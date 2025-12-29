@@ -41,3 +41,7 @@ Thumbs.db
 # Temporary
 tmp/
 outputs/
+
+# ===== generated datasets / caches (DO NOT COMMIT) =====
+exts/fdm/data/Terrains/test_datasets/
+**/test_datasets/
