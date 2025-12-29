@@ -1,0 +1,98 @@
+# Use Python 3.8 for files in ros/, otherwise use Python 3.10
+
+repos:
+  - repo: https://github.com/python/black
+    rev: 24.3.0
+    hooks:
+      - id: black
+        args: ["--line-length", "120", "--unstable"]
+        language_version: python3.8
+        files: ^ros/
+      - id: black
+        args: ["--line-length", "120", "--unstable"]
+        exclude: ^ros/
+
+  - repo: https://github.com/pycqa/flake8
+    rev: 7.0.0
+    hooks:
+      - id: flake8
+        additional_dependencies: [flake8-simplify, flake8-return]
+        language_version: python3.8
+        files: ^ros/
+      - id: flake8
+        additional_dependencies: [flake8-simplify, flake8-return]
+        exclude: ^ros/
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+      - id: check-symlinks
+      - id: destroyed-symlinks
+      - id: check-added-large-files
+        args: ["--maxkb=2000"]  # restrict files more than 2 MB. Should use git-lfs instead.
+      - id: check-yaml
+      - id: check-merge-conflict
+      - id: check-case-conflict
+      - id: check-executables-have-shebangs
+      - id: check-toml
+      - id: end-of-file-fixer
+      - id: check-shebang-scripts-are-executable
+      - id: detect-private-key
+      - id: debug-statements
+
+  - repo: https://github.com/pycqa/isort
+    rev: 5.13.2
+    hooks:
+      - id: isort
+        args: ["--profile", "black", "--filter-files"]
+        language_version: python3.8
+        files: ^ros/
+      - id: isort
+        args: ["--profile", "black", "--filter-files"]
+        exclude: ^ros/
+
+  - repo: https://github.com/asottile/pyupgrade
+    rev: v3.15.1
+    hooks:
+      - id: pyupgrade
+        args: ["--py38-plus"]
+        language_version: python3.8
+        files: ^ros/
+      - id: pyupgrade
+        args: ["--py310-plus"]
+        exclude: ^ros/
+
+  - repo: https://github.com/codespell-project/codespell
+    rev: v2.2.6
+    hooks:
+      - id: codespell
+        exclude: ^ros/
+        additional_dependencies:
+        - tomli
+
+  - repo: https://github.com/Lucas-C/pre-commit-hooks
+    rev: v1.5.1
+    hooks:
+      - id: insert-license
+        files: \.py$
+        exclude: ^(ros/waypoint_rviz_plugin)/
+        args:
+          # - --remove-header    # Remove existing license headers. Useful when updating license.
+          - --license-filepath
+          - .github/LICENSE_HEADER.txt
+          - --use-current-year
+
+  - repo: https://github.com/Lucas-C/pre-commit-hooks
+    rev: v1.5.1
+    hooks:
+      - id: insert-license
+        files: \.cpp$   # This regex includes both .py and .yml files
+        exclude: ^(ros/waypoint_rviz_plugin)/
+        args:
+          # - --remove-header    # Remove existing license headers. Useful when updating license.
+          - --license-filepath
+          - .github/LICENSE_HEADER.txt
+          - --use-current-year
+          - --comment-style
+          - /*| *| */

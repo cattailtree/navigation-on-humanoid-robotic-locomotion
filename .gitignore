@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.env
+.venv
+venv/
+conda/
+*.log
+
+# PyTorch / ML
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Isaac / Omniverse
+isaac_sim/
+*.usd
+*.usda
+*.usdc
+*_cache/
+omni.kit.*
+
+# Logs & WandB
+logs/
+wandb/
+tensorboard/
+tb/
+
+
+
+# OS / IDE
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Temporary
+tmp/
+outputs/

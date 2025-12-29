@@ -1,0 +1,3 @@
+[submodule "nav-suite"]
+	path = nav-suite
+	url = git@github.com:leggedrobotics/nav-suite.git

@@ -1,0 +1,10 @@
+# Copyright (c) 2025, The Nav-Suite Project Developers (https://github.com/leggedrobotics/nav-suite/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Semantic class cost mapping for Mountain categories
+semantic_costs:
+  tree: 1.0
+  ground: 0.0
+  water: 1.0
