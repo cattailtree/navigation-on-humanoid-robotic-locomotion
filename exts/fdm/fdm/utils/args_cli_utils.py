@@ -160,6 +160,8 @@ def robot_changes(
         # currently cancel out all the pre-trained models
         if isinstance(cfg, fdm_runner.FDMRunnerCfg):
             cfg.trainer_cfg.encoder_resume = None
+        cfg.body_regex_contact_checking: str = "^(left|right)_ankle_roll_link$"
+
 
         # NOTE: remove when test datasets are available
         cfg.trainer_cfg.test_datasets = None
@@ -204,7 +206,7 @@ def cfg_modifier_pre_init(  # noqa: C901
             cfg.env_cfg.observations.fdm_obs_proprioception.joint_torque.noise = Unoise(n_min=-0.1, n_max=0.1)
             cfg.env_cfg.observations.fdm_obs_proprioception.joint_pos.noise = Unoise(n_min=-0.01, n_max=0.01)
 
-            if args_cli.robot.lower() == "anymal" or args_cli.robot.lower() == "anymal_perceptive":
+            if args_cli.robot.lower() == "anymal" or args_cli.robot.lower() == "anymal_perceptive" :
                 cfg.env_cfg.observations.fdm_obs_proprioception.joint_vel_idx0.noise = Unoise(n_min=-1.5, n_max=1.5)
                 cfg.env_cfg.observations.fdm_obs_proprioception.joint_pos_error_idx0.noise = Unoise(
                     n_min=-0.01, n_max=0.01
@@ -240,6 +242,11 @@ def cfg_modifier_pre_init(  # noqa: C901
             cfg.env_cfg.observations.fdm_obs_exteroceptive.enable_corruption = True
 
     # reduced observation space
+        # --- FORCE: when loading a saved run in test/eval, do NOT apply reduced_obs again ---
+    # because the saved config already encodes the obs structure & dims.
+    if hasattr(args_cli, "runs") and args_cli.runs is not None:
+        args_cli.reduced_obs = False
+
     if hasattr(args_cli, "reduced_obs") and args_cli.reduced_obs and args_cli.env != "baseline" and args_cli.robot.lower() in ["anymal", "anymal_perceptive", "aow"]:
         print("[INFO] Reduced observation space")
         # remove the friction from the state space

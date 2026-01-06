@@ -382,27 +382,32 @@ class TrajectoryDataset(Dataset):
             #     self.perfect_velocity_following_local_frame[env_idx, command_idx]
             # )
 
+        
         N, H, _ = self.states.shape
         dt = self.model_cfg.command_timestep
 
         # ---------- 1. 局部坐标最终位移（只杀 teleport） ----------
         delta_xy = self.states[:, -1, :2] - self.states[:, 0, :2]
         max_distance = torch.norm(delta_xy, dim=1)
-        # ---------- teleport ----------
+
+        # 两足：10m 仍然是一个合理的 teleport 判据
         bad_dist = max_distance > 10.0
 
-        # ---------- step jump (geometry only) ----------
+
+        # ---------- 2. 单步“几何跳变”（不是速度） ----------
         step_xy = self.states[:, 1:, :2] - self.states[:, :-1, :2]
         step_norm = torch.norm(step_xy, dim=-1)
-        bad_step = (step_norm > 2.0).sum(dim=1) >= 2   # 两步以上
 
-        # ---------- yaw jump (geometry only) ----------
-        yaw = self.states[:, :, 3]
+        # 两足这里要放宽
+        bad_step = (step_norm > 1.5).any(dim=1)   # ← 四足我会用 1.0，这里是 1.5
+
+
+        # ---------- 3. yaw 跳变（两足非常关键） ----------
+        yaw = self.states[:, :, 3]  # 直接就是 yaw(rad)
         yaw_diff = math_utils.wrap_to_pi(yaw[:, 1:] - yaw[:, :-1]).abs()
-        bad_yaw = (yaw_diff > 1.2).any(dim=1)
 
+        bad_yaw = ((yaw_diff / dt) > 50.0).any(dim=1)   # 建议 4~6 rad/s；你想更宽可以设到 10
         outlier_mask = bad_dist | bad_step | bad_yaw
-
         outlier_idx = torch.where(outlier_mask)[0]
 
         outlier_ratio = outlier_mask.float().mean().item()
@@ -424,6 +429,7 @@ class TrajectoryDataset(Dataset):
             if hasattr(self, "_dbg_coll") and self._dbg_coll:
                 print("coll mean AFTER filter:", self.states[..., 4].float().mean().item(), flush=True)
                 print("coll any AFTER filter:", (self.states[..., 4] != 0).any(dim=1).float().mean().item(), flush=True)
+
 
 
         ###

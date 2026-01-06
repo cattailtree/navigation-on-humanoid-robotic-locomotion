@@ -154,7 +154,11 @@ def reset_root_state_center(
         torch.zeros((len(env_ids), 1), device=asset.device),
     ])
     perturbation[:, 2] = 0.1
-    positions = root_states[:, :3] + env.scene.env_origins[env_ids] + perturbation
+    origins = env.scene.env_origins[env_ids]
+    positions = root_states[:, :3].clone()
+    # place x,y in world and set z relative to env origin
+    positions[:, :2] += origins[:, :2] + perturbation[:, :2]
+    positions[:, 2] = origins[:, 2] + 0.8
     # orientations
     num_env_origins = torch.unique(env.scene.env_origins, dim=0).shape[0]
     assets_per_origin = math.ceil(env.num_envs / num_env_origins)
@@ -193,7 +197,10 @@ def reset_root_state_paper_plot(
     perturbation = quat_apply_yaw(
         orientations, torch.tensor([[0.5, 0.0, 0.1]], device=asset.device).repeat(len(env_ids), 1)
     )
-    positions = root_states[:, :3] + env.scene.env_origins[env_ids] + perturbation
+    origins = env.scene.env_origins[env_ids]
+    positions = root_states[:, :3].clone()
+    positions[:, :2] += origins[:, :2] + perturbation[:, :2]
+    positions[:, 2] = origins[:, 2] + 0.8
 
     # velocities
     velocities = root_states[:, 7:13]
@@ -236,7 +243,10 @@ def reset_root_state_planner_paper_plot(
             .reshape(-1, 3)
         )
     # perturbation = torch.tensor([[0.0, -1.0, 0.1], [0.0, 1.0, 0.1]], device=asset.device)[None, :, :].repeat(num_env_origins, 1, 1).reshape(-1, 3)
-    positions = root_states[:, :3] + env.scene.env_origins[env_ids] + perturbation[env_ids]
+    origins = env.scene.env_origins[env_ids]
+    positions = root_states[:, :3].clone()
+    positions[:, :2] += origins[:, :2] + perturbation[env_ids][:, :2]
+    positions[:, 2] = origins[:, 2] + 0.8
 
     # set into the physics simulation
     asset.write_root_pose_to_sim(torch.cat([positions, root_states[:, 3:7]], dim=-1), env_ids=env_ids)
@@ -279,8 +289,12 @@ def reset_robot_position_planner(
     # positions - based on given start points (command generator)
     positions = asset.data.default_root_state[env_ids, :3].clone()
     positions += goal_cmd_generator.pos_spawn_w[env_ids]
+    origins = env.scene.env_origins[env_ids]
+    # place x,y in world (include env origin if spawn_in_env_frame)
     if spawn_in_env_frame:
-        positions += env.scene.env_origins[env_ids]
+        positions[:, :2] += origins[:, :2]
+    # enforce z relative to env origin to keep consistent height
+    positions[:, 2] = origins[:, 2] + 0.8
 
     # yaw range
     yaw_samples = sample_uniform(yaw_range[0], yaw_range[1], (len(env_ids), 1), device=asset.device)

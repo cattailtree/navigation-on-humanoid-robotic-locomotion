@@ -24,7 +24,7 @@ import hydra
 import omegaconf
 import pypose as pp
 import wandb
-
+import fdm.mdp as mdp
 import isaaclab.utils.math as math_utils
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.utils.io import dump_yaml
@@ -142,6 +142,13 @@ class FDMRunner:
         # ------------------------------------------------------------------
         # 2. create env FIRST
         # ------------------------------------------------------------------
+        # default spawn z: use env var FDM_FORCE_SPAWN_Z if set, otherwise default to 0.8
+        force_z_env = os.getenv("FDM_FORCE_SPAWN_Z", None)
+        try:
+            self.force_spawn_z = float(force_z_env) if force_z_env is not None else 0.8
+        except Exception:
+            self.force_spawn_z = 0.8
+
         self.env: ManagerBasedRLEnv = ManagerBasedRLEnv(
             self.cfg.env_cfg, render_mode=self.render_mode
         )
@@ -225,6 +232,9 @@ class FDMRunner:
         self.feet_idx, _ = self.env.scene.sensors["contact_forces"].find_bodies(
             self.cfg.body_regex_contact_checking
         )
+        #print("[DEBUG] feet_idx =", self.feet_idx)
+        #print("[DEBUG] feet_idx len =", len(self.feet_idx))
+
         self.feet_contact = torch.zeros(
             (self.env.num_envs, len(self.feet_idx)),
             dtype=torch.bool,
@@ -245,13 +255,6 @@ class FDMRunner:
             dump_yaml(filename=f"{self.trainer.log_dir}/params/config.yaml", data=save_cfg)
             save_cfg.pop("trainer_cfg")
             wandb.config.update(save_cfg)
-
-        # setup buffers
-        self.feet_idx, _ = self.env.scene.sensors["contact_forces"].find_bodies(self.cfg.body_regex_contact_checking)
-        self.feet_contact = torch.zeros(
-            (self.env.num_envs, len(self.feet_idx)), dtype=torch.bool, device=self.env.device
-        )
-        self.feet_non_contact_counter = torch.zeros(self.env.num_envs, dtype=torch.long, device=self.env.device)
 
         print("[INFO]: Setup complete.")
 
@@ -301,6 +304,33 @@ class FDMRunner:
         with torch.inference_mode():
             # reset env
             self.env.reset(1)
+            try:
+                robot = self.env.scene.articulations["robot"]
+                p = robot.data.root_pos_w[:5, 2].detach().cpu().numpy()
+                origins = self.env.scene.env_origins[:5].cpu().numpy()
+                #print(f"[RESET-DBG] post-reset root_z[:5]={p} env_origins[:5]={origins}", flush=True)
+                # apply configured/default spawn z (self.force_spawn_z)
+                try:
+                    if getattr(self, "force_spawn_z", None) is not None:
+                        desired_z = float(self.force_spawn_z)
+                        # modify world positions directly (write world coordinates)
+                        world_pos = robot.data.root_pos_w.clone()
+                        origins = self.env.scene.env_origins.to(world_pos.device)
+                        # per-env world z = env_origin.z + offset
+                        world_pos[:, 2] = origins[:, 2] + desired_z
+                        orientations = robot.data.root_quat_w.clone()
+                        env_ids = torch.arange(world_pos.shape[0], device=world_pos.device)
+                        robot.write_root_pose_to_sim(torch.cat([world_pos, orientations], dim=-1), env_ids=env_ids)
+                        try:
+                            zero_vel = torch.zeros((world_pos.shape[0], 6), device=world_pos.device)
+                            robot.write_root_velocity_to_sim(zero_vel, env_ids=env_ids)
+                        except Exception:
+                            pass
+                        #print(f"[FORCE-DBG] forced world_z_offset={desired_z} wrote world_z[:5]={world_pos[:5,2].cpu().numpy()}", flush=True)
+                except Exception as e:
+                    print(f"[FORCE-DBG] failed to force spawn z: {e}", flush=True)
+            except Exception:
+                pass
         # collect data
         if self.env.cfg.scene.terrain.terrain_type == "usd":
             # get dataset path
@@ -367,6 +397,30 @@ class FDMRunner:
         # reset the environment
         with torch.inference_mode():
             obs, _ = self.env.reset(1)
+            try:
+                robot = self.env.scene.articulations["robot"]
+                p = robot.data.root_pos_w[:5, 2].detach().cpu().numpy()
+                origins = self.env.scene.env_origins[:5].cpu().numpy()
+                #print(f"[RESET-DBG] eval post-reset root_z[:5]={p} env_origins[:5]={origins}", flush=True)
+                try:
+                    if getattr(self, "force_spawn_z", None) is not None:
+                        desired_z = float(self.force_spawn_z)
+                        world_pos = robot.data.root_pos_w.clone()
+                        origins = self.env.scene.env_origins.to(world_pos.device)
+                        world_pos[:, 2] = origins[:, 2] + desired_z
+                        orientations = robot.data.root_quat_w.clone()
+                        env_ids = torch.arange(world_pos.shape[0], device=world_pos.device)
+                        robot.write_root_pose_to_sim(torch.cat([world_pos, orientations], dim=-1), env_ids=env_ids)
+                        try:
+                            zero_vel = torch.zeros((world_pos.shape[0], 6), device=world_pos.device)
+                            robot.write_root_velocity_to_sim(zero_vel, env_ids=env_ids)
+                        except Exception:
+                            pass
+                        #print(f"[FORCE-DBG] forced world_z_offset={desired_z} wrote world_z[:5]={world_pos[:5,2].cpu().numpy()}", flush=True)
+                except Exception as e:
+                    print(f"[FORCE-DBG] failed to force spawn z: {e}", flush=True)
+            except Exception:
+                pass
         # reset agent
         actions = self.agent.reset(obs)
 
@@ -619,8 +673,35 @@ class FDMRunner:
         # reset the environment
         with torch.inference_mode():
             obs, _ = self.env.reset(0)
+            try:
+                robot = self.env.scene.articulations["robot"]
+                p = robot.data.root_pos_w[:5, 2].detach().cpu().numpy()
+                origins = self.env.scene.env_origins[:5].cpu().numpy()
+                print(f"[RESET-DBG] planner post-reset root_z[:5]={p} env_origins[:5]={origins}", flush=True)
+                try:
+                    if getattr(self, "force_spawn_z", None) is not None:
+                        desired_z = float(self.force_spawn_z)
+                        world_pos = robot.data.root_pos_w.clone()
+                        origins = self.env.scene.env_origins.to(world_pos.device)
+                        world_pos[:, 2] = origins[:, 2] + desired_z
+                        orientations = robot.data.root_quat_w.clone()
+                        env_ids = torch.arange(world_pos.shape[0], device=world_pos.device)
+                        robot.write_root_pose_to_sim(torch.cat([world_pos, orientations], dim=-1), env_ids=env_ids)
+                        try:
+                            zero_vel = torch.zeros((world_pos.shape[0], 6), device=world_pos.device)
+                            robot.write_root_velocity_to_sim(zero_vel, env_ids=env_ids)
+                        except Exception:
+                            pass
+                        print(f"[FORCE-DBG] forced world_z_offset={desired_z} wrote world_z[:5]={world_pos[:5,2].cpu().numpy()}", flush=True)
+                except Exception as e:
+                    print(f"[FORCE-DBG] failed to force spawn z: {e}", flush=True)
+            except Exception:
+                pass
         # reset agent
         actions = self.agent.reset(obs)
+        assert actions is not None, "agent.reset(obs) returned None"
+        assert torch.is_tensor(actions), f"actions type is {type(actions)}"
+
 
         if hasattr(self.args_cli, "max_actions") and self.args_cli.max_actions:
             max_actions = torch.zeros_like(actions)
@@ -680,9 +761,31 @@ class FDMRunner:
             render_counter = torch.zeros(self.env.num_envs, device=self.env.device, dtype=torch.int)
 
         while not self.replay_buffer.is_filled:
-            # step environment
+            robot = self.env.scene.articulations["robot"]
+            p = robot.data.root_pos_w[0].detach().cpu()
+            v = robot.data.root_lin_vel_w[0].detach().cpu()
+            print("[DEBUG] root_z =", float(p[2]), "vz =", float(v[2]), flush=True)
+            pelvis_z = float(robot.data.root_pos_w[0,2].item())
+            # 用 ankle_roll_link 的刚体高度（需要你确认 body index）
+            # 临时做法：直接打印所有 body z 的 min/max
+            z_all = robot.data.body_pos_w[0,:,2].detach().cpu()
+            print("[DEBUG] pelvis_z", pelvis_z, "body_z min/max", float(z_all.min()), float(z_all.max()), flush=True)
+
             with torch.inference_mode():
                 obs, _, dones, _, _ = self.env.step(actions.clone())
+                
+            # --- DEBUG: 本步实际生效的顶层动作（SE2 cmd） ---
+            if self.env.common_step_counter < 20:
+                print("[DEBUG] step =", int(self.env.common_step_counter),
+                    "actions[0][:3] =", actions[0, :3].detach().cpu().tolist(),
+                    flush=True)
+            robot = self.env.scene.articulations["robot"]
+            v = robot.data.root_lin_vel_w[0].detach().cpu()
+            w = robot.data.root_ang_vel_w[0].detach().cpu()
+            print(f"[DEBUG] root v_w={v.tolist()}  w_w={w.tolist()}", flush=True)
+
+
+
             # also mark every env as done where the replay buffer is filled
             dones = dones | self.replay_buffer.env_buffer_filled.to(self.device)
 
@@ -731,6 +834,7 @@ class FDMRunner:
             # if torch.any(dones):
             #     # for done environments reset replay_buffer
             #     self.replay_buffer.reset(env_ids=self.replay_buffer._ALL_INDICES[dones])
+
 
             # decide for which environments to do a new prediction
             # note: first time prediction can be done when fill idx is increased to 1, next when it reaches 1+prediction_horizon, etc.
@@ -791,18 +895,18 @@ class FDMRunner:
                 if use_planner:
                     # -- get the future actions
                     if self.args_cli.equal_actions:
-                        future_actions = torch.concatenate(
-                            [
-                                self.agent._plan[
-                                    torch.zeros(env_new_prediction.shape[0], dtype=torch.long),
-                                    self.agent._plan_step[torch.zeros(env_new_prediction.shape[0], dtype=torch.long)]
-                                    - 1
-                                    + idx,
-                                ][:, None, :]
-                                for idx in range(self.cfg.model_cfg.prediction_horizon)
-                            ],
-                            dim=1,
-                        ).to(self.device)
+                        plan = self.agent._plan
+                        ph = self.cfg.model_cfg.prediction_horizon
+                        H = plan.shape[1]
+
+                        base_env = torch.zeros(env_new_prediction.shape[0], dtype=torch.long, device=plan.device)
+                        ps = self.agent._plan_step[base_env] - 1
+                        idx_seq = torch.stack([ps + k for k in range(ph)], dim=1).clamp(0, H - 1)
+                        print("plan_step min/max:", ps.min().item(), ps.max().item(), "H:", H, "ph:", ph,
+                        "idx_min:", (ps).min().item(), "idx_max:", (ps + ph - 1).max().item(), flush=True)
+
+                        future_actions = plan[base_env][:, idx_seq].to(self.device)
+
                     elif hasattr(self.args_cli, "max_actions") and self.args_cli.max_actions:
                         future_actions = torch.concatenate(
                             [
@@ -812,15 +916,22 @@ class FDMRunner:
                             dim=1,
                         ).to(self.device)
                     else:
-                        future_actions = torch.concatenate(
-                            [
-                                self.agent._plan[
-                                    env_new_prediction, self.agent._plan_step[env_new_prediction] - 1 + idx
-                                ][:, None, :]
-                                for idx in range(self.cfg.model_cfg.prediction_horizon)
-                            ],
-                            dim=1,
-                        ).to(self.device)
+                        # plan shape: (num_envs, plan_horizon, act_dim)
+                        plan = self.agent._plan
+                        ps = self.agent._plan_step[env_new_prediction] - 1  # (n,)
+                        H = plan.shape[1]
+                        ph = self.cfg.model_cfg.prediction_horizon
+
+                        # (n, ph) 每个 env 要取的 action index
+                        idx_seq = torch.stack([ps + k for k in range(ph)], dim=1)
+
+                        # 防止越界（关键！）
+                        idx_seq = idx_seq.clamp(0, H - 1)
+
+                        # 高级索引：先选 env，再按每行 idx_seq 取
+                        future_actions = plan[env_new_prediction][:, idx_seq]  # (n, ph, act_dim)
+                        future_actions = future_actions.to(self.device)
+
 
                     # -- collect the start and goal observations
                     planner.obs = obs["planner_obs"]
@@ -848,49 +959,84 @@ class FDMRunner:
                     # -- save predictions
                     perfect_velocity_predictions_start.extend(new_perfect_vel_pred_start.tolist())
                     perfect_velocity_predictions_end.extend(new_perfect_vel_pred_end.tolist())
+            # Drawing
+            ###
+            if hasattr(self, "draw_interface") and self.draw_interface is not None:
+                # draw predictions
+                self.draw_interface.clear_lines()
+                for env_idx in range(self.env.num_envs):
+                    if self.replay_buffer.fill_idx[env_idx] > 2:
+                        # plot trajectories from replay buffer
+                        self.draw_interface.draw_lines(
+                            self.replay_buffer.states[env_idx, 1 : self.replay_buffer.fill_idx[env_idx], 0, :3][:-1].tolist(),
+                            self.replay_buffer.states[env_idx, 1 : self.replay_buffer.fill_idx[env_idx], 0, :3][1:].tolist(),
+                            self.trajectory_color * (self.replay_buffer.fill_idx[env_idx] - 2),
+                            [25.0] * (self.replay_buffer.fill_idx[env_idx] - 2),
+                        )
 
+                self.draw_interface.draw_lines(
+                    safe_predictions_start,
+                    safe_predictions_end,
+                    [self.safe_colors[0]] * len(safe_predictions_start),
+                    [25.0] * len(safe_predictions_start),
+                )
+                self.draw_interface.draw_lines(
+                    collision_predictions_start,
+                    collision_predictions_end,
+                    [self.collision_colors[0]] * len(collision_predictions_start),
+                    [25.0] * len(collision_predictions_start),
+                )
+
+                # draw perfect velocity predictions
+                if use_planner:
+                    self.draw_interface.draw_lines(
+                        perfect_velocity_predictions_start,
+                        perfect_velocity_predictions_end,
+                        self.perfect_velocity_color * len(perfect_velocity_predictions_start),
+                        [25.0] * len(perfect_velocity_predictions_start),
+                    )
             ###
             # Drawing
             ###
-            # draw predictions
-            self.draw_interface.clear_lines()
-            for env_idx in range(self.env.num_envs):
-                if self.replay_buffer.fill_idx[env_idx] > 2:
-                    # plot trajectories from replay buffer
-                    self.draw_interface.draw_lines(
-                        self.replay_buffer.states[env_idx, 1 : self.replay_buffer.fill_idx[env_idx], 0, :3][
-                            :-1
-                        ].tolist(),
-                        self.replay_buffer.states[env_idx, 1 : self.replay_buffer.fill_idx[env_idx], 0, :3][
-                            1:
-                        ].tolist(),
-                        self.trajectory_color * (self.replay_buffer.fill_idx[env_idx] - 2),
-                        [25.0] * (self.replay_buffer.fill_idx[env_idx] - 2),
-                    )
-            self.draw_interface.draw_lines(
-                safe_predictions_start,
-                safe_predictions_end,
-                [self.safe_colors[0]] * len(safe_predictions_start),
-                [25.0] * len(safe_predictions_start),
-            )
-            self.draw_interface.draw_lines(
-                collision_predictions_start,
-                collision_predictions_end,
-                [self.collision_colors[0]] * len(collision_predictions_start),
-                [25.0] * len(collision_predictions_start),
-            )
-            # draw perfect velocity predictions
-            if use_planner:
+            if hasattr(self, "draw_interface") and self.draw_interface is not None:
+                # draw predictions
+                self.draw_interface.clear_lines()
+                for env_idx in range(self.env.num_envs):
+                    if self.replay_buffer.fill_idx[env_idx] > 2:
+                        # plot trajectories from replay buffer
+                        self.draw_interface.draw_lines(
+                            self.replay_buffer.states[env_idx, 1 : self.replay_buffer.fill_idx[env_idx], 0, :3][:-1].tolist(),
+                            self.replay_buffer.states[env_idx, 1 : self.replay_buffer.fill_idx[env_idx], 0, :3][1:].tolist(),
+                            self.trajectory_color * (self.replay_buffer.fill_idx[env_idx] - 2),
+                            [25.0] * (self.replay_buffer.fill_idx[env_idx] - 2),
+                        )
+
                 self.draw_interface.draw_lines(
-                    perfect_velocity_predictions_start,
-                    perfect_velocity_predictions_end,
-                    self.perfect_velocity_color * len(perfect_velocity_predictions_start),
-                    [25.0] * len(perfect_velocity_predictions_start),
+                    safe_predictions_start,
+                    safe_predictions_end,
+                    [self.safe_colors[0]] * len(safe_predictions_start),
+                    [25.0] * len(safe_predictions_start),
                 )
+                self.draw_interface.draw_lines(
+                    collision_predictions_start,
+                    collision_predictions_end,
+                    [self.collision_colors[0]] * len(collision_predictions_start),
+                    [25.0] * len(collision_predictions_start),
+                )
+
+                # draw perfect velocity predictions
+                if use_planner:
+                    self.draw_interface.draw_lines(
+                        perfect_velocity_predictions_start,
+                        perfect_velocity_predictions_end,
+                        self.perfect_velocity_color * len(perfect_velocity_predictions_start),
+                        [25.0] * len(perfect_velocity_predictions_start),
+                    )
 
             # save the images if cameras are provided
             if cameras is not None:
                 for idx, camera in enumerate(cameras):
+                    
                     if hasattr(self.args_cli, "paper_platform_figure") and self.args_cli.paper_platform_figure:
                         if idx == 1:
                             robot_pos_1 = self.env.scene.articulations["robot"].data.root_pos_w[idx] + torch.tensor(
@@ -902,6 +1048,15 @@ class FDMRunner:
                                 [-10.0, 0.0, 9], device=self.env.device
                             )
                             camera.set_world_pose(position=robot_pos_2, orientation=[0.9250441, 0.0, 0.3798598, 0.0])
+                    robot_pos = self.env.scene.articulations["robot"].data.root_pos_w[0]
+
+                    camera.set_world_pose(
+                        position=(
+                            robot_pos
+                            + torch.tensor([-5.0, 0.0, 5.0], device=self.env.device)
+                        ).tolist(),
+                        orientation=[0.9250441, 0.0, 0.3798598, 0.0],
+                    )
 
                     for i in range(2):
                         self.env.sim.render()
@@ -951,6 +1106,30 @@ class FDMRunner:
         # reset environment
         with torch.inference_mode():
             obs, _ = self.env.reset(random.randint(0, 1000000))
+            try:
+                robot = self.env.scene.articulations["robot"]
+                p = robot.data.root_pos_w[:5, 2].detach().cpu().numpy()
+                origins = self.env.scene.env_origins[:5].cpu().numpy()
+                print(f"[RESET-DBG] random post-reset root_z[:5]={p} env_origins[:5]={origins}", flush=True)
+                try:
+                    if getattr(self, "force_spawn_z", None) is not None:
+                        desired_z = float(self.force_spawn_z)
+                        world_pos = robot.data.root_pos_w.clone()
+                        origins = self.env.scene.env_origins.to(world_pos.device)
+                        world_pos[:, 2] = origins[:, 2] + desired_z
+                        orientations = robot.data.root_quat_w.clone()
+                        env_ids = torch.arange(world_pos.shape[0], device=world_pos.device)
+                        robot.write_root_pose_to_sim(torch.cat([world_pos, orientations], dim=-1), env_ids=env_ids)
+                        try:
+                            zero_vel = torch.zeros((world_pos.shape[0], 6), device=world_pos.device)
+                            robot.write_root_velocity_to_sim(zero_vel, env_ids=env_ids)
+                        except Exception:
+                            pass
+                        print(f"[FORCE-DBG] forced world_z_offset={desired_z} wrote world_z[:5]={world_pos[:5,2].cpu().numpy()}", flush=True)
+                except Exception as e:
+                    print(f"[FORCE-DBG] failed to force spawn z: {e}", flush=True)
+            except Exception:
+                pass
             # the contact sensor is delayed, execute delay+1 steps to reset all environments correctly
             if torch.any(obs["fdm_state"][..., 7]):
                 for _ in range(self.cfg.env_cfg.scene.contact_forces.history_length - self.cfg.env_cfg.decimation + 1):
@@ -1141,36 +1320,75 @@ class FDMRunner:
         print("[INFO]: Data collection complete.")
 
     @torch.inference_mode()
+        
     def _feet_contact_handler(
         self, dones: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor | dict[str, torch.Tensor]] | None]:
-        # update for done environments
-        self.feet_contact[dones] = False
+        # 1) done 的 env 先清零计数（保持语义）
         self.feet_non_contact_counter[dones] = 0
-        # determine which feet are in contact
-        self.feet_contact[
-            torch.norm(self.env.scene.sensors["contact_forces"].data.net_forces_w[:, self.feet_idx], dim=-1) > 1
-        ] = True
-        feet_all_contact = torch.all(self.feet_contact, dim=-1)
-        # feet non-contact counter
-        self.feet_non_contact_counter[feet_all_contact] = 0
-        self.feet_non_contact_counter[~feet_all_contact] += 1
-        # reset for envs that have not touched the ground for a while
+
+        # 2) per-foot 接触判断
+        forces = torch.norm(
+            self.env.scene.sensors["contact_forces"].data.net_forces_w[:, self.feet_idx],
+            dim=-1,
+        )  # (N, nfeet)
+
+        # 阈值先别太大：两足脚底接触力可能小于你想象，建议先用 1~5
+        contact_th = 5.0
+        self.feet_contact = forces > contact_th  # (N, nfeet)
+
+        feet_any_contact = torch.any(self.feet_contact, dim=-1)  # (N,)
+        feet_all_contact = torch.all(self.feet_contact, dim=-1)  # (N,)
+
+        # 3) 可选：只在“起步阶段”要求 all_contact 达成一次
+        if not hasattr(self, "feet_contact_initialized"):
+            self.feet_contact_initialized = torch.zeros(
+                self.env.num_envs, dtype=torch.bool, device=self.env.device
+            )
+
+        # dones 的 env 重新初始化
+        self.feet_contact_initialized[dones] = False
+
+        # 一旦某 env 达到过 all_contact，则认为起步完成
+        self.feet_contact_initialized |= feet_all_contact
+
+        # 起步前：要求双脚都触地；起步后：允许单脚支撑
+        feet_ok = torch.where(
+            self.feet_contact_initialized,
+            feet_any_contact,
+            feet_all_contact,
+        )
+
+        # 4) 计数器：统计“完全没脚接触”的持续时间（用 any_contact 做更合理）
+        self.feet_non_contact_counter[feet_any_contact] = 0
+        self.feet_non_contact_counter[~feet_any_contact] += 1
+
+        # 5) 长时间没接触则 reset
         obs = None
         reset_envs = self.feet_non_contact_counter > 200
         if torch.any(reset_envs):
             print("[WARNING]: Resetting environments that have not touched the ground for a while.")
-            # NOTE: this does not affect the data collection, as it will only start when all feet are in contact
-            with torch.inference_mode():
-                self.env._reset_idx(self.agent._ALL_INDICES[reset_envs])
-                # compute observations
-                # note: done after reset to get the correct observations for reset envs
-                obs = self.env.observation_manager.compute()
-            # reset counter for these environments and add to done environments
+            self.env._reset_idx(self.agent._ALL_INDICES[reset_envs])
+            obs = self.env.observation_manager.compute()
             dones[reset_envs] = True
             self.feet_non_contact_counter[reset_envs] = 0
+            self.feet_contact_initialized[reset_envs] = False
 
-        return feet_all_contact, dones, obs
+        # 6) debug 打印（别引用未定义变量）
+        if torch.rand(1).item() < 0.01:
+            e = 0
+            print(
+                "forces:", forces[e].tolist(),
+                "contact:", self.feet_contact[e].tolist(),
+                "all:", feet_all_contact[e].item(),
+                "any:", feet_any_contact[e].item(),
+                "init:", self.feet_contact_initialized[e].item(),
+                "feet_ok:", feet_ok[e].item(),
+                flush=True,
+            )
+
+        return feet_ok, dones, obs
+
 
     def _eval_predict(self, env_ids: torch.Tensor, model: FDMModel | None = None):
         """Make predictions based on the current states and the planned actions"""
@@ -1199,30 +1417,45 @@ class FDMRunner:
                     model.hard_contact_obs_limits[1] - model.hard_contact_obs_limits[0]
                 )
 
-        # collect future actions
+               # collect future actions  (SAFE indexing)
+        plan = self.agent._plan                       # (num_envs, H_plan, act_dim)
+        plan_steps = self.agent._plan_step            # (num_envs,)
+        H_plan = plan.shape[1]
+        ph = int(self.cfg.model_cfg.prediction_horizon)
+
         if self.args_cli.equal_actions:
-            future_actions = torch.concatenate(
-                [
-                    self.agent._plan[
-                        torch.zeros(env_ids.shape[0], dtype=torch.long),
-                        self.agent._plan_step[torch.zeros(env_ids.shape[0], dtype=torch.long)] - 1 + idx,
-                    ][:, None, :]
-                    for idx in range(self.cfg.model_cfg.prediction_horizon)
-                ],
+            # use env 0's plan for all envs, but still safe w.r.t. plan_step
+            base_env = torch.zeros(env_ids.shape[0], dtype=torch.long, device=plan.device)
+            ps = plan_steps[base_env] - 1  # (n,)
+            idx_seq = torch.stack([ps + k for k in range(ph)], dim=1)  # (n, ph)
+            idx_seq = idx_seq.clamp(0, H_plan - 1)
+
+            # first pick base_env rows, then gather per-row indices
+            future_actions = plan[base_env]  # (n, H_plan, act_dim)
+            future_actions = future_actions.gather(
                 dim=1,
-            ).to(self.device)
+                index=idx_seq[..., None].expand(-1, -1, future_actions.shape[-1]),
+            )
+
         elif hasattr(self.args_cli, "max_actions") and self.args_cli.max_actions:
-            future_actions = torch.zeros(env_ids.shape[0], self.cfg.model_cfg.prediction_horizon, 3).to(self.device)
+            future_actions = torch.zeros(env_ids.shape[0], ph, 3, device=self.device)
             future_actions[:, :, 0] = VEL_RANGE_X[1]
             future_actions[:, :, 1] = VEL_RANGE_Y[1]
+
         else:
-            future_actions = torch.concatenate(
-                [
-                    self.agent._plan[env_ids, self.agent._plan_step[env_ids] - 1 + idx][:, None, :]
-                    for idx in range(self.cfg.model_cfg.prediction_horizon)
-                ],
+            ps = plan_steps[env_ids] - 1  # (n,)
+            idx_seq = torch.stack([ps + k for k in range(ph)], dim=1)  # (n, ph)
+            idx_seq = idx_seq.clamp(0, H_plan - 1)
+
+            # pick env rows then gather
+            plan_sel = plan[env_ids]  # (n, H_plan, act_dim)
+            future_actions = plan_sel.gather(
                 dim=1,
-            ).to(self.device)
+                index=idx_seq[..., None].expand(-1, -1, plan_sel.shape[-1]),
+            )
+
+        future_actions = future_actions.to(self.device)
+
 
         # make predictions
         model_in = (

@@ -538,7 +538,7 @@ def base_collision(
         support_any = (feet_max > feet_support_threshold).any(dim=-1)   # (N,)
         no_support = ~support_any
 
-        hard_now = pelvis_hit & no_support
+        hard_now = pelvis_hit 
 
     # -------------------------
     # 3) debounce: K consecutive
@@ -633,3 +633,13 @@ def energy_consumption(
     # extract the used quantities (to enable type-hinting)
     asset: Articulation = env.scene[asset_cfg.name]
     return (asset.data.applied_torque**2).sum(dim=-1).unsqueeze(-1) * energy_scale_factor
+def gait_phase(env: ManagerBasedRLEnv, period: float) -> torch.Tensor:
+    if not hasattr(env, "episode_length_buf"):
+        env.episode_length_buf = torch.zeros(env.num_envs, device=env.device, dtype=torch.long)
+
+    global_phase = (env.episode_length_buf * env.step_dt) % period / period
+
+    phase = torch.zeros(env.num_envs, 2, device=env.device)
+    phase[:, 0] = torch.sin(global_phase * torch.pi * 2.0)
+    phase[:, 1] = torch.cos(global_phase * torch.pi * 2.0)
+    return phase

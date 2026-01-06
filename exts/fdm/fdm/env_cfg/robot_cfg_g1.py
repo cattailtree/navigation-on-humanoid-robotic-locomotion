@@ -69,26 +69,78 @@ class UnitreeG1Dims:
     n_dof = len(G1_29DOF_JOINT_NAMES)
     contact_dim = 2
 
+from isaaclab.actuators import ImplicitActuatorCfg
+
 G1_CFG = UnitreeArticulationCfg(
     prim_path="{ENV_REGEX_NS}/Robot",
     spawn=UnitreeUsdFileCfg(
-        usd_path=f"/home/ubuntu/fdm/unitree_model/G1/29dof/usd/g1_29dof_rev_1_0/configuration/g1_29dof_rev_1_0_physics.usd"
+        usd_path="/home/ubuntu/fdm/unitree_model/G1/29dof/usd/g1_29dof_rev_1_0/configuration/g1_29dof_rev_1_0_physics.usd"
     ),
     init_state=ArticulationCfg.InitialStateCfg(
         pos=(0.0, 0.0, 0.8),
-        joint_pos={".*": 0.0},
         joint_vel={".*": 0.0},
     ),
     actuators={
-        joint_name: ImplicitActuatorCfg(
-            joint_names_expr=joint_name,
-            stiffness=20.0,
-            damping=0.5,
-        ) for joint_name in G1_29DOF_JOINT_NAMES
+        # ---------- legs ----------
+        "hips": ImplicitActuatorCfg(
+            joint_names_expr=[
+                "left_hip_pitch_joint", "right_hip_pitch_joint",
+                "left_hip_roll_joint",  "right_hip_roll_joint",
+                "left_hip_yaw_joint",   "right_hip_yaw_joint",
+            ],
+            stiffness=180.0,
+            damping=6.0,
+        ),
+        "knees": ImplicitActuatorCfg(
+            joint_names_expr=["left_knee_joint", "right_knee_joint"],
+            stiffness=260.0,
+            damping=10.0,
+        ),
+        "ankles": ImplicitActuatorCfg(
+            joint_names_expr=[
+                "left_ankle_pitch_joint", "right_ankle_pitch_joint",
+                "left_ankle_roll_joint",  "right_ankle_roll_joint",
+            ],
+            stiffness=90.0,
+            damping=3.5,
+        ),
+
+        # ---------- waist / torso ----------
+        "waist": ImplicitActuatorCfg(
+            joint_names_expr=["waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint"],
+            stiffness=140.0,
+            damping=5.0,
+        ),
+
+        # ---------- arms ----------
+        "shoulders": ImplicitActuatorCfg(
+            joint_names_expr=[
+                "left_shoulder_pitch_joint", "right_shoulder_pitch_joint",
+                "left_shoulder_roll_joint",  "right_shoulder_roll_joint",
+                "left_shoulder_yaw_joint",   "right_shoulder_yaw_joint",
+            ],
+            stiffness=60.0,
+            damping=2.5,
+        ),
+        "elbows": ImplicitActuatorCfg(
+            joint_names_expr=["left_elbow_joint", "right_elbow_joint"],
+            stiffness=45.0,
+            damping=2.0,
+        ),
+        "wrists": ImplicitActuatorCfg(
+            joint_names_expr=[
+                "left_wrist_roll_joint",  "right_wrist_roll_joint",
+                "left_wrist_pitch_joint", "right_wrist_pitch_joint",
+                "left_wrist_yaw_joint",   "right_wrist_yaw_joint",
+            ],
+            stiffness=25.0,
+            damping=1.2,
+        ),
     },
     joint_sdk_names=G1_29DOF_JOINT_NAMES.copy(),
 )
 G1_CFG.joint_names = G1_29DOF_JOINT_NAMES.copy()
+
 
 @configclass
 class G1PolicyCfg(ObsGroup):

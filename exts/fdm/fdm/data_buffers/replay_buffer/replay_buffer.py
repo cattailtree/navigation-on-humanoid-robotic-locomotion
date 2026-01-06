@@ -146,7 +146,7 @@ class ReplayBuffer:
 
         # update step counter for all environments
         # NOTE: we only start the counting once all feet were in contact
-        self.env_step_counter[feet_contact.to(self.device)] += 1
+        self.env_step_counter += 1
 
     def reset(self, env_ids: torch.Tensor | None = None):
         """Reset the buffer for the given environments"""
@@ -321,7 +321,7 @@ class ReplayBuffer:
         # update if environment is colliding
         updatable_envs[colliding_envs] = True
         # don't update if robot has not touched the ground yet (initial falling period after reset)
-        updatable_envs[~feet_contact] = False
+        #updatable_envs[~feet_contact] = False
         # write the current robot state into the buffer
         self.local_state_history[updatable_envs] = torch.roll(self.local_state_history[updatable_envs], 1, dims=1)
         self.local_state_history[updatable_envs, 0] = state[updatable_envs].to(self.device)
@@ -351,7 +351,7 @@ class ReplayBuffer:
             self.env_step_counter == self._data_collection_interval
         ].to(self.device)
         # don't update if robot has not touched the ground yet (initial falling period after reset)
-        updatable_envs[~feet_contact] = False
+        #updatable_envs[~feet_contact] = False
         # get the index of the updatable environments
         updatable_idxs = self._ALL_INDICES[updatable_envs]
         # check which environments are not complelty filled

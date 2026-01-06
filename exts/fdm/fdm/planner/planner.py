@@ -666,7 +666,7 @@ class FDMPlanner:
             torch.int
         ) == 0
         # don't update if robot has not touched the ground yet (initial falling period after reset)
-        updatable_envs[~feet_contact] = False
+        #updatable_envs[~feet_contact] = False
 
         # write the current robot state into the buffer
         self._state_history[updatable_envs] = torch.roll(self._state_history[updatable_envs], 1, dims=1)
@@ -682,7 +682,7 @@ class FDMPlanner:
 
         # update step counter for all environments
         # NOTE: we only start the counting once all feet were in contact
-        self._obs_env_step_counter[feet_contact] += 1
+        self._obs_env_step_counter += 1
 
     def _reset_obs_buffers(self, env_ids: torch.Tensor):
         # reset the step counter

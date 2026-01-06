@@ -52,7 +52,8 @@ class FDMRunnerCfg:
     collection_rounds: int = 20
     """Number of collection rounds. For each round, ``epochs`` number of epochs are trained."""
 
-    body_regex_contact_checking: str = ".*ankle_roll_link"
+    body_regex_contact_checking: str = "^(left|right)_ankle_roll_link$"
+
     """Regex to select the bodies for contact checking.
 
     During data collection, reset environments that haven't been in contact with the ground for a certain number of steps.

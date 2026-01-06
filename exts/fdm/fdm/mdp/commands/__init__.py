@@ -6,3 +6,4 @@
 
 from .mixed_command_generator import MixedCommand
 from .mixed_command_generator_cfg import MixedCommandCfg
+
