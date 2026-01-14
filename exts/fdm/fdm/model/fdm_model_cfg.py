@@ -138,7 +138,7 @@ class FDMBaseModelCfg(BaseModelCfg):
     """
     history_time_step: float | None = None
     """Time step of the history. If None, the time step is ``command_timestep / history_length``."""
-    collision_threshold: float = 0.2
+    collision_threshold: float = 0.5
     """Collision threshold for the collision prediction. Default is 0.5."""
     eval_distance_interval: float = 1.0
     """Distance interval for the evaluation metrics."""

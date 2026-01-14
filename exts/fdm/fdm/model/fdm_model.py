@@ -560,8 +560,9 @@ class FDMModel(Model):
             meta[f"{mode}{suffix} Perfect Velocity Position Loss [Batch]"] = model_loss / constant_perf_vel_loss
 
             if mode == "plot":
-                distance = torch.norm(target_state_traj[:, -1, :2] - target_state_traj[:, 0, :2], dim=-1)
-                distance = torch.clamp(distance, max=20.0)
+                # distance travelled per sample (end pos - start pos)
+                distances = torch.norm(target_state_traj[:, -1, :2] - target_state_traj[:, 0, :2], dim=-1)
+                distances = torch.clamp(distances, max=20.0)
                 # get the error in the position
                 pv_pos_error = torch.norm(eval_in[..., :2] - target_state_traj[..., :2], dim=-1)
 
@@ -569,19 +570,10 @@ class FDMModel(Model):
                 pred_collision_idx = torch.any(pred_collision_prob_traj > self.cfg.collision_threshold, dim=1)
 
                 # run the evaluation with distance intervals
-                for distance in torch.arange(
-                    self.cfg.eval_distance_interval,
-                    int(torch.max(torch.norm(target_state_traj[:, -1, :2], dim=1)).item())
-                    + self.cfg.eval_distance_interval,
-                    self.cfg.eval_distance_interval,
-                ):
+                max_dist = int(torch.max(distances).item()) + self.cfg.eval_distance_interval
+                for d in torch.arange(self.cfg.eval_distance_interval, max_dist, self.cfg.eval_distance_interval):
                     samples_within_distance = torch.all(
-                        torch.vstack((
-                            torch.norm(target_state_traj[:, -1, :2], dim=1) - self.cfg.eval_distance_interval
-                            < distance,
-                            torch.norm(target_state_traj[:, -1, :2], dim=1) > distance,
-                        )),
-                        dim=0,
+                        torch.vstack((distances - self.cfg.eval_distance_interval < d, distances > d)), dim=0
                     )
                     if torch.sum(samples_within_distance) == 0:
                         continue
@@ -589,16 +581,16 @@ class FDMModel(Model):
                     # mean of position offset
                     meta[
                         f"{mode}{suffix} Perfect Velocity Position Offset"
-                        f" {distance - self.cfg.eval_distance_interval:.2f} - {distance:.2f}m [Batch]"
+                        f" {float(d - self.cfg.eval_distance_interval):.2f} - {float(d):.2f}m [Batch]"
                     ] = torch.mean(pv_pos_error[samples_within_distance, -1]).item()
                     if torch.sum(samples_within_distance) > 1:
                         meta[
                             f"{mode}{suffix} Perfect Velocity Position Offset Std"
-                            f" {distance - self.cfg.eval_distance_interval:.2f} - {distance:.2f}m [Batch]"
+                            f" {float(d - self.cfg.eval_distance_interval):.2f} - {float(d):.2f}m [Batch]"
                         ] = torch.std(pv_pos_error[samples_within_distance, -1]).item()
                     meta[
                         f"{mode}{suffix} Relative Perfect Velocity Position Offset"
-                        f" {distance - self.cfg.eval_distance_interval:.2f} - {distance:.2f}m [Batch]"
+                        f" {float(d - self.cfg.eval_distance_interval):.2f} - {float(d):.2f}m [Batch]"
                     ] = (
                         torch.mean(
                             torch.norm(
@@ -609,7 +601,7 @@ class FDMModel(Model):
                         )
                         / meta[
                             f"{mode}{suffix} Perfect Velocity Position Offset"
-                            f" {distance - self.cfg.eval_distance_interval:.2f} - {distance:.2f}m [Batch]"
+                            f" {float(d - self.cfg.eval_distance_interval):.2f} - {float(d):.2f}m [Batch]"
                         ]
                     ).item()
 
@@ -617,46 +609,46 @@ class FDMModel(Model):
                     if torch.sum(collision_idx[samples_within_distance]) > 0:
                         meta[
                             f"{mode}{suffix} Perfect Velocity Position Offset"
-                            f" {distance - self.cfg.eval_distance_interval:.2f} - {distance:.2f}m [Collision]"
+                            f" {float(d - self.cfg.eval_distance_interval):.2f} - {float(d):.2f}m [Collision]"
                         ] = torch.mean(pv_pos_error[collision_idx & samples_within_distance, -1]).item()
                     if torch.sum(collision_idx[samples_within_distance]) > 1:
                         meta[
                             f"{mode}{suffix} Perfect Velocity Position Offset Std"
-                            f" {distance - self.cfg.eval_distance_interval:.2f} - {distance:.2f}m [Collision]"
+                            f" {float(d - self.cfg.eval_distance_interval):.2f} - {float(d):.2f}m [Collision]"
                         ] = torch.std(pv_pos_error[collision_idx & samples_within_distance, -1]).item()
 
                     if torch.sum(~collision_idx[samples_within_distance]) > 0:
                         meta[
                             f"{mode}{suffix} Perfect Velocity Position Offset"
-                            f" {distance - self.cfg.eval_distance_interval:.2f} - {distance:.2f}m [Non-Collision]"
+                            f" {float(d - self.cfg.eval_distance_interval):.2f} - {float(d):.2f}m [Non-Collision]"
                         ] = torch.mean(pv_pos_error[~collision_idx & samples_within_distance, -1]).item()
                     if torch.sum(~collision_idx[samples_within_distance]) > 1:
                         meta[
                             f"{mode}{suffix} Perfect Velocity Position Offset Std"
-                            f" {distance - self.cfg.eval_distance_interval:.2f} - {distance:.2f}m [Non-Collision]"
+                            f" {float(d - self.cfg.eval_distance_interval):.2f} - {float(d):.2f}m [Non-Collision]"
                         ] = torch.std(pv_pos_error[~collision_idx & samples_within_distance, -1]).item()
 
                     # split for predicted collision samples
                     if torch.sum(pred_collision_idx[samples_within_distance]) > 0:
                         meta[
                             f"{mode}{suffix} Perfect Velocity Position Offset"
-                            f" {distance - self.cfg.eval_distance_interval:.2f} - {distance:.2f}m [Pred Collision]"
+                            f" {float(d - self.cfg.eval_distance_interval):.2f} - {float(d):.2f}m [Pred Collision]"
                         ] = torch.mean(pv_pos_error[pred_collision_idx & samples_within_distance, -1]).item()
                     if torch.sum(pred_collision_idx[samples_within_distance]) > 1:
                         meta[
                             f"{mode}{suffix} Perfect Velocity Position Offset Std"
-                            f" {distance - self.cfg.eval_distance_interval:.2f} - {distance:.2f}m [Pred Collision]"
+                            f" {float(d - self.cfg.eval_distance_interval):.2f} - {float(d):.2f}m [Pred Collision]"
                         ] = torch.std(pv_pos_error[pred_collision_idx & samples_within_distance, -1]).item()
 
                     if torch.sum(~pred_collision_idx[samples_within_distance]) > 0:
                         meta[
                             f"{mode}{suffix} Perfect Velocity Position Offset"
-                            f" {distance - self.cfg.eval_distance_interval:.2f} - {distance:.2f}m [Pred Non-Collision]"
+                            f" {float(d - self.cfg.eval_distance_interval):.2f} - {float(d):.2f}m [Pred Non-Collision]"
                         ] = torch.mean(pv_pos_error[~pred_collision_idx & samples_within_distance, -1]).item()
                     if torch.sum(~pred_collision_idx[samples_within_distance]) > 1:
                         meta[
                             f"{mode}{suffix} Perfect Velocity Position Offset Std"
-                            f" {distance - self.cfg.eval_distance_interval:.2f} - {distance:.2f}m [Pred Non-Collision]"
+                            f" {float(d - self.cfg.eval_distance_interval):.2f} - {float(d):.2f}m [Pred Non-Collision]"
                         ] = torch.std(pv_pos_error[~pred_collision_idx & samples_within_distance, -1]).item()
 
                 # run the evaluation for the individual steps

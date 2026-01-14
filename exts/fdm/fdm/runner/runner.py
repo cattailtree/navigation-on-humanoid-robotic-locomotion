@@ -205,6 +205,13 @@ class FDMRunner:
             self.cfg.replay_buffer_cfg, self.model.cfg, self.env
         )
 
+        # print debug info about collection intervals from the runner (more reliable stdout)
+        print("[DBG] data_collection_interval =", self.replay_buffer.data_collection_interval,
+              "history_collection_interval =", self.replay_buffer.history_collection_interval,
+              "command_timestep =", self.model.cfg.command_timestep,
+              "step_dt =", self.env.step_dt,
+              flush=True)
+
         # ------------------------------------------------------------------
         # 7. trainer (uses D, but no longer controls encoder size)
         # ------------------------------------------------------------------
@@ -503,7 +510,7 @@ class FDMRunner:
                 ),
                 actions=actions.clone(),
                 dones=dones.to(torch.bool).clone(),
-                feet_contact=feet_all_contact,
+                feet_contact=self.feet_contact,
                 add_observation_exteroceptive=(
                     obs["fdm_add_obs_exteroceptive"] if "fdm_add_obs_exteroceptive" in obs else None
                 ),
@@ -826,7 +833,7 @@ class FDMRunner:
                 ),
                 actions=actions.clone(),
                 dones=dones.to(torch.bool).clone(),
-                feet_contact=feet_all_contact,
+                feet_contact=self.feet_contact,
                 add_observation_exteroceptive=(
                     obs["fdm_add_obs_exteroceptive"] if "fdm_add_obs_exteroceptive" in obs else None
                 ),
@@ -1221,7 +1228,7 @@ class FDMRunner:
                 ),
                 actions=actions.clone(),
                 dones=dones.to(torch.bool).clone(),
-                feet_contact=feet_all_contact,
+                feet_contact=self.feet_contact,
                 add_observation_exteroceptive=(
                     obs["fdm_add_obs_exteroceptive"] if "fdm_add_obs_exteroceptive" in obs else None
                 ),
@@ -1320,74 +1327,173 @@ class FDMRunner:
         print("[INFO]: Data collection complete.")
 
     @torch.inference_mode()
-        
     def _feet_contact_handler(
         self, dones: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor | dict[str, torch.Tensor]] | None]:
-        # 1) done 的 env 先清零计数（保持语义）
-        self.feet_non_contact_counter[dones] = 0
+        device = self.env.device
+        N = self.env.num_envs
 
+        # -------------------------
+        # 0) lazy init state
+        # -------------------------
+        if not hasattr(self, "feet_non_contact_counter"):
+            self.feet_non_contact_counter = torch.zeros(N, dtype=torch.int32, device=device)
+
+        if not hasattr(self, "feet_contact_initialized"):
+            self.feet_contact_initialized = torch.zeros(N, dtype=torch.bool, device=device)
+
+        # 去抖/滞回计数器：any_contact 连续为真/为假
+        if not hasattr(self, "_any_on_cnt"):
+            self._any_on_cnt = torch.zeros(N, dtype=torch.int32, device=device)
+        if not hasattr(self, "_any_off_cnt"):
+            self._any_off_cnt = torch.zeros(N, dtype=torch.int32, device=device)
+
+        # 窗口初始化：左右脚是否“触地过一次”
+        if not hasattr(self, "_foot_touched"):
+            # shape (N, nfeet) 这里假设 nfeet=2
+            self._foot_touched = torch.zeros(N, 2, dtype=torch.bool, device=device)
+            # 初始化窗口倒计时（避免 touched 永远挂着）：窗口内两脚都触地才算初始化
+            self._init_window_left = torch.zeros(N, dtype=torch.int32, device=device)
+
+        # 可调超参（先用这套默认值，后面再按你日志调）
+        contact_th = 2.0               # 比 5 更宽松：先稳定，再慢慢往上加
+        ON_FRAMES_FOR_GROUNDED = 6     # any_contact 连续 >=1 帧，认为“稳定触地”
+        OFF_FRAMES_FOR_RESET = 200     # 连续 >=200 帧完全没接触才 reset（你原来就是 200）
+
+        INIT_WINDOW = 80              # 初始化窗口长度：80 steps 内左右脚都触地过一次即可
+        OFF_FRAMES_CLEAR_GROUNDED = 6  # any_contact 连续 >=6 帧为假，才认为“真的离地”(滞回)
+
+        # -------------------------
+        # 1) 对 done env 清状态
+        # -------------------------
+        self.feet_non_contact_counter[dones] = 0
+        self._any_on_cnt[dones] = 0
+        self._any_off_cnt[dones] = 0
+        self.feet_contact_initialized[dones] = False
+        self._foot_touched[dones] = False
+        self._init_window_left[dones] = 0
+
+        # -------------------------
         # 2) per-foot 接触判断
+        # -------------------------
         forces = torch.norm(
             self.env.scene.sensors["contact_forces"].data.net_forces_w[:, self.feet_idx],
             dim=-1,
-        )  # (N, nfeet)
+        )  # (N, 2)
 
-        # 阈值先别太大：两足脚底接触力可能小于你想象，建议先用 1~5
-        contact_th = 5.0
-        self.feet_contact = forces > contact_th  # (N, nfeet)
+        per_foot_contact = forces > contact_th          # (N,2)
+        any_contact = torch.any(per_foot_contact, dim=-1)  # (N,)
+        # all_contact = torch.all(per_foot_contact, dim=-1)
+        self.feet_contact = per_foot_contact
 
-        feet_any_contact = torch.any(self.feet_contact, dim=-1)  # (N,)
-        feet_all_contact = torch.all(self.feet_contact, dim=-1)  # (N,)
+        # -------------------------
+        # 3) any_contact 去抖 + 滞回（得到稳定触地信号 grounded_stable）
+        # -------------------------
+        self._any_on_cnt = torch.where(any_contact, self._any_on_cnt + 1, torch.zeros_like(self._any_on_cnt))
+        self._any_off_cnt = torch.where(~any_contact, self._any_off_cnt + 1, torch.zeros_like(self._any_off_cnt))
 
-        # 3) 可选：只在“起步阶段”要求 all_contact 达成一次
-        if not hasattr(self, "feet_contact_initialized"):
-            self.feet_contact_initialized = torch.zeros(
-                self.env.num_envs, dtype=torch.bool, device=self.env.device
-            )
+        grounded_rise = self._any_on_cnt >= ON_FRAMES_FOR_GROUNDED
+        grounded_fall = self._any_off_cnt >= OFF_FRAMES_CLEAR_GROUNDED
 
-        # dones 的 env 重新初始化
-        self.feet_contact_initialized[dones] = False
+        if not hasattr(self, "grounded_stable"):
+            self.grounded_stable = torch.zeros(N, dtype=torch.bool, device=device)
 
-        # 一旦某 env 达到过 all_contact，则认为起步完成
-        self.feet_contact_initialized |= feet_all_contact
+        # 滞回更新：rise 置 True，fall 才置 False
+        self.grounded_stable = torch.where(grounded_rise, torch.ones_like(self.grounded_stable), self.grounded_stable)
+        self.grounded_stable = torch.where(grounded_fall, torch.zeros_like(self.grounded_stable), self.grounded_stable)
 
-        # 起步前：要求双脚都触地；起步后：允许单脚支撑
-        feet_ok = torch.where(
-            self.feet_contact_initialized,
-            feet_any_contact,
-            feet_all_contact,
+        # -------------------------
+        # 4) 初始化逻辑：不要求同一帧双脚 all_contact
+        #    而是 INIT_WINDOW steps 内左右脚都触地过一次
+        # -------------------------
+        # 开始窗口：只要还没 initialized，就让窗口倒计时跑起来
+        need_init = ~self.feet_contact_initialized
+        # 如果窗口没开过，就打开
+        self._init_window_left = torch.where(
+            need_init & (self._init_window_left == 0),
+            torch.full_like(self._init_window_left, INIT_WINDOW),
+            self._init_window_left,
+        )
+        # 窗口倒计时（只对 need_init 的 env）
+        self._init_window_left = torch.where(
+            need_init & (self._init_window_left > 0),
+            self._init_window_left - 1,
+            self._init_window_left,
         )
 
-        # 4) 计数器：统计“完全没脚接触”的持续时间（用 any_contact 做更合理）
-        self.feet_non_contact_counter[feet_any_contact] = 0
-        self.feet_non_contact_counter[~feet_any_contact] += 1
+        # 记录“触地过”的脚
+        self._foot_touched = torch.where(
+            need_init.unsqueeze(-1),
+            self._foot_touched | per_foot_contact,
+            self._foot_touched,
+        )
 
-        # 5) 长时间没接触则 reset
+        # nfeet=2: 左右都 touched 即初始化成功
+        both_touched = self._foot_touched[:, 0] & self._foot_touched[:, 1]
+        self.feet_contact_initialized |= both_touched
+
+        # 若窗口耗尽仍未完成，则重置窗口记录，重新来一轮（避免永远卡死）
+        window_expired = need_init & (self._init_window_left == 0) & (~both_touched)
+        if torch.any(window_expired):
+            self._foot_touched[window_expired] = False
+            self._init_window_left[window_expired] = INIT_WINDOW
+
+        # -------------------------
+        # 5) feet_ok：给“环境逻辑/状态机”用（能通过起步检查）
+        #    起步前：要求“左右都触地过一次”(initialized 变 True)
+        #    起步后：用 grounded_stable（允许单脚支撑，但要稳定）
+        # -------------------------
+        feet_ok = torch.where(self.feet_contact_initialized, self.grounded_stable, both_touched)
+
+        # -------------------------
+        # 6) reset 计数：用最宽松的 any_contact（不去抖也行，但你现在用 any_contact 就很好）
+        # -------------------------
+        self.feet_non_contact_counter[any_contact] = 0
+        self.feet_non_contact_counter[~any_contact] += 1
+
         obs = None
-        reset_envs = self.feet_non_contact_counter > 200
+        reset_envs = self.feet_non_contact_counter > OFF_FRAMES_FOR_RESET
         if torch.any(reset_envs):
             print("[WARNING]: Resetting environments that have not touched the ground for a while.")
             self.env._reset_idx(self.agent._ALL_INDICES[reset_envs])
             obs = self.env.observation_manager.compute()
             dones[reset_envs] = True
             self.feet_non_contact_counter[reset_envs] = 0
+            self._any_on_cnt[reset_envs] = 0
+            self._any_off_cnt[reset_envs] = 0
+            self.grounded_stable[reset_envs] = False
             self.feet_contact_initialized[reset_envs] = False
+            self._foot_touched[reset_envs] = False
+            self._init_window_left[reset_envs] = 0
 
-        # 6) debug 打印（别引用未定义变量）
-        if torch.rand(1).item() < 0.01:
+        # -------------------------
+        # 7) debug
+        # -------------------------
+        if torch.rand(1).item() < 0.001:
             e = 0
             print(
                 "forces:", forces[e].tolist(),
-                "contact:", self.feet_contact[e].tolist(),
-                "all:", feet_all_contact[e].item(),
-                "any:", feet_any_contact[e].item(),
+                "per_foot_contact:", per_foot_contact[e].tolist(),
+                "any:", any_contact[e].item(),
+                "grounded_stable:", self.grounded_stable[e].item(),
                 "init:", self.feet_contact_initialized[e].item(),
+                "touched:", self._foot_touched[e].tolist(),
                 "feet_ok:", feet_ok[e].item(),
+                "non_contact_cnt:", int(self.feet_non_contact_counter[e].item()),
                 flush=True,
             )
+        if torch.rand(1).item() < 0.001:
+            print("any_contact ratio:", any_contact.float().mean().item(),
+                "will_reset:", int((self.feet_non_contact_counter > 200).sum().item()),
+                "max_cnt:", int(self.feet_non_contact_counter.max().item()),
+                flush=True)
+
+
+        # 额外：把“采集用的稳定接触”也暴露出去，后面 buffer gating 要用它
+        self.grounded_for_buffer = self.grounded_stable  # 你也可以更严格：grounded_rise
 
         return feet_ok, dones, obs
+
 
 
     def _eval_predict(self, env_ids: torch.Tensor, model: FDMModel | None = None):

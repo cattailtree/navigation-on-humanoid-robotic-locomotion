@@ -168,6 +168,9 @@ class ReplayBuffer:
         self.states[env_ids] = 0
         self.observations_proprioceptive[env_ids] = 0
         self.actions[env_ids] = 0
+        if hasattr(self, "_has_touched_ground"):
+            self._has_touched_ground[env_ids] = False   # env_ids=None 就全清
+
 
         if self._has_add_exteroceptive_observation:
             self.add_observations_exteroceptive[env_ids] = 0
@@ -309,29 +312,39 @@ class ReplayBuffer:
         self.fill_idx = torch.zeros(self.env.num_envs, device=self.device, dtype=torch.long)
         self.env_step_counter = torch.zeros(self.env.num_envs, device=self.device, dtype=torch.long)
 
-    def _update_local_history_buffers(
-        self,
-        colliding_envs: torch.Tensor,
-        state: torch.Tensor,
-        obersevations_proprioceptive: torch.Tensor,
-        feet_contact: torch.Tensor,
-    ):
-        # local robot state history buffer
-        updatable_envs = (self.env_step_counter % self._history_collection_interval).type(torch.int) == 0  # noqa: E721
-        # update if environment is colliding
-        updatable_envs[colliding_envs] = True
-        # don't update if robot has not touched the ground yet (initial falling period after reset)
-        #updatable_envs[~feet_contact] = False
-        # write the current robot state into the buffer
+    def _update_local_history_buffers(self, colliding_envs, state, obersevations_proprioceptive, feet_contact):
+        # ---- 统一 device / dtype：所有 mask 都在 self.device 且为 bool ----
+        colliding_envs = colliding_envs.to(self.device, dtype=torch.bool)
+
+        # feet_contact 允许 (N,) 或 (N,K)，先搬到 self.device
+        feet_contact = feet_contact.to(self.device)
+        feet_any = feet_contact.any(dim=-1) if feet_contact.ndim == 2 else feet_contact.to(torch.bool)  # (N,) bool on self.device
+
+        # base schedule mask（bool on self.device）
+        updatable_envs = ((self.env_step_counter % self._history_collection_interval) == 0).to(self.device)
+
+        # collision 强制更新（仍然 bool）
+        updatable_envs |= colliding_envs
+
+        # ---- sticky 触地闸门（永远在 self.device）----
+        if not hasattr(self, "_has_touched_ground") or self._has_touched_ground.device != self.device:
+            self._has_touched_ground = torch.zeros(self.env.num_envs, dtype=torch.bool, device=self.device)
+
+        self._has_touched_ground |= feet_any
+
+        # 触地前不更新；触地后允许更新
+        updatable_envs &= self._has_touched_ground
+        # -----------------------------------------------
+
+        # 写入 history（state/proprio 也按需搬到 self.device）
         self.local_state_history[updatable_envs] = torch.roll(self.local_state_history[updatable_envs], 1, dims=1)
         self.local_state_history[updatable_envs, 0] = state[updatable_envs].to(self.device)
-        # write the current proprioceptive observation into the buffer
+
         self.local_proprioceptive_observation_history[updatable_envs] = torch.roll(
             self.local_proprioceptive_observation_history[updatable_envs], 1, dims=1
         )
-        self.local_proprioceptive_observation_history[updatable_envs, 0] = obersevations_proprioceptive[
-            updatable_envs
-        ].to(self.device)
+        self.local_proprioceptive_observation_history[updatable_envs, 0] = obersevations_proprioceptive[updatable_envs].to(self.device)
+
 
     def _update_full_trajectory_buffers(
         self,
@@ -341,26 +354,31 @@ class ReplayBuffer:
         feet_contact: torch.Tensor,
         add_observation_exteroceptive: torch.Tensor | None,
     ):
-        # for updatable environments, store the state, proprioceptive observation, exteroceptive observation and action
-        updatable_envs = (self.env_step_counter % self._data_collection_interval).type(torch.int) == 0  # noqa: E721
-        # filter if step is 0
+        colliding_envs = colliding_envs.to(self.device, dtype=torch.bool)
+        feet_contact = feet_contact.to(self.device)
+
+        updatable_envs = ((self.env_step_counter % self._data_collection_interval) == 0).to(self.device)
         updatable_envs[self.env_step_counter == 0] = False
-        # enable if environment is colliding
         updatable_envs[colliding_envs] = True
-        updatable_envs[self.env_step_counter == self._data_collection_interval] = ~colliding_envs[
-            self.env_step_counter == self._data_collection_interval
-        ].to(self.device)
-        # don't update if robot has not touched the ground yet (initial falling period after reset)
-        #updatable_envs[~feet_contact] = False
-        # get the index of the updatable environments
+        interval_mask = (self.env_step_counter == self._data_collection_interval)
+        if torch.any(interval_mask):
+            updatable_envs[interval_mask] = ~colliding_envs[interval_mask]
+
+        # ===== sticky once-grounded gate（只依赖 feet_contact）=====
+        feet_any = feet_contact.any(dim=-1) if feet_contact.ndim == 2 else feet_contact.to(torch.bool)  # (N,) bool on self.device
+        if not hasattr(self, "_has_touched_ground") or self._has_touched_ground.device != self.device:
+            self._has_touched_ground = torch.zeros(self.env.num_envs, dtype=torch.bool, device=self.device)
+        self._has_touched_ground |= feet_any
+
+        updatable_envs &= self._has_touched_ground
+        updatable_envs[colliding_envs] &= self._has_touched_ground[colliding_envs]  # 防空中碰撞污染
+        # ==========================================================
         updatable_idxs = self._ALL_INDICES[updatable_envs]
-        # check which environments are not complelty filled
         env_non_full = ~self.env_buffer_filled[updatable_idxs]
         updatable_idxs = updatable_idxs[env_non_full]
-        # check if any environment to be updated
         if len(updatable_idxs) == 0:
             return
-
+        
         # write state with history into buffer
         self.states[updatable_idxs, self.fill_idx[updatable_idxs]] = self.local_state_history[updatable_idxs].clone()
         # write propriocpetive observations with history into buffer

@@ -399,7 +399,9 @@ class TrajectoryDataset(Dataset):
         step_norm = torch.norm(step_xy, dim=-1)
 
         # 两足这里要放宽
-        bad_step = (step_norm > 1.5).any(dim=1)   # ← 四足我会用 1.0，这里是 1.5
+        step_spike = (step_norm > 3.0)            # (N, H-1)
+        bad_step = (step_spike.float().mean(dim=1) > 0.50)  # 超过10%的步异常才丢
+
 
 
         # ---------- 3. yaw 跳变（两足非常关键） ----------

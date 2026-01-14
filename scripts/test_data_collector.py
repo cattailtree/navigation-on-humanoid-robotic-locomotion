@@ -84,7 +84,7 @@ def main():
         #     project_uvw=True,
         # ),
         debug_vis=False,
-        usd_uniform_env_spacing=10.0,  # 10m spacing between environment origins in the usd environment
+        env_spacing=10.0,  # 10m spacing between environment origins in the usd environment
     )
     # turn of logging
     cfg.trainer_cfg.logging = False
