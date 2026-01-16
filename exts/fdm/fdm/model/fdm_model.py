@@ -329,7 +329,7 @@ class FDMModel(Model):
 
         r = y.float().mean().clamp(1e-3, 1-1e-3)   # 正例比例
         pos_w = ((1 - r) / r).detach()             # 经典 balanced 权重：neg/pos
-        pos_w = pos_w.clamp(0.25, 4.0)
+        pos_w = pos_w.clamp(1.0, 50.0)
         neg_w = 1.0
 
         # element-wise weighted BCE
@@ -493,43 +493,62 @@ class FDMModel(Model):
         heading_loss = torch.sum(torch.stack(heading_loss_list) * weights, dim=0)
         return heading_loss, heading_loss_list
 
-    def _position_loss(
-        self, pred_state_traj: torch.Tensor, target_state_traj: torch.Tensor
-    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        # 使用 delta position，而不是绝对位置
-        position_loss_list = []
+    def _position_loss(self, pred_state_traj: torch.Tensor, target_state_traj: torch.Tensor):
+    # pred_state_traj: (B,T,D), target_state_traj: (B,T,D)
+        B, T, _ = pred_state_traj.shape
 
-        for idx in range(1, pred_state_traj.shape[1]):
-            pred_delta = pred_state_traj[:, idx, :2] - pred_state_traj[:, idx - 1, :2]
-            tgt_delta = target_state_traj[:, idx, :2] - target_state_traj[:, idx - 1, :2]
+        # delta xy: (B, T-1, 2)
+        pred_delta = pred_state_traj[:, 1:, :2] - pred_state_traj[:, :-1, :2]
+        tgt_delta  = target_state_traj[:, 1:, :2] - target_state_traj[:, :-1, :2]
 
-            loss = self.position_loss(pred_delta, tgt_delta)
-            position_loss_list.append(loss)
-        T = pred_state_traj.shape[1]
-        gamma = 0.95  # 0.9~0.97 都行，人形建议先 0.95
-        weights = (gamma ** torch.arange(T, device=self.device)).float()
+        # per-step loss: (T-1,) or (B,T-1) depending on your criterion
+        # I recommend criterion returns (B,T-1) with reduction='none', then average later.
+        per_step = self.position_loss(pred_delta, tgt_delta)
+
+        # Make per_step shape be (T-1,) by averaging over batch if needed
+        if per_step.dim() == 2:          # (B, T-1)
+            per_step_mean = per_step.mean(dim=0)   # (T-1,)
+        elif per_step.dim() == 1:        # (T-1,)
+            per_step_mean = per_step
+        else:
+            # if scalar, just return
+            return per_step, [per_step]
+
+        gamma = 0.95
+        weights = (gamma ** torch.arange(T-1, device=pred_state_traj.device)).float()
         weights = weights / weights.sum()
 
-        position_loss = torch.sum(torch.stack(position_loss_list), dim=0)
+        position_loss = (per_step_mean * weights).sum()
+        position_loss_list = list(per_step_mean)  # 用于你外面打印 horizon loss
+
         return position_loss, position_loss_list
 
 
     def _stop_loss(
-        self, pred_state_traj: torch.Tensor, target_collision_state_traj: torch.Tensor, target_state_traj: torch.Tensor
+        self,
+        pred_state_traj: torch.Tensor,          # (B, T, 4) = [x,y,yaw,v]
+        target_collision_state_traj: torch.Tensor,  # (B, T)
+        target_state_traj: torch.Tensor         # (B, T, 4)
     ) -> torch.Tensor:
-        # find first collision timestep per sample
-        collision_mask = target_collision_state_traj == 1
-        first_collision_idx = collision_mask.float().argmax(dim=1)
 
-        valid = collision_mask.any(dim=1)
+        collision_mask = target_collision_state_traj == 1   # (B, T)
+        valid = collision_mask.any(dim=1)                    # (B,)
 
-        stop_loss = self.stop_loss(
-            pred_state_traj[valid, first_collision_idx[valid]],
-            target_state_traj[valid, first_collision_idx[valid]],
+        if not valid.any():
+            return torch.tensor(0.0, device=pred_state_traj.device)
+
+        # first collision timestep per sample
+        first_t = collision_mask.float().argmax(dim=1)       # (B,)
+
+        # 只约束速度 v（第 3 维）
+        pred_v = pred_state_traj[valid, first_t[valid], 3]  # (N,)
+        tgt_v  = torch.zeros_like(pred_v)                    # 希望碰撞时 v ≈ 0
+
+        stop_loss = torch.nn.functional.smooth_l1_loss(
+            pred_v, tgt_v, reduction="mean"
         )
-
-        stop_loss = torch.tensor(0.0, device=self.device) if torch.isnan(stop_loss) else stop_loss
         return stop_loss
+
 
     """
     Eval metric components

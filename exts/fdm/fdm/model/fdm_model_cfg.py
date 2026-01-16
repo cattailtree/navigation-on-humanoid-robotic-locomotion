@@ -92,12 +92,12 @@ class FDMBaseModelCfg(BaseModelCfg):
     """
 
     loss_weights: dict[str, float] = {
-        "collision": 3.0,
-        "position": 2.5,
+        "collision": 5.0,
+        "position": 1.0,
         "heading": 1.5,
         "velocity": 0.0,
         "acceleration": 0.0,
-        "stop": 0.00015,
+        "stop": 0.1,
         "energy": 0.0,
     }
     """Loss weights for the different terms."""

@@ -399,8 +399,8 @@ class TrajectoryDataset(Dataset):
         step_norm = torch.norm(step_xy, dim=-1)
 
         # 两足这里要放宽
-        step_spike = (step_norm > 3.0)            # (N, H-1)
-        bad_step = (step_spike.float().mean(dim=1) > 0.50)  # 超过10%的步异常才丢
+        step_spike = (step_norm > 5.0)            # (N, H-1)
+        bad_step = (step_spike.float().mean(dim=1) > 0.10)  # 超过10%的步异常才丢
 
 
 
@@ -408,8 +408,8 @@ class TrajectoryDataset(Dataset):
         yaw = self.states[:, :, 3]  # 直接就是 yaw(rad)
         yaw_diff = math_utils.wrap_to_pi(yaw[:, 1:] - yaw[:, :-1]).abs()
 
-        bad_yaw = ((yaw_diff / dt) > 50.0).any(dim=1)   # 建议 4~6 rad/s；你想更宽可以设到 10
-        outlier_mask = bad_dist | bad_step | bad_yaw
+        bad_yaw = ((yaw_diff / dt) > 10.0).any(dim=1)   # 建议 4~6 rad/s；你想更宽可以设到 10
+        outlier_mask = bad_dist | bad_yaw | bad_step
         outlier_idx = torch.where(outlier_mask)[0]
 
         outlier_ratio = outlier_mask.float().mean().item()
