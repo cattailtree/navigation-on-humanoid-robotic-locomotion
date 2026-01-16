@@ -11,7 +11,7 @@ import prettytable
 import torch
 import torch.nn as nn
 from typing import TYPE_CHECKING
-
+import torch.nn.functional as F
 from torchmetrics.classification import BinaryAccuracy, BinaryPrecision, BinaryRecall
 
 from isaaclab.utils import math as math_utils
@@ -493,33 +493,23 @@ class FDMModel(Model):
         heading_loss = torch.sum(torch.stack(heading_loss_list) * weights, dim=0)
         return heading_loss, heading_loss_list
 
-    def _position_loss(self, pred_state_traj: torch.Tensor, target_state_traj: torch.Tensor):
-    # pred_state_traj: (B,T,D), target_state_traj: (B,T,D)
+    def _position_loss(self, pred_state_traj, target_state_traj):
         B, T, _ = pred_state_traj.shape
 
-        # delta xy: (B, T-1, 2)
-        pred_delta = pred_state_traj[:, 1:, :2] - pred_state_traj[:, :-1, :2]
+        pred_delta = pred_state_traj[:, 1:, :2] - pred_state_traj[:, :-1, :2]   # (B,T-1,2)
         tgt_delta  = target_state_traj[:, 1:, :2] - target_state_traj[:, :-1, :2]
 
-        # per-step loss: (T-1,) or (B,T-1) depending on your criterion
-        # I recommend criterion returns (B,T-1) with reduction='none', then average later.
-        per_step = self.position_loss(pred_delta, tgt_delta)
-
-        # Make per_step shape be (T-1,) by averaging over batch if needed
-        if per_step.dim() == 2:          # (B, T-1)
-            per_step_mean = per_step.mean(dim=0)   # (T-1,)
-        elif per_step.dim() == 1:        # (T-1,)
-            per_step_mean = per_step
-        else:
-            # if scalar, just return
-            return per_step, [per_step]
+        # SmoothL1 per-element -> (B,T-1,2)
+        per_elem = F.smooth_l1_loss(pred_delta, tgt_delta, reduction="none")
+        per_step = per_elem.mean(dim=-1)        # (B,T-1) 先把xy维合掉
+        per_step_mean = per_step.mean(dim=0)    # (T-1,) 再把batch合掉（用于打印 horizon）
 
         gamma = 0.95
         weights = (gamma ** torch.arange(T-1, device=pred_state_traj.device)).float()
         weights = weights / weights.sum()
 
-        position_loss = (per_step_mean * weights).sum()
-        position_loss_list = list(per_step_mean)  # 用于你外面打印 horizon loss
+        position_loss = (per_step_mean * weights).sum()   # 标量
+        position_loss_list = list(per_step_mean.detach()) # 长度=T-1，logger 不会再是 1
 
         return position_loss, position_loss_list
 
