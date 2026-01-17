@@ -13,7 +13,7 @@ import torch.nn as nn
 from typing import TYPE_CHECKING
 import torch.nn.functional as F
 from torchmetrics.classification import BinaryAccuracy, BinaryPrecision, BinaryRecall
-
+import torch
 from isaaclab.utils import math as math_utils
 
 from .model_base import Model
@@ -481,16 +481,35 @@ class FDMModel(Model):
     def _heading_loss(
         self, pred_state_traj: torch.Tensor, target_state_traj: torch.Tensor
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        heading_loss_list = [
-            self.heading_loss(pred_state_traj[:, idx, 2:], target_state_traj[:, idx, 2:])
-            for idx in range(pred_state_traj.shape[1])
-        ]
-        T = pred_state_traj.shape[1]
+        """
+        pred_state_traj/target_state_traj: (B, T, 4) = [x, y, yaw, v]
+        Only supervise yaw with a wrapped angle difference to avoid NaNs.
+        Returns:
+        - heading_loss: scalar
+        - heading_loss_list: list of length T (per-horizon mean loss) for logging
+        """
+        B, T, _ = pred_state_traj.shape
+        if T == 0:
+            zero = pred_state_traj.new_tensor(0.0)
+            return zero, []
+
+        pred_yaw = pred_state_traj[:, :, 2]     # (B, T)
+        tgt_yaw  = target_state_traj[:, :, 2]   # (B, T)
+
+        # wrap to [-pi, pi]
+        d = pred_yaw - tgt_yaw
+        d = torch.atan2(torch.sin(d), torch.cos(d))  # (B, T)
+
+        # per-step mean over batch -> (T,)
+        per_step_mean = d.abs().mean(dim=0)          # (T,)
+
         gamma = 0.95
-        weights = (gamma ** torch.arange(T, device=self.device)).float()
+        weights = (gamma ** torch.arange(T, device=pred_state_traj.device)).float()
         weights = weights / weights.sum()
 
-        heading_loss = torch.sum(torch.stack(heading_loss_list) * weights, dim=0)
+        heading_loss = (per_step_mean * weights).sum()      # scalar
+        heading_loss_list = [x.detach() for x in per_step_mean]
+
         return heading_loss, heading_loss_list
 
     def _position_loss(self, pred_state_traj, target_state_traj):
