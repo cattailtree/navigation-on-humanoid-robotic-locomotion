@@ -38,10 +38,10 @@ class TrainerBaseCfg:
     """Rate of samples that are in collision."""
     # test_datasets: str | list[str] | None = None
     test_datasets: str | list[str] | None = [
-        "{LOG_DIR}/test_datasets/plane.pkl",
-        "{LOG_DIR}/test_datasets/PILLAR_EVAL_CFG.pkl",
-        "{LOG_DIR}/test_datasets/STAIRS_WALL_EVAL_CFG.pkl",
-        "{LOG_DIR}/test_datasets/STAIRS_RAMP_EVAL_CFG.pkl",
+        "/home/ubuntu/fdm/exts/fdm/data/Terrains/test_datasets/plane_reducedObs_noTorque.pkl",
+        "/home/ubuntu/fdm/exts/fdm/data/Terrains/test_datasets/PILLAR_EVAL_CFG_reducedObs_noTorque.pkl",
+        "/home/ubuntu/fdm/exts/fdm/data/Terrains/test_datasets/STAIRS_WALL_EVAL_CFG_reducedObs_noTorque.pkl",
+        "/home/ubuntu/fdm/exts/fdm/data/Terrains/test_datasets/STAIRS_RAMP_EVAL_CFG_reducedObs_noTorque.pkl",
     ]
     """Static Test Datasets collected from different environments"""
     real_world_train_datasets: str | list[str] | None = None
