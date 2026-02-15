@@ -46,5 +46,4 @@ outputs/
 exts/fdm/data/Terrains/test_datasets/
 **/test_datasets/
 
-# --- private env configs ---
-**/env_cfg*
+
