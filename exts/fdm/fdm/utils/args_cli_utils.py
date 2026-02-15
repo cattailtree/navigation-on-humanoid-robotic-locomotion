@@ -161,10 +161,6 @@ def robot_changes(
         if isinstance(cfg, fdm_runner.FDMRunnerCfg):
             cfg.trainer_cfg.encoder_resume = None
         cfg.body_regex_contact_checking: str = "^(left|right)_ankle_roll_link$"
-
-
-        # NOTE: remove when test datasets are available
-        cfg.trainer_cfg.test_datasets = None
         return cfg
 
 

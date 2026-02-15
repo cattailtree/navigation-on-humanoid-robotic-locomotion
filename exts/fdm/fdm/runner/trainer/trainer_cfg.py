@@ -72,7 +72,7 @@ class TrainerBaseCfg:
     # weight decay and learning rate
     weight_decay: float = 1e-4  # Dec03 Model: 5e-5;  Nov19 Model: 1e-4
     """Weight decay for the optimizer."""
-    learning_rate: float = 3e-2
+    learning_rate: float = 5e-4
     """Learning rate for the optimizer."""
 
     # saving and logging
