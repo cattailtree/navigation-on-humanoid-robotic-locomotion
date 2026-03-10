@@ -206,7 +206,7 @@ def run_eval(runner: fdm_runner_cfg.FDMRunner, args_cli: argparse.Namespace):
     # Create baseline model data
     ###
 
-    if args_cli.ablation_mode is None:
+    if False and args_cli.ablation_mode is None:
         # close prev environment
         runner.close()
         # create a new stage
@@ -312,7 +312,7 @@ def run_eval(runner: fdm_runner_cfg.FDMRunner, args_cli: argparse.Namespace):
     plot_metrics_with_grid(distance_meta_summary, os.path.join(dir_path, "plots"), only_first_row=True)
 
     # if ablation mode is not None, we do not need to plot the baseline
-    if args_cli.ablation_mode is not None:
+    if False and args_cli.ablation_mode is not None:
         print("Done evaluated the model")
         return
 

@@ -47,3 +47,9 @@ def add_fdm_args(parser: argparse.ArgumentParser, default_num_envs: int = 2048):
     parser.add_argument("--timestamp", type=float, default=None, help="Command timestep of the model.")
     parser.add_argument("--friction", action="store_true", default=False, help="Vary friction for each robot.")
     parser.add_argument("-d", "--debug", action="store_true", default=False, help="Enable debug mode.")
+    parser.add_argument(
+        "--include_baseline",
+        action="store_true",
+        default=False,
+        help="Also run the baseline comparison/evaluation step when finishing training or during eval.",
+    )

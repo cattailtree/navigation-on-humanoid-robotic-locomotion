@@ -49,7 +49,7 @@ class FDMRunnerCfg:
     """Replay buffer config class"""
 
     # general configurations
-    collection_rounds: int = 20
+    collection_rounds: int = 200
     """Number of collection rounds. For each round, ``epochs`` number of epochs are trained."""
 
     body_regex_contact_checking: str = "^(left|right)_ankle_roll_link$"

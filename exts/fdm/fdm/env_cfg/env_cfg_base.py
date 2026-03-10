@@ -147,7 +147,7 @@ class ActionsCfg:
         ),
         low_level_decimation=4,
         # ✅ 这里换成你训练好的 G1 行走策略 .pt（现在暂时用 ANYmal 路径也行，记得之后改）
-        low_level_policy_file="/home/ubuntu/fdm/exts/fdm/data/ANYmal-D-New/policy.pt",
+        low_level_policy_file="/data1/home/liao_junhong/fdm/exts/fdm/data/ANYmal-D-New/policy.pt",
         # NavigationSE2Action 在 apply_actions 里会用这个 group 名去取低层 obs
         low_level_obs_group="policy",
     )

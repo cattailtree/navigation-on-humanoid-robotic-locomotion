@@ -136,7 +136,7 @@ class ActionsCfg:
         low_level_action=mdp.JointPositionActionCfg(
             asset_name="robot", joint_names=[".*"], scale=1.0, use_default_offset=False
         ),
-        low_level_policy_file="/home/ubuntu/fdm/exts/fdm/data/ANYmal-D-New/policy.pt",
+        low_level_policy_file="/data1/home/liao_junhong/fdm/exts/fdm/data/ANYmal-D-New/policy.pt",
         low_level_obs_group="locomotion_policy",
     )
 

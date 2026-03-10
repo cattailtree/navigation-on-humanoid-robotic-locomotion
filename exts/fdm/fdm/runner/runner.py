@@ -193,10 +193,10 @@ class FDMRunner:
         )
         self.model.to(self.device)
 
-        print(
-            "[DEBUG] encoder input_size =",
-            self.model.state_obs_proprioceptive_encoder.input_size,
-        )
+        #print(
+        #    "[DEBUG] encoder input_size =",
+        #    self.model.state_obs_proprioceptive_encoder.input_size,
+        #)
 
         # ------------------------------------------------------------------
         # 6. replay buffer
@@ -206,11 +206,11 @@ class FDMRunner:
         )
 
         # print debug info about collection intervals from the runner (more reliable stdout)
-        print("[DBG] data_collection_interval =", self.replay_buffer.data_collection_interval,
-              "history_collection_interval =", self.replay_buffer.history_collection_interval,
-              "command_timestep =", self.model.cfg.command_timestep,
-              "step_dt =", self.env.step_dt,
-              flush=True)
+        #print("[DBG] data_collection_interval =", self.replay_buffer.data_collection_interval,
+        #      "history_collection_interval =", self.replay_buffer.history_collection_interval,
+        #      "command_timestep =", self.model.cfg.command_timestep,
+        #      "step_dt =", self.env.step_dt,
+        #      flush=True)
 
         # ------------------------------------------------------------------
         # 7. trainer (uses D, but no longer controls encoder size)

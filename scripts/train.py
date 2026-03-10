@@ -129,62 +129,66 @@ def run_eval(runner: FDMRunner):
     # del runner
     del runner
 
-    # include baseline in the tests --> load baseline method and rerun the evaluation
-    args_cli.env = "baseline"
-    args_cli.runs = None
-    cfg = load_cfg()
-    # limit number of samples
-    cfg.trainer_cfg.num_samples = 50000
-    # increase the resolution of the
-    cfg.model_cfg.eval_distance_interval = 0.1
-    runner = FDMRunner(cfg=cfg, args_cli=args_cli, eval=True)
-    baseline_meta_eval, baseline_test_meta = runner.eval_metric()
-    baseline_meta_eval_new = {}
-    for key, value in baseline_meta_eval.items():
-        new_key = key.replace("plot", "plot baseline", 1)
-        baseline_meta_eval_new[new_key] = value
-    for key, value in baseline_test_meta.items():
-        new_key = key.replace("_baseline", " baseline", 1)
-        baseline_meta_eval_new[new_key] = value
+    # optionally include baseline comparison
+    if getattr(args_cli, "include_baseline", False):
+        # include baseline in the tests --> load baseline method and rerun the evaluation
+        args_cli.env = "baseline"
+        args_cli.runs = None
+        cfg = load_cfg()
+        # limit number of samples
+        cfg.trainer_cfg.num_samples = 50000
+        # increase the resolution of the
+        cfg.model_cfg.eval_distance_interval = 0.1
+        runner = FDMRunner(cfg=cfg, args_cli=args_cli, eval=True)
+        baseline_meta_eval, baseline_test_meta = runner.eval_metric()
+        baseline_meta_eval_new = {}
+        for key, value in baseline_meta_eval.items():
+            new_key = key.replace("plot", "plot baseline", 1)
+            baseline_meta_eval_new[new_key] = value
+        for key, value in baseline_test_meta.items():
+            new_key = key.replace("_baseline", " baseline", 1)
+            baseline_meta_eval_new[new_key] = value
 
-    # get path to save the plots
-    dir_path, _ = os.path.split(fdm_model_log_dir)
-    os.makedirs(os.path.join(dir_path, "plots"), exist_ok=True)
+        # get path to save the plots
+        dir_path, _ = os.path.split(fdm_model_log_dir)
+        os.makedirs(os.path.join(dir_path, "plots"), exist_ok=True)
 
-    # create violin plot
-    vilion_plotter.update_data(runner.model, runner.trainer.dataloader, "train", baseline=True)
-    if runner.trainer.test_datasets is not None:
-        for test_dataset_name, test_dataset in runner.trainer.test_datasets.items():
-            vilion_plotter.update_data(
-                runner.model, test_dataset, test_dataset_name.removesuffix("_baseline"), baseline=True
-            )
-    # create the vilion plot
-    vilion_plotter.plot_data(os.path.join(dir_path, "plots"))
+        # create violin plot
+        vilion_plotter.update_data(runner.model, runner.trainer.dataloader, "train", baseline=True)
+        if runner.trainer.test_datasets is not None:
+            for test_dataset_name, test_dataset in runner.trainer.test_datasets.items():
+                vilion_plotter.update_data(
+                    runner.model, test_dataset, test_dataset_name.removesuffix("_baseline"), baseline=True
+                )
+        # create the vilion plot
+        vilion_plotter.plot_data(os.path.join(dir_path, "plots"))
 
-    # Save the metrics in a grid plot
-    # -- plot without baseline
-    distance_meta_summary, step_meta_summary = meta_summarize(meta_eval | test_meta)
-    plot_metrics_with_grid(distance_meta_summary, os.path.join(dir_path, "plots"))
-    plot_metrics_with_grid(step_meta_summary, os.path.join(dir_path, "plots"), step=True)
-    plot_metrics_with_grid(
-        distance_meta_summary, os.path.join(dir_path, "plots"), only_first_row=True, suffix="_first_row"
-    )
-    plot_metrics_with_grid(
-        step_meta_summary, os.path.join(dir_path, "plots"), step=True, only_first_row=True, suffix="_first_row"
-    )
+        # Save the metrics in a grid plot
+        # -- plot without baseline
+        distance_meta_summary, step_meta_summary = meta_summarize(meta_eval | test_meta)
+        plot_metrics_with_grid(distance_meta_summary, os.path.join(dir_path, "plots"))
+        plot_metrics_with_grid(step_meta_summary, os.path.join(dir_path, "plots"), step=True)
+        plot_metrics_with_grid(
+            distance_meta_summary, os.path.join(dir_path, "plots"), only_first_row=True, suffix="_first_row"
+        )
+        plot_metrics_with_grid(
+            step_meta_summary, os.path.join(dir_path, "plots"), step=True, only_first_row=True, suffix="_first_row"
+        )
 
-    # -- plot with baseline
-    distance_meta_summary, step_meta_summary = meta_summarize(meta_eval | test_meta | baseline_meta_eval_new)
-    plot_metrics_with_grid(distance_meta_summary, os.path.join(dir_path, "plots"), suffix="_baseline")
-    plot_metrics_with_grid(step_meta_summary, os.path.join(dir_path, "plots"), step=True, suffix="_baseline")
-    plot_metrics_with_grid(
-        distance_meta_summary, os.path.join(dir_path, "plots"), suffix="_baseline_first_row", only_first_row=True
-    )
-    plot_metrics_with_grid(
-        step_meta_summary, os.path.join(dir_path, "plots"), step=True, suffix="_baseline_first_row", only_first_row=True
-    )
+        # -- plot with baseline
+        distance_meta_summary, step_meta_summary = meta_summarize(meta_eval | test_meta | baseline_meta_eval_new)
+        plot_metrics_with_grid(distance_meta_summary, os.path.join(dir_path, "plots"), suffix="_baseline")
+        plot_metrics_with_grid(step_meta_summary, os.path.join(dir_path, "plots"), step=True, suffix="_baseline")
+        plot_metrics_with_grid(
+            distance_meta_summary, os.path.join(dir_path, "plots"), suffix="_baseline_first_row", only_first_row=True
+        )
+        plot_metrics_with_grid(
+            step_meta_summary, os.path.join(dir_path, "plots"), step=True, suffix="_baseline_first_row", only_first_row=True
+        )
 
-    print("Done evaluated the model")
+        print("Done evaluated the model")
+    else:
+        print("Done evaluated the model (baseline skipped)")
 
 
 def main():

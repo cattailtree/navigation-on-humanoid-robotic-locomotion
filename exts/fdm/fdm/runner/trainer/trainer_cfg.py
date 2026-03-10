@@ -34,14 +34,14 @@ class TrainerBaseCfg:
     """Whether to shuffle the batch during training."""
     batch_size: int = 2048
     """Batch size for training."""
-    collision_rate: float | None = None  # 0.4
+    collision_rate: float | None = 0.4  # 0.4
     """Rate of samples that are in collision."""
     # test_datasets: str | list[str] | None = None
     test_datasets: str | list[str] | None = [
-        "/home/ubuntu/fdm/exts/fdm/data/Terrains/test_datasets/plane_reducedObs_noTorque.pkl",
-        "/home/ubuntu/fdm/exts/fdm/data/Terrains/test_datasets/PILLAR_EVAL_CFG_reducedObs_noTorque.pkl",
-        "/home/ubuntu/fdm/exts/fdm/data/Terrains/test_datasets/STAIRS_WALL_EVAL_CFG_reducedObs_noTorque.pkl",
-        "/home/ubuntu/fdm/exts/fdm/data/Terrains/test_datasets/STAIRS_RAMP_EVAL_CFG_reducedObs_noTorque.pkl",
+        "/data1/home/liao_junhong/fdm/exts/fdm/data/Terrains/test_datasets/plane_reducedObs_noTorque.pkl",
+        "/data1/home/liao_junhong/fdm/exts/fdm/data/Terrains/test_datasets/PILLAR_EVAL_CFG_reducedObs_noTorque.pkl",
+        "/data1/home/liao_junhong/fdm/exts/fdm/data/Terrains/test_datasets/STAIRS_WALL_EVAL_CFG_reducedObs_noTorque.pkl",
+        "/data1/home/liao_junhong/fdm/exts/fdm/data/Terrains/test_datasets/STAIRS_RAMP_EVAL_CFG_reducedObs_noTorque.pkl",
     ]
     """Static Test Datasets collected from different environments"""
     real_world_train_datasets: str | list[str] | None = None
@@ -72,7 +72,7 @@ class TrainerBaseCfg:
     # weight decay and learning rate
     weight_decay: float = 1e-4  # Dec03 Model: 5e-5;  Nov19 Model: 1e-4
     """Weight decay for the optimizer."""
-    learning_rate: float = 5e-4
+    learning_rate: float = 2e-3
     """Learning rate for the optimizer."""
 
     # saving and logging
