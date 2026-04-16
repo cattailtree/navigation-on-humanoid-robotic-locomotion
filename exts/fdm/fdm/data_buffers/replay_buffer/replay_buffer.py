@@ -16,10 +16,7 @@ from .replay_buffer_cfg import ReplayBufferCfg
 
 
 class ReplayBuffer:
-    """A replay buffer with support for training/validation iterators and ensembles.
-
-    This buffer can be pushed to and sampled from as a typical replay buffer.
-    """
+    """A replay buffer with support for training/validation iterators and ensembles."""
 
     def __init__(
         self,
@@ -30,26 +27,25 @@ class ReplayBuffer:
         # get parameters
         self.cfg = cfg
         self.model_cfg = model_cfg
+
         # get env
         self.env: ManagerBasedRLEnv = env
 
-        # for simplicity, introduce flag if exteroceptive observations are present
-        if "fdm_obs_exteroceptive" in self.env.observation_manager.group_obs_dim:
-            self._has_exteroceptive_observation = True
-        else:
-            self._has_exteroceptive_observation = False
-
-        # for simplicity, introduce flag if additional exteroceptive observations are present
-        if "fdm_add_obs_exteroceptive" in self.env.observation_manager.group_obs_dim:
-            self._has_add_exteroceptive_observation = True
-        else:
-            self._has_add_exteroceptive_observation = False
+        # exteroceptive observation flags
+        self._has_exteroceptive_observation = (
+            "fdm_obs_exteroceptive" in self.env.observation_manager.group_obs_dim
+        )
+        self._has_add_exteroceptive_observation = (
+            "fdm_add_obs_exteroceptive" in self.env.observation_manager.group_obs_dim
+        )
 
         # init buffers
         self._init_buffers()
 
         # parameters
-        self._ALL_INDICES = torch.arange(self.env.num_envs, device=self.device)
+        self._ALL_INDICES = torch.arange(
+            self.env.num_envs, device=self.device, dtype=torch.long
+        )
 
     """
     Properties
@@ -57,16 +53,12 @@ class ReplayBuffer:
 
     @property
     def data_collection_interval(self):
-        """The interval at which data is collected.
-
-        Defined as the number of steps (decimation x physics_dt) after which data is collected."""
+        """The interval at which data is collected."""
         return self._data_collection_interval
 
     @property
     def history_collection_interval(self):
-        """The interval at which history is collected.
-
-        Defined as the number of steps (decimation x physics_dt) after which history is collected."""
+        """The interval at which history is collected."""
         return self._history_collection_interval
 
     @property
@@ -75,12 +67,10 @@ class ReplayBuffer:
 
     @property
     def is_filled(self) -> bool:
-        """Whether the replay buffer is filled to capacity."""
         return torch.all(self.env_buffer_filled)
 
     @property
     def fill_ratio(self) -> float:
-        """The ratio of the buffer that is filled."""
         return torch.mean(self.fill_idx / self.cfg.trajectory_length).item()
 
     @property
@@ -95,15 +85,13 @@ class ReplayBuffer:
     def exteroceptive_observation_dim(self) -> tuple[int, ...] | None:
         if self._has_exteroceptive_observation:
             return self.env.observation_manager.group_obs_dim["fdm_obs_exteroceptive"]
-        else:
-            return None
+        return None
 
     @property
     def add_exteroceptive_observation_dim(self) -> tuple[int, ...] | None:
         if self._has_add_exteroceptive_observation:
             return self.env.observation_manager.group_obs_dim["fdm_add_obs_exteroceptive"]
-        else:
-            return None
+        return None
 
     @property
     def action_dim(self) -> int:
@@ -111,7 +99,6 @@ class ReplayBuffer:
 
     @property
     def device(self) -> str:
-        """The device of the replay buffer."""
         return self.cfg.buffer_device
 
     """
@@ -128,82 +115,136 @@ class ReplayBuffer:
         feet_contact: torch.Tensor,
         add_observation_exteroceptive: torch.Tensor | None = None,
     ):
-        # for terminate environments, reset the step counter
-        self.env_step_counter[dones] = 0
+        # IMPORTANT:
+        # In Isaac/manager-style envs, when done=True, the returned obs/state is often already from the reset episode.
+        # So we must clear ALL local collector state for done envs BEFORE using current states.
+        done_env_ids = torch.nonzero(dones, as_tuple=False).squeeze(-1)
+        if done_env_ids.numel() > 0:
+            self.reset_local_history(done_env_ids)
 
-        # for colliding environments, record the last state before they get reset (will happen in the following sim step)
-        # only record if its history buffer is filled and does not terminate in first rec step
+        # raw collision from state label
         colliding_envs = states[..., 7].to(torch.bool)
+
+        # current obs of done envs belongs to a fresh/reset episode -> never treat it as a valid collision sample
+        colliding_envs[dones] = False
+
+        # keep the original FDM-style "do not trust very first recording window"
         colliding_envs[self.env_step_counter < self._data_collection_interval] = False
 
-        # update local history buffers
-        self._update_local_history_buffers(colliding_envs, states, obersevations_proprioceptive, feet_contact)
+        # update local history / touchdown bookkeeping
+        self._update_local_history_buffers(
+            colliding_envs, states, obersevations_proprioceptive, feet_contact
+        )
+
+        # update collector arm state
+        self._update_collection_armed(states, actions)
 
         # update full trajectory buffers
         self._update_full_trajectory_buffers(
-            colliding_envs, obersevations_exteroceptive, actions, feet_contact, add_observation_exteroceptive
+            colliding_envs,
+            obersevations_exteroceptive,
+            actions,
+            feet_contact,
+            add_observation_exteroceptive,
         )
 
-        # update step counter for all environments
-        # NOTE: we only start the counting once all feet were in contact
+        # step counters
         self.env_step_counter += 1
-
+        self._steps_since_arm[self._collector_armed] += 1
     def reset(self, env_ids: torch.Tensor | None = None):
-        """Reset the buffer for the given environments"""
-
+        """Reset the full buffer state for the given environments."""
         if env_ids is None:
             env_ids = self._ALL_INDICES
 
-        # reset the step counter
         self.env_step_counter[env_ids] = 0
-
-        # reset the fill index
         self.fill_idx[env_ids] = 0
 
-        # reset the local history buffers
         self.local_state_history[env_ids] = 0
         self.local_proprioceptive_observation_history[env_ids] = 0
 
-        # reset the full trajectory buffers
         self.states[env_ids] = 0
         self.observations_proprioceptive[env_ids] = 0
         self.actions[env_ids] = 0
-        if hasattr(self, "_has_touched_ground"):
-            self._has_touched_ground[env_ids] = False   # env_ids=None 就全清
-
 
         if self._has_add_exteroceptive_observation:
             self.add_observations_exteroceptive[env_ids] = 0
         if self._has_exteroceptive_observation:
             self.observations_exteroceptive[env_ids] = 0
 
+        self._has_touched_ground[env_ids] = False
+        self._steps_since_first_touchdown[env_ids] = 0
+
+        self._collector_armed[env_ids] = False
+        self._steps_since_arm[env_ids] = 0
+        self._touchdown_xy[env_ids] = 0.0
+        self._cmd_active_counter[env_ids] = 0
+        self._first_interval_after_arm_pending[env_ids] = False
+
+    def reset_local_history(self, env_ids):
+        """Reset only local collector state for environments that just got reset in sim."""
+        self.env_step_counter[env_ids] = 0
+        self.local_state_history[env_ids] = 0
+        self.local_proprioceptive_observation_history[env_ids] = 0
+
+        self._has_touched_ground[env_ids] = False
+        self._steps_since_first_touchdown[env_ids] = 0
+
+        self._collector_armed[env_ids] = False
+        self._steps_since_arm[env_ids] = 0
+        self._touchdown_xy[env_ids] = 0.0
+        self._cmd_active_counter[env_ids] = 0
+        self._first_interval_after_arm_pending[env_ids] = False
+
     def fill_leftover_envs(self):
-        """Fill the buffer for the environments that are not yet filled"""
-        # identify collision for each environment
+        """Fill the buffer for the environments that are not yet filled."""
         collision_indices = torch.nonzero(torch.any(self.states[..., 7], dim=-1))
 
-        # get the last collision index
+        if collision_indices.numel() == 0:
+            envs_to_fill = self._ALL_INDICES[~self.env_buffer_filled].type(torch.long)
+            source_env_idxs = self._ALL_INDICES[self.fill_idx >= self.cfg.trajectory_length]
+            if source_env_idxs.shape[0] == 0:
+                print("[Warning]: No source environments available to fill leftover envs.")
+                return
+            if source_env_idxs.shape[0] < len(envs_to_fill):
+                repeat_times = len(envs_to_fill) // source_env_idxs.shape[0]
+                source_env_idxs = source_env_idxs.repeat(repeat_times + 1)[: len(envs_to_fill)]
+
+            for target_env_idx, source_env_idx in zip(envs_to_fill, source_env_idxs):
+                self.states[target_env_idx] = self.states[source_env_idx]
+                self.observations_proprioceptive[target_env_idx] = self.observations_proprioceptive[source_env_idx]
+                if self._has_exteroceptive_observation:
+                    self.observations_exteroceptive[target_env_idx] = self.observations_exteroceptive[source_env_idx]
+                self.actions[target_env_idx] = self.actions[source_env_idx]
+                if self._has_add_exteroceptive_observation:
+                    self.add_observations_exteroceptive[target_env_idx] = (
+                        self.add_observations_exteroceptive[source_env_idx]
+                    )
+            self.fill_idx[envs_to_fill] = self.cfg.trajectory_length
+            return
+
         collision_envs, unique_indices = torch.unique(collision_indices[:, 0], return_inverse=True)
         env_split_data = torch.split(collision_indices[:, 1], torch.bincount(unique_indices).tolist())
-        collision_max_indices = torch.tensor([torch.max(env_indices) for env_indices in env_split_data])
+        collision_max_indices = torch.tensor(
+            [torch.max(env_indices) for env_indices in env_split_data], device=self.device
+        )
 
-        # Note: add 1 to collision_max_idx to avoid cropping the collision event
+        # add 1 to avoid cropping the collision event itself
         collision_max_indices += 1
 
-        # check if any environment has never collided
         not_collided_envs = list(set(self._ALL_INDICES.tolist()) - set(collision_envs.tolist()))
-        collision_envs = torch.concatenate((collision_envs, torch.tensor(not_collided_envs)))
-        collision_max_indices = torch.concatenate((collision_max_indices, torch.zeros(len(not_collided_envs))))
+        collision_envs = torch.concatenate(
+            (collision_envs, torch.tensor(not_collided_envs, device=self.device))
+        )
+        collision_max_indices = torch.concatenate(
+            (collision_max_indices, torch.zeros(len(not_collided_envs), device=self.device, dtype=torch.long))
+        )
 
-        # sort the collision environments and collision max indices
         collision_envs, sort_indices = collision_envs.sort()
         collision_max_indices = collision_max_indices[sort_indices]
 
-        # filter for the environments that are not yet filled
         envs_to_fill = collision_envs[~self.env_buffer_filled].type(torch.long)
         env_fill_from_indices = collision_max_indices[~self.env_buffer_filled].type(torch.long)
 
-        # randomly select an environment to fill up the buffer from the environments that have already filled the buffer
         source_env_idxs = self._ALL_INDICES[
             self.fill_idx >= self.cfg.trajectory_length - torch.min(env_fill_from_indices)
         ]
@@ -212,26 +253,24 @@ class ReplayBuffer:
             repeat_times = len(envs_to_fill) // source_env_idxs.shape[0]
             source_env_idxs = source_env_idxs.repeat(repeat_times + 1)[: len(envs_to_fill)]
 
-        # fill the buffer
         for target_env_idx, source_env_idx, collision_max_idx in zip(
             envs_to_fill, source_env_idxs, env_fill_from_indices
         ):
             use_until_idx = int(self.cfg.trajectory_length - collision_max_idx)
-            self.states[target_env_idx, int(collision_max_idx) :] = self.states[source_env_idx, :use_until_idx]
-            self.observations_proprioceptive[target_env_idx, int(collision_max_idx) :] = (
+            self.states[target_env_idx, int(collision_max_idx):] = self.states[source_env_idx, :use_until_idx]
+            self.observations_proprioceptive[target_env_idx, int(collision_max_idx):] = (
                 self.observations_proprioceptive[source_env_idx, :use_until_idx]
             )
             if self._has_exteroceptive_observation:
-                self.observations_exteroceptive[target_env_idx, int(collision_max_idx) :] = (
+                self.observations_exteroceptive[target_env_idx, int(collision_max_idx):] = (
                     self.observations_exteroceptive[source_env_idx, :use_until_idx]
                 )
-            self.actions[target_env_idx, int(collision_max_idx) :] = self.actions[source_env_idx, :use_until_idx]
+            self.actions[target_env_idx, int(collision_max_idx):] = self.actions[source_env_idx, :use_until_idx]
             if self._has_add_exteroceptive_observation:
-                self.add_observations_exteroceptive[target_env_idx, int(collision_max_idx) :] = (
+                self.add_observations_exteroceptive[target_env_idx, int(collision_max_idx):] = (
                     self.add_observations_exteroceptive[source_env_idx, :use_until_idx]
                 )
 
-        # update the fill index
         self.fill_idx[envs_to_fill] = self.cfg.trajectory_length
 
     """
@@ -239,33 +278,33 @@ class ReplayBuffer:
     """
 
     def _init_buffers(self):
-        # init collection intervals
-        self._data_collection_interval = self.model_cfg.command_timestep / self.env.step_dt
+        # keep your current sampling frequency unchanged
+        self._data_collection_interval = (self.model_cfg.command_timestep / self.env.step_dt)
+        print(f"Data collection interval: {self._data_collection_interval} steps")
         if self._data_collection_interval % 1 != 0:
             print("[WARNING]: Data collection interval is not an integer. Can influence data collection.")
-        # define after how many steps (decimation x physics_dt) the state/ proprioceptive obs should be written in the buffer
+
         if self.model_cfg.history_time_step is not None:
             self._history_collection_interval = self.model_cfg.history_time_step / self.env.step_dt
         else:
             self._history_collection_interval = self._data_collection_interval / self.model_cfg.history_length
+
         assert self._history_collection_interval >= 1, (
-            "History collection frequency calculated as must be larger than "
-            "physics frequency! Decrease history length as collection timestep is calculated by division of the "
-            "command timestep by the history length"
+            "History collection frequency calculated as must be larger than physics frequency! "
+            "Decrease history length as collection timestep is calculated by division of the command timestep "
+            "by the history length."
         )
         if self._history_collection_interval % 1 != 0:
             print(
-                "[WARNING]: History collection interval is not an integer. Will make data collection not equidistant,"
-                "i.e. with an interval of 2.5 will sample at env step [3, 5, 8, 10, 13, ...]."
+                "[WARNING]: History collection interval is not an integer. Will make data collection "
+                "not equidistant, i.e. with an interval of 2.5 will sample at env step [3, 5, 8, 10, 13, ...]."
             )
 
         # full trajectory buffers
-        # state is position, orientation, collision
         self.states = torch.zeros(
             (self.env.num_envs, self.cfg.trajectory_length, self.model_cfg.history_length, *(self.state_dim)),
             device=self.device,
         )
-        # proprioceptive observations
         self.observations_proprioceptive = torch.zeros(
             (
                 self.env.num_envs,
@@ -275,7 +314,7 @@ class ReplayBuffer:
             ),
             device=self.device,
         )
-        # exteroceptive observations
+
         if self._has_exteroceptive_observation:
             self.observations_exteroceptive = torch.zeros(
                 (self.env.num_envs, self.cfg.trajectory_length, *(self.exteroceptive_observation_dim)),
@@ -284,7 +323,7 @@ class ReplayBuffer:
             )
         else:
             self.observations_exteroceptive = None
-        # additional exteroceptive observations
+
         if self._has_add_exteroceptive_observation:
             self.add_observations_exteroceptive = torch.zeros(
                 (self.env.num_envs, self.cfg.trajectory_length, *(self.add_exteroceptive_observation_dim)),
@@ -293,7 +332,7 @@ class ReplayBuffer:
             )
         else:
             self.add_observations_exteroceptive = None
-        # actions are velocity commands
+
         self.actions = torch.zeros(
             (self.env.num_envs, self.cfg.trajectory_length, self.action_dim),
             device=self.device,
@@ -301,7 +340,8 @@ class ReplayBuffer:
 
         # local history buffers
         self.local_state_history = torch.zeros(
-            (self.env.num_envs, self.model_cfg.history_length, *(self.state_dim)), device=self.device
+            (self.env.num_envs, self.model_cfg.history_length, *(self.state_dim)),
+            device=self.device,
         )
         self.local_proprioceptive_observation_history = torch.zeros(
             (self.env.num_envs, self.model_cfg.history_length, *(self.proprioceptive_observation_dim)),
@@ -312,39 +352,105 @@ class ReplayBuffer:
         self.fill_idx = torch.zeros(self.env.num_envs, device=self.device, dtype=torch.long)
         self.env_step_counter = torch.zeros(self.env.num_envs, device=self.device, dtype=torch.long)
 
-    def _update_local_history_buffers(self, colliding_envs, state, obersevations_proprioceptive, feet_contact):
-        # ---- 统一 device / dtype：所有 mask 都在 self.device 且为 bool ----
+        # touchdown / anti-reset-pollution bookkeeping
+        self._has_touched_ground = torch.zeros(self.env.num_envs, device=self.device, dtype=torch.bool)
+        self._steps_since_first_touchdown = torch.zeros(self.env.num_envs, device=self.device, dtype=torch.long)
+
+        # collector arm state
+        self._collector_armed = torch.zeros(self.env.num_envs, device=self.device, dtype=torch.bool)
+        self._steps_since_arm = torch.zeros(self.env.num_envs, device=self.device, dtype=torch.long)
+        self._touchdown_xy = torch.zeros((self.env.num_envs, 2), device=self.device)
+        self._cmd_active_counter = torch.zeros(self.env.num_envs, device=self.device, dtype=torch.long)
+        self._first_interval_after_arm_pending = torch.zeros(
+            self.env.num_envs, device=self.device, dtype=torch.bool
+        )
+
+    def _update_local_history_buffers(
+        self,
+        colliding_envs: torch.Tensor,
+        state: torch.Tensor,
+        obersevations_proprioceptive: torch.Tensor,
+        feet_contact: torch.Tensor,
+    ):
         colliding_envs = colliding_envs.to(self.device, dtype=torch.bool)
-
-        # feet_contact 允许 (N,) 或 (N,K)，先搬到 self.device
         feet_contact = feet_contact.to(self.device)
-        feet_any = feet_contact.any(dim=-1) if feet_contact.ndim == 2 else feet_contact.to(torch.bool)  # (N,) bool on self.device
+        feet_any = feet_contact.any(dim=-1) if feet_contact.ndim == 2 else feet_contact.to(torch.bool)
 
-        # base schedule mask（bool on self.device）
-        updatable_envs = ((self.env_step_counter % self._history_collection_interval) == 0).to(self.device)
-
-        # collision 强制更新（仍然 bool）
-        updatable_envs |= colliding_envs
-
-        # ---- sticky 触地闸门（永远在 self.device）----
-        if not hasattr(self, "_has_touched_ground") or self._has_touched_ground.device != self.device:
-            self._has_touched_ground = torch.zeros(self.env.num_envs, dtype=torch.bool, device=self.device)
-
+        # touchdown bookkeeping
+        prev_touched = self._has_touched_ground.clone()
         self._has_touched_ground |= feet_any
 
-        # 触地前不更新；触地后允许更新
-        updatable_envs &= self._has_touched_ground
-        # -----------------------------------------------
+        new_touchdown = (~prev_touched) & feet_any
+        self._steps_since_first_touchdown[new_touchdown] = 0
+        self._touchdown_xy[new_touchdown] = state[new_touchdown, :2].to(self.device)
 
-        # 写入 history（state/proprio 也按需搬到 self.device）
-        self.local_state_history[updatable_envs] = torch.roll(self.local_state_history[updatable_envs], 1, dims=1)
+        touched_mask = self._has_touched_ground
+        self._steps_since_first_touchdown[touched_mask] += 1
+
+        # keep original FDM-style colliding update, but only after collector is armed
+        valid_colliding_envs = colliding_envs & self._collector_armed
+
+        updatable_envs = ((self.env_step_counter % self._history_collection_interval) == 0).to(self.device)
+        updatable_envs |= valid_colliding_envs
+        updatable_envs &= self._has_touched_ground
+
+        self.local_state_history[updatable_envs] = torch.roll(
+            self.local_state_history[updatable_envs], 1, dims=1
+        )
         self.local_state_history[updatable_envs, 0] = state[updatable_envs].to(self.device)
 
         self.local_proprioceptive_observation_history[updatable_envs] = torch.roll(
             self.local_proprioceptive_observation_history[updatable_envs], 1, dims=1
         )
-        self.local_proprioceptive_observation_history[updatable_envs, 0] = obersevations_proprioceptive[updatable_envs].to(self.device)
+        self.local_proprioceptive_observation_history[updatable_envs, 0] = (
+            obersevations_proprioceptive[updatable_envs].to(self.device)
+        )
 
+    def _update_collection_armed(self, state: torch.Tensor, actions: torch.Tensor):
+        """
+        Arm the collector only after the env has clearly left reset-settling phase.
+
+        Once armed:
+          - collision samples are allowed to use continuous colliding update
+          - full trajectory samples are allowed to be written
+
+        Critical anti-pollution step:
+          on the FIRST not-armed -> armed transition, clear local history and reset steps_since_arm,
+          so pre-armed reset/fall traces cannot leak into stored windows.
+        """
+        xy = state[:, :2].to(self.device)
+        actions = actions.to(self.device)
+
+        # align with your hard_failure command threshold
+        cmd_mag = torch.norm(actions[:, :2], dim=-1) + 0.5 * torch.abs(actions[:, 2])
+        cmd_active = cmd_mag > 0.15
+
+        active_mask = self._has_touched_ground & cmd_active
+        self._cmd_active_counter[active_mask] += 1
+        self._cmd_active_counter[~active_mask] = 0
+
+        progress_from_touchdown = torch.norm(xy - self._touchdown_xy, dim=-1)
+
+        # stricter than quadruped: explicitly block reset-settling pseudo-falls
+        arm_min_steps = 8
+        arm_progress_threshold = 0.15
+        arm_cmd_steps = 3
+
+        arm_now = (
+            self._has_touched_ground
+            & (self._steps_since_first_touchdown >= arm_min_steps)
+            & (progress_from_touchdown > arm_progress_threshold)
+            & (self._cmd_active_counter >= arm_cmd_steps)
+        )
+
+        newly_armed = (~self._collector_armed) & arm_now
+        self._collector_armed |= arm_now
+
+        if torch.any(newly_armed):
+            self.local_state_history[newly_armed] = 0
+            self.local_proprioceptive_observation_history[newly_armed] = 0
+            self._steps_since_arm[newly_armed] = 0
+            self._first_interval_after_arm_pending[newly_armed] = True
 
     def _update_full_trajectory_buffers(
         self,
@@ -355,52 +461,88 @@ class ReplayBuffer:
         add_observation_exteroceptive: torch.Tensor | None,
     ):
         colliding_envs = colliding_envs.to(self.device, dtype=torch.bool)
-        feet_contact = feet_contact.to(self.device)
 
-        updatable_envs = ((self.env_step_counter % self._data_collection_interval) == 0).to(self.device)
-        updatable_envs[self.env_step_counter == 0] = False
-        updatable_envs[colliding_envs] = True
-        interval_mask = (self.env_step_counter == self._data_collection_interval)
-        if torch.any(interval_mask):
-            updatable_envs[interval_mask] = ~colliding_envs[interval_mask]
+        steps = self._steps_since_first_touchdown
+        arm_steps = self._steps_since_arm
+        interval = int(self._data_collection_interval)
+        post_touchdown_block_steps = 3
 
-        # ===== sticky once-grounded gate（只依赖 feet_contact）=====
-        feet_any = feet_contact.any(dim=-1) if feet_contact.ndim == 2 else feet_contact.to(torch.bool)  # (N,) bool on self.device
-        if not hasattr(self, "_has_touched_ground") or self._has_touched_ground.device != self.device:
-            self._has_touched_ground = torch.zeros(self.env.num_envs, dtype=torch.bool, device=self.device)
-        self._has_touched_ground |= feet_any
+        hist = self.local_state_history
+        xy_now = hist[:, 0, :2]
+        xy_old = hist[:, -1, :2]
+        move_dist = torch.norm(xy_now - xy_old, dim=-1)
 
-        updatable_envs &= self._has_touched_ground
-        updatable_envs[colliding_envs] &= self._has_touched_ground[colliding_envs]  # 防空中碰撞污染
-        # ==========================================================
-        updatable_idxs = self._ALL_INDICES[updatable_envs]
+        min_move_dist = 0.08
+        meaningful_motion = move_dist > min_move_dist
+
+        # -------- regular sampling path only --------
+        sampling_mask = (
+            (steps > 0)
+            & (steps % interval == 0)
+        )
+        sampling_mask &= self._has_touched_ground
+        sampling_mask &= (steps >= post_touchdown_block_steps)
+        sampling_mask &= meaningful_motion
+        sampling_mask &= (self.env_step_counter > 0)
+        sampling_mask &= self._collector_armed
+        sampling_mask &= (arm_steps > 0)  # block same-step arm write
+
+        first_valid = (
+            self._has_touched_ground
+            & (steps == post_touchdown_block_steps)
+            & meaningful_motion
+            & self._collector_armed
+            & (arm_steps > 0)
+        )
+        sampling_mask |= first_valid
+
+        # ==================================================
+        # HARD RULE:
+        # never write a sample whose CURRENT frame is already collision.
+        # This is the only reliable way to kill "initial collision" at buffer level.
+        # ==================================================
+        sampling_mask &= ~colliding_envs
+
+        # quadruped-style protection can stay, but is now mostly redundant
+        first_interval_after_arm_hit = (
+            self._first_interval_after_arm_pending
+            & self._collector_armed
+            & (arm_steps > 0)
+            & self._has_touched_ground
+            & (steps > 0)
+            & (steps % interval == 0)
+        )
+        self._first_interval_after_arm_pending[first_interval_after_arm_hit] = False
+
+        # -------- write --------
+        updatable_idxs = self._ALL_INDICES[sampling_mask]
         env_non_full = ~self.env_buffer_filled[updatable_idxs]
         updatable_idxs = updatable_idxs[env_non_full]
+
         if len(updatable_idxs) == 0:
             return
-        
-        # write state with history into buffer
-        self.states[updatable_idxs, self.fill_idx[updatable_idxs]] = self.local_state_history[updatable_idxs].clone()
-        # write propriocpetive observations with history into buffer
+
+        self.states[updatable_idxs, self.fill_idx[updatable_idxs]] = (
+            self.local_state_history[updatable_idxs].clone()
+        )
         self.observations_proprioceptive[updatable_idxs, self.fill_idx[updatable_idxs]] = (
             self.local_proprioceptive_observation_history[updatable_idxs].clone()
         )
-        # write exteroceptive observations into buffer
+
         if self._has_exteroceptive_observation:
             self.observations_exteroceptive[updatable_idxs, self.fill_idx[updatable_idxs]] = (
                 obersevations_exteroceptive[updatable_idxs]
                 .to(self.device)
                 .type(getattr(torch, self.cfg.exteroceptive_obs_precision))
             )
-        # write actions into buffer
+
         self.actions[updatable_idxs, self.fill_idx[updatable_idxs]] = actions[updatable_idxs].to(self.device)
 
-        # write additional exteroceptive observations into buffer if requested
         if self._has_add_exteroceptive_observation:
             self.add_observations_exteroceptive[updatable_idxs, self.fill_idx[updatable_idxs]] = (
                 add_observation_exteroceptive[updatable_idxs]
                 .to(self.device)
                 .type(getattr(torch, self.cfg.exteroceptive_obs_precision))
             )
-        # update fill index
+
         self.fill_idx[updatable_idxs] += 1

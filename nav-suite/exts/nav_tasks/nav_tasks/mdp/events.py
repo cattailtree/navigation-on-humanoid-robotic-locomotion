@@ -13,7 +13,7 @@ import omni.log
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.math import quat_from_euler_xyz, sample_uniform
-
+from isaaclab.envs.mdp.events import reset_root_state_uniform
 from nav_suite.terrain_analysis import TerrainAnalysisCfg, TerrainAnalysisSingletonCfg
 
 from .commands import FixGoalCommand, GoalCommand
@@ -42,7 +42,7 @@ class TerrainAnalysisRootReset:
         # -------- G1-specific spawn tuning (NO new args) --------
         # Height (meters) added above local terrain max height.
         # For humanoid, DO NOT reuse asset.default_root_state[z] (often ~0.8) + 0.3 margin -> spawns too high.
-        self._spawn_z_offset = 0.50   # ✅ 先用 0.60；若仍高/低，调到 0.55~0.75
+        self._spawn_z_offset = 0.65   # ✅ 先用 0.60；若仍高/低，调到 0.55~0.75
         # Extra safety margin to prevent initial penetration. 0.3m is too large for humanoid here.
         self._safety_margin_min = 0.05
 
@@ -137,16 +137,15 @@ class TerrainAnalysisRootReset:
             pass
 
         # yaw
-        yaw_samples = sample_uniform(yaw_range[0], yaw_range[1], (len(env_ids), 1), device=asset.device)
+        safe_yaw_min = max(yaw_range[0], -0.1)
+        safe_yaw_max = min(yaw_range[1],  0.1)
+        yaw_samples = sample_uniform(safe_yaw_min, safe_yaw_max, (len(env_ids), 1), device=asset.device)
         orientations = quat_from_euler_xyz(
             torch.zeros_like(yaw_samples), torch.zeros_like(yaw_samples), yaw_samples
         ).squeeze(1)
 
         # velocities
-        range_list = [velocity_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z", "roll", "pitch", "yaw"]]
-        ranges = torch.tensor(range_list, device=asset.device)
-        rand_samples = sample_uniform(ranges[:, 0], ranges[:, 1], (len(env_ids), 6), device=asset.device)
-        velocities = root_states[:, 7:13] + rand_samples
+        velocities = torch.zeros((len(env_ids), 6), device=asset.device)
 
         # write to sim
         asset.write_root_pose_to_sim(torch.cat([positions, orientations], dim=-1), env_ids=env_ids)

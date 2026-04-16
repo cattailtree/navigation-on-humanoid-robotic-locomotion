@@ -71,15 +71,42 @@ class BaselineFdmStateCfg(ObsGroup):
     #base_position = ObsTerm(func=mdp.base_position)
     base_orientation = ObsTerm(func=mdp.base_orientation_xyzw)
     base_collision = ObsTerm(
-            func=mdp.base_collision_obs,
-            params={
-        "threshold": 100.0,
-        "K": 3,
-        "feet_support_threshold": 5.0,
+    func=mdp.hard_faliure_obs,
+    params={
+        "body_force_threshold": 20.0,
+        "feet_support_threshold": 10.0,
+        "min_base_height": 0.45,
+        "max_abs_roll": 0.8,
+        "max_abs_pitch": 0.8,
+        "stuck_steps": 5,
+        "min_progress": 0.003,
+        "command_threshold": 0.15,
+        "K": 1,
+
+        # near-obstacle patch
+        "extero_key": "extero_obs",
+        "near_obstacle_height_th": 0.08,
+        "near_obstacle_front_x": 0.8,
+        "near_obstacle_half_width": 0.35,
+
         "sensor_cfg": SceneEntityCfg(
             "contact_forces",
-            body_names=[".*pelvis.*"],
+            body_names=[
+                "pelvis",
+                "waist_yaw_link",
+                "waist_roll_link",
+                "torso_link",
+                "left_hip_pitch_link",
+                "left_hip_roll_link",
+                "left_hip_yaw_link",
+                "left_knee_link",
+                "right_hip_pitch_link",
+                "right_hip_roll_link",
+                "right_hip_yaw_link",
+                "right_knee_link",
+            ],
         ),
+
         "feet_cfg": SceneEntityCfg(
             "contact_forces",
             body_names=[
@@ -88,8 +115,7 @@ class BaselineFdmStateCfg(ObsGroup):
             ],
         ),
     },
-
-        )
+)
     # add additional terms below, first term have to stay the default and are used in the code
     # NOTE: this is required in the trajectory dataset code but will not be used by the Baseline model
     hard_contact = ObsTerm(func=mdp.energy_consumption, params={"energy_scale_factor": 0.001})

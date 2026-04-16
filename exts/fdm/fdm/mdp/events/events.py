@@ -251,8 +251,79 @@ def reset_root_state_planner_paper_plot(
     # set into the physics simulation
     asset.write_root_pose_to_sim(torch.cat([positions, root_states[:, 3:7]], dim=-1), env_ids=env_ids)
     asset.write_root_velocity_to_sim(root_states[:, 7:13], env_ids=env_ids)
+def reset_root_state_humanoid_stable(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+):
+    """
+    Stable humanoid reset for training:
+    - reset root pose to safe standing pose
+    - reset root velocity to zero
+    - reset joint positions/velocities to default
+    - sync joint targets
+    - clear low-level action cache
+    - clear custom failure/collision/stuck counters
+    """
+    asset: RigidObject | Articulation = env.scene[asset_cfg.name]
 
+    root_states = asset.data.default_root_state[env_ids].clone()
+    origins = env.scene.env_origins[env_ids]
 
+    # 1) root
+    positions = root_states[:, :3].clone()
+    orientations = root_states[:, 3:7].clone()
+
+    positions[:, 0] = origins[:, 0]
+    positions[:, 1] = origins[:, 1]
+    positions[:, 2] = origins[:, 2] + root_states[:, 2] 
+    velocities = torch.zeros_like(root_states[:, 7:13])
+
+    asset.write_root_pose_to_sim(torch.cat([positions, orientations], dim=-1), env_ids=env_ids)
+    asset.write_root_velocity_to_sim(velocities, env_ids=env_ids)
+
+    # 2) joints
+    if hasattr(asset.data, "default_joint_pos") and hasattr(asset.data, "default_joint_vel"):
+        joint_pos = asset.data.default_joint_pos[env_ids].clone()
+        joint_vel = torch.zeros_like(asset.data.default_joint_vel[env_ids])
+
+        asset.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
+
+        if hasattr(asset, "set_joint_position_target"):
+            asset.set_joint_position_target(joint_pos, env_ids=env_ids)
+        if hasattr(asset, "set_joint_velocity_target"):
+            asset.set_joint_velocity_target(joint_vel, env_ids=env_ids)
+        if hasattr(asset, "set_joint_effort_target"):
+            asset.set_joint_effort_target(torch.zeros_like(joint_pos), env_ids=env_ids)
+
+        # write once more to suppress possible stale low-level state overwrite
+        asset.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
+
+    # 3) low-level action manager cache
+    if hasattr(env, "action_manager") and hasattr(env.action_manager, "reset"):
+        try:
+            env.action_manager.reset(env_ids=env_ids)
+        except TypeError:
+            env.action_manager.reset(env_ids)
+
+    # 4) clear custom failure / collision / stuck caches
+    if hasattr(env, "_hard_collision_counter"):
+        env._hard_collision_counter[env_ids] = 0
+
+    if hasattr(env, "_hard_failure_counter"):
+        env._hard_failure_counter[env_ids] = 0
+
+    if hasattr(env, "_stuck_counter"):
+        env._stuck_counter[env_ids] = 0
+
+    if hasattr(env, "_stuck_prev_pos"):
+        env._stuck_prev_pos[env_ids] = positions[:, :2].clone()
+
+    if hasattr(env, "_last_applied_action"):
+        env._last_applied_action[env_ids] = 0.0
+
+    if hasattr(env, "_prev_applied_action"):
+        env._prev_applied_action[env_ids] = 0.0
 ###
 # Planner Reset
 ###

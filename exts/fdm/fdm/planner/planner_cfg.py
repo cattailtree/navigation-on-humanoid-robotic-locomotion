@@ -127,14 +127,14 @@ class FDMPlannerCfg:
             mode="reset",
             params={
                 "asset_cfg": SceneEntityCfg("robot"),
-                "yaw_range": (-3.14, 3.14),
+                "yaw_range": (0.0, 0.0),
                 "velocity_range": {
-                    "x": (-0.5, 0.5),
-                    "y": (-0.5, 0.5),
+                    "x": (-0.01, 0.01),
+                    "y": (-0.01, 0.01),
                     "z": (0, 0),
                     "roll": (0, 0),
                     "pitch": (0, 0),
-                    "yaw": (-0.5, 0.5),
+                    "yaw": (-0.01, 0.01),
                 },
                 "goal_command_generator_name": "command",
             },

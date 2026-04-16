@@ -33,7 +33,7 @@ def random_maze_terrain(
     assert cfg.size[0] % cfg.resolution == 0, "Size must be divisible by resolution"
     assert cfg.size[1] % cfg.resolution == 0, "Size must be divisible by resolution"
 
-    open_probability = min(1.0 - difficulty, 0.6)  # difficulty is in the range [0, 1.0]
+    open_probability = 0.6  # difficulty is in the range [0, 1.0]
     maze = generate_maze((int(cfg.size[0] / cfg.resolution), int(cfg.size[1] / cfg.resolution)), open_probability)
 
     # Extrustion process

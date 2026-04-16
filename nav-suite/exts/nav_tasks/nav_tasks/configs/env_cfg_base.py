@@ -217,20 +217,9 @@ class EventCfg:
         func=mdp.reset_robot_position,
         mode="reset",
         params={
-            "yaw_range": (-3.0, 3.0),
+            "yaw_range": (0.0, 0.0),
         },
     )
-
-    reset_robot_joints = EventTerm(
-        func=mdp.reset_joints_by_scale,
-        mode="reset",
-        params={
-            "asset_cfg": SceneEntityCfg("robot"),
-            "position_range": (0.0, 0.0),
-            "velocity_range": (0.0, 0.0),
-        },
-    )
-
 
 @configclass
 class RewardsCfg:

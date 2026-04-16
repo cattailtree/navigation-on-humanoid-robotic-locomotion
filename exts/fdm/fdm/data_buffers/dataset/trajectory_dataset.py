@@ -300,88 +300,105 @@ class TrajectoryDataset(Dataset):
 
         # ===== END DEBUG =====
 
+        # -----------------------------------------------------------------------------
+        # Filtering statistics
+        # -----------------------------------------------------------------------------
+        num_total = self.states.shape[0]
+        print(f"[FILTER] total samples before filtering: {num_total}")
 
-        # filter every sample with collision in the first three steps (get collision state from samples)
+        # 统计各项单独命中的数量
+        filter_stats = {}
+
+        # -----------------------------------------------------------------------------
+        # 1) filter every sample that has a collision in the first K steps
+        # -----------------------------------------------------------------------------
         collision_env, collision_idx = torch.where(self.states[..., 4])
-        remove_idx = collision_env[collision_idx < self.cfg.sample_filter_first_steps_coll]
-        remove_idx = torch.unique(remove_idx)
-        keep_idx[remove_idx] = False
-        # filter every sample that has a collision in its initial position
-        collision_env = torch.where(self.state_history[:, 0, 4])[0]
-        keep_idx[collision_env] = False
-        # restrict ratio of samples that move less than 1m in the entire trajectory to 10%
+        first_steps_mask = collision_idx < self.cfg.sample_filter_first_steps_coll
+        remove_idx_first_coll = torch.unique(collision_env[first_steps_mask])
+
+        filter_stats["first_steps_collision"] = remove_idx_first_coll.numel()
+        keep_idx[remove_idx_first_coll] = False
+
+        print(
+            f"[FILTER] first_steps_collision (< {self.cfg.sample_filter_first_steps_coll} steps): "
+            f"{filter_stats['first_steps_collision']}"
+        )
+
+        # -----------------------------------------------------------------------------
+        # 2) filter every sample that has a collision in its initial position
+        # -----------------------------------------------------------------------------
+        collision_env_init = torch.where(self.state_history[:, 0, 4])[0]
+
+        filter_stats["initial_collision"] = collision_env_init.numel()
+        keep_idx[collision_env_init] = False
+
+        print(f"[FILTER] initial_collision: {filter_stats['initial_collision']}")
+
+        # -----------------------------------------------------------------------------
+        # 3) restrict ratio of small-motion samples
+        # -----------------------------------------------------------------------------
         if self.cfg.small_motion_ratio is not None:
-            small_movement_idx = torch.where(
+            small_movement_idx_all = torch.where(
                 torch.norm(torch.abs(self.states[:, -1, :2]), dim=1) < self.cfg.small_motion_threshold
             )[0]
-            small_movement_ratio = small_movement_idx.shape[0] / self.states.shape[0]
+            small_movement_ratio = small_movement_idx_all.shape[0] / self.states.shape[0]
+
+            print(
+                f"[FILTER] small_motion candidates: {small_movement_idx_all.numel()} / {self.states.shape[0]} "
+                f"({small_movement_ratio:.4f}), threshold={self.cfg.small_motion_threshold}, "
+                f"target_ratio={self.cfg.small_motion_ratio}"
+            )
+
             if small_movement_ratio > self.cfg.small_motion_ratio:
-                # we want to remove samples until we reach the desired small motion ratio
-                # let x = small_movement_idx.shape[0]
-                # let N = self.states.shape[0]
-                # let r = self.cfg.small_motion_ratio
                 # solve for num_remove in: r = (x - num_remove) / (N - num_remove)
                 num_remove = int(
-                    (self.cfg.small_motion_ratio * self.states.shape[0] - small_movement_idx.shape[0])
+                    (self.cfg.small_motion_ratio * self.states.shape[0] - small_movement_idx_all.shape[0])
                     / (self.cfg.small_motion_ratio - 1)
                 )
-                small_movement_idx = small_movement_idx[:num_remove]
+                small_movement_idx = small_movement_idx_all[:num_remove]
+                filter_stats["small_motion_removed"] = small_movement_idx.numel()
                 keep_idx[small_movement_idx] = False
+            else:
+                filter_stats["small_motion_removed"] = 0
 
-        # filter samples with too little height difference
+            print(f"[FILTER] small_motion_removed: {filter_stats['small_motion_removed']}")
+
+        # -----------------------------------------------------------------------------
+        # 4) filter samples with too little height difference
+        # -----------------------------------------------------------------------------
         if self.cfg.height_threshold is not None:
             state_height = states_SE3[..., 2].reshape(-1, self.model_cfg.prediction_horizon)
             height_diff = torch.max(torch.abs(state_height[:, 1:] - state_height[:, :-1]), dim=-1)[0]
-            keep_idx[torch.where(height_diff < self.cfg.height_threshold)[0]] = False
+            low_height_idx = torch.where(height_diff < self.cfg.height_threshold)[0]
+
+            filter_stats["low_height_diff"] = low_height_idx.numel()
+            keep_idx[low_height_idx] = False
+
             print(
-                "[INFO] Filtered samples with too little height difference! Overall"
-                f" {(height_diff < self.cfg.height_threshold).sum().item()} samples filtered!"
+                f"[FILTER] low_height_diff (< {self.cfg.height_threshold}): "
+                f"{filter_stats['low_height_diff']}"
             )
 
+        # -----------------------------------------------------------------------------
+        # summary before actual filtering
+        # -----------------------------------------------------------------------------
+        num_keep = keep_idx.sum().item()
+        num_remove_total = (~keep_idx).sum().item()
+
+        print(f"[FILTER] total removed after union: {num_remove_total}")
+        print(f"[FILTER] total kept after union:    {num_keep}")
+
+        # 如果你想看各过滤项之间的重叠导致“单项之和 > 总移除数”，这个对理解很有帮助
+        sum_individual = sum(filter_stats.values())
+        print(f"[FILTER] sum of individual removals: {sum_individual}")
+        print(f"[FILTER] overlap count: {sum_individual - num_remove_total}")
+
+        # -----------------------------------------------------------------------------
         # filter samples
+        # -----------------------------------------------------------------------------
         initial_states = initial_states.repeat(1, self.model_cfg.prediction_horizon, 1)[keep_idx]
         states = states[keep_idx]
         self._filter_idx(keep_idx)
-
-        ###
-        # Collision handling - repeat last state when in collision
-        ###
-
-        # for states that are in collision, take the last state and copy it to the rest of the trajectory
-        collision_env, collision_idx = torch.where(self.states[..., 4])
-        if len(collision_env) > 0:
-            # if there are multiple collisions within the sampled trajectory, only use the first one
-            collision_env_red = torch.unique(collision_env)
-            collision_idx_red = torch.hstack(
-                [torch.min(collision_idx[collision_env == curr_env]) for curr_env in collision_env_red]
-            )
-            # get indices
-            indices = [
-                [
-                    collision_env_red[idx].repeat(self.model_cfg.prediction_horizon - collision_idx_red[idx]),
-                    torch.arange(
-                        collision_idx_red[idx],
-                        self.model_cfg.prediction_horizon,
-                        device=self.replay_buffer_cfg.buffer_device,
-                    ),
-                    collision_idx_red[idx].repeat(self.model_cfg.prediction_horizon - collision_idx_red[idx]),
-                ]
-                for idx in range(len(collision_env_red))
-            ]
-            env_idx = torch.hstack([curr_indices[0] for curr_indices in indices])
-            horizon_idx = torch.hstack([curr_indices[1] for curr_indices in indices])
-            command_idx = torch.hstack([curr_indices[2] for curr_indices in indices])
-            # update data
-            self.states[env_idx, horizon_idx] = self.states[env_idx, command_idx]
-
-            # NOTE: actions should not be copied, otherwise model learns to recognize collision from actions
-            # self.actions[env_idx, horizon_idx] = self.actions[env_idx, command_idx]
-
-            # NOTE: for the evaluation, also the perfect velocity is not corrected
-            # self.perfect_velocity_following_local_frame[env_idx, horizon_idx] = (
-            #     self.perfect_velocity_following_local_frame[env_idx, command_idx]
-            # )
-
         
         N, H, _ = self.states.shape
         dt = self.model_cfg.command_timestep

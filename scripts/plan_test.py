@@ -177,6 +177,7 @@ def main():
             "pitch": (0.0, 0.0),
             "yaw": (0.0, 0.0),
         }
+        cfg.env_cfg.events.reset_robot_joints.params["position_range"] = (1.0, 1.0)
 
     # set a fix goal point
     cfg.env_cfg.commands.command = mdp.FixGoalCommandCfg(

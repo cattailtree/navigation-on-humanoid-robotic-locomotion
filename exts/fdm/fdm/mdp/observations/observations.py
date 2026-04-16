@@ -502,48 +502,61 @@ Collision
 
 def base_collision(
     env: ManagerBasedRLEnv,
-    threshold: float = 100.0,
+    threshold: float = 60.0,
     sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_forces"),
     feet_cfg: SceneEntityCfg | None = None,
     K: int = 2,
     feet_support_threshold: float = 5.0,
+    require_no_support: bool = False,
 ) -> torch.Tensor:
     """
-    Humanoid-friendly collision:
-      pelvis hit (force > threshold)
-      AND (optional) feet have no support (support_sum < feet_support_threshold)
-      AND persists for K consecutive calls (debounce)
+    Humanoid-friendly hard collision / failure signal.
+
+    Triggers when:
+      1) non-foot body contact exceeds threshold
+      2) optionally combined with no foot support
+      3) persists for K consecutive calls
     """
 
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
     net_contact_forces = contact_sensor.data.net_forces_w_history  # (N, T, B, 3)
 
-    # -------------------------
-    # 1) pelvis / main-body hit
-    # -------------------------
-    # 关键：这里的 sensor_cfg.body_ids 必须已经是 “整型索引”
-    pelvis_force = torch.norm(net_contact_forces[:, :, sensor_cfg.body_ids], dim=-1)  # (N, T, npelvis)
-    pelvis_force = pelvis_force.flatten(start_dim=1)                                  # (N, T*npelvis)
-    pelvis_hit = torch.max(pelvis_force, dim=1)[0] > threshold                         # (N,)
+    # --------------------------------------------------
+    # 1) Non-foot body contact
+    # --------------------------------------------------
+    body_force = torch.norm(net_contact_forces[:, :, sensor_cfg.body_ids], dim=-1)  # (N, T, nbodies)
+    body_force = body_force.flatten(start_dim=1)  # (N, T*nbodies)
+    body_hit = torch.max(body_force, dim=1)[0] > threshold  # (N,)
 
-    # -------------------------
-    # 2) feet support (optional)
-    # -------------------------
-    if feet_cfg is None:
-        hard_now = pelvis_hit
-    else:
+    # --------------------------------------------------
+    # 2) Feet support
+    # --------------------------------------------------
+    if feet_cfg is not None:
         feet_force = torch.norm(net_contact_forces[:, :, feet_cfg.body_ids], dim=-1)  # (N, T, nfeet)
-        feet_max = torch.max(feet_force, dim=1)[0]                                     # (N, nfeet)
-        support_sum = torch.sum(feet_max, dim=-1)                                      # (N,)
-        support_any = (feet_max > feet_support_threshold).any(dim=-1)   # (N,)
+        feet_max = torch.max(feet_force, dim=1)[0]  # (N, nfeet)
+
+        # at least one supporting foot
+        support_any = (feet_max > feet_support_threshold).any(dim=-1)  # (N,)
         no_support = ~support_any
+    else:
+        no_support = torch.zeros_like(body_hit, dtype=torch.bool)
 
-        hard_now = pelvis_hit 
+    # --------------------------------------------------
+    # 3) Current hard-failure logic
+    # --------------------------------------------------
+    if feet_cfg is None:
+        hard_now = body_hit
+    else:
+        if require_no_support:
+            hard_now = body_hit & no_support
+        else:
+            # More practical for humanoid navigation:
+            # strong body hit OR complete loss of support
+            hard_now = body_hit | no_support
 
-    # -------------------------
-    # 3) debounce: K consecutive
-    # -------------------------
-    # 注意：这里不能在 base_collision 里“找 ids”，但可以存计数器（按 env 维度）
+    # --------------------------------------------------
+    # 4) Debounce: K consecutive
+    # --------------------------------------------------
     if not hasattr(env, "_hard_collision_counter"):
         env._hard_collision_counter = torch.zeros(
             env.num_envs, device=net_contact_forces.device, dtype=torch.long
@@ -552,11 +565,11 @@ def base_collision(
     env._hard_collision_counter[hard_now] += 1
     env._hard_collision_counter[~hard_now] = 0
 
-    return (env._hard_collision_counter >= K)
+    return env._hard_collision_counter >= K
 
 def base_collision_obs(
     env: ManagerBasedRLEnv,
-    threshold: float = 100.0,
+    threshold: float = 60.0,
     sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_forces"),
     feet_cfg: SceneEntityCfg | None = None,
     K: int = 3,
@@ -572,6 +585,214 @@ def base_collision_obs(
     )
     return collision.unsqueeze(-1)   # (N, 1)
 
+def hard_faliure(
+    env: ManagerBasedRLEnv,
+    body_force_threshold: float = 20.0,
+    feet_support_threshold: float = 10.0,
+    min_base_height: float = 0.45,
+    max_abs_roll: float = 0.8,
+    max_abs_pitch: float = 0.8,
+    stuck_steps: int = 5,
+    min_progress: float = 0.003,
+    command_threshold: float = 0.15,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_forces"),
+    feet_cfg: SceneEntityCfg | None = None,
+    K: int = 1,
+    # near-obstacle patch
+    extero_key: str = "extero_obs",
+    near_obstacle_height_th: float = 0.08,
+    near_obstacle_front_x: float = 0.8,
+    near_obstacle_half_width: float = 0.35,
+) -> torch.Tensor:
+    """
+    Humanoid-friendly hard failure signal.
+
+    Covers:
+      1) bad body contact
+      2) fallen / bad attitude / low base height
+      3) stuck with non-trivial command
+      4) obstacle too close in front (using local height scan if available)
+
+    Returns a one-step pulse:
+      True only when the debounce counter first reaches K.
+    """
+    device = env.device
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    net_contact_forces = contact_sensor.data.net_forces_w_history  # (N, T, B, 3)
+
+    robot = env.scene.articulations["robot"]
+
+    # --------------------------------------------------
+    # 0) command intent
+    # --------------------------------------------------
+    if hasattr(env, "_last_applied_action"):
+        cmd = env._last_applied_action
+    else:
+        cmd = torch.zeros(env.num_envs, 3, device=device)
+
+    cmd_mag = torch.norm(cmd[:, :2], dim=-1) + 0.5 * torch.abs(cmd[:, 2])
+    trying_to_move = cmd_mag > command_threshold
+
+    # --------------------------------------------------
+    # 1) Bad body contact
+    # --------------------------------------------------
+    body_force = torch.norm(net_contact_forces[:, :, sensor_cfg.body_ids], dim=-1)  # (N,T,B)
+    body_force_last = body_force[:, -1, :]                                           # (N,B)
+    body_force_peak = torch.max(body_force_last, dim=1)[0]                           # (N,)
+    bad_contact = body_force_peak > body_force_threshold
+
+    # --------------------------------------------------
+    # 2) Feet support
+    # --------------------------------------------------
+    if feet_cfg is not None:
+        feet_force = torch.norm(net_contact_forces[:, :, feet_cfg.body_ids], dim=-1)  # (N,T,nfeet)
+        feet_last = feet_force[:, -1, :]
+        support_sum = torch.sum(feet_last, dim=-1)
+        low_support = support_sum < feet_support_threshold
+    else:
+        low_support = torch.zeros(env.num_envs, device=device, dtype=torch.bool)
+
+    # --------------------------------------------------
+    # 3) Fallen / unstable
+    # --------------------------------------------------
+    root_pos = robot.data.root_pos_w
+    root_quat = robot.data.root_quat_w
+    roll, pitch, _ = math_utils.euler_xyz_from_quat(root_quat)
+
+    low_height = root_pos[:, 2] < min_base_height
+    bad_attitude = (torch.abs(roll) > max_abs_roll) | (torch.abs(pitch) > max_abs_pitch)
+
+    # 保留 low_support 作为“姿态差时”的辅助判断，避免正常支撑时过早判失败
+    fallen = low_height | (bad_attitude & low_support)
+
+    # --------------------------------------------------
+    # 4) Stuck
+    # --------------------------------------------------
+    if not hasattr(env, "_stuck_counter"):
+        env._stuck_counter = torch.zeros(env.num_envs, device=device, dtype=torch.long)
+    if not hasattr(env, "_stuck_prev_pos"):
+        env._stuck_prev_pos = root_pos[:, :2].clone()
+
+    progress = torch.norm(root_pos[:, :2] - env._stuck_prev_pos, dim=-1)
+    env._stuck_prev_pos = root_pos[:, :2].clone()
+
+    stuck_now = trying_to_move & (progress < min_progress)
+    env._stuck_counter[stuck_now] += 1
+    env._stuck_counter[~stuck_now] = 0
+
+    stuck = env._stuck_counter >= stuck_steps
+
+    # --------------------------------------------------
+    # 5) Near obstacle in front (cheap patch)
+    # --------------------------------------------------
+    near_obstacle = torch.zeros(env.num_envs, device=device, dtype=torch.bool)
+
+    # Try to fetch local exteroceptive height scan from common locations.
+    extero_obs = None
+    if hasattr(env, "obs") and isinstance(env.obs, dict) and extero_key in env.obs:
+        extero_obs = env.obs[extero_key]
+    elif hasattr(env, "_obs") and isinstance(env._obs, dict) and extero_key in env._obs:
+        extero_obs = env._obs[extero_key]
+
+    if extero_obs is not None:
+        # expected shape: (N,1,H,W) or (N,H,W)
+        if extero_obs.dim() == 4:
+            height_scan = extero_obs.squeeze(1).to(device).float()  # (N,H,W)
+        else:
+            height_scan = extero_obs.to(device).float()
+
+        N, H, W = height_scan.shape
+
+        # assume scan is centered on robot and aligned with robot frame
+        xs = torch.linspace(
+            - (W // 2), W // 2, W, device=device, dtype=height_scan.dtype
+        )
+        ys = torch.linspace(
+            - (H // 2), H // 2, H, device=device, dtype=height_scan.dtype
+        )
+
+        # try to infer resolution from env if available, else fall back to 0.1 m
+        resolution = 0.1
+        if hasattr(env, "height_scan_resolution"):
+            resolution = float(env.height_scan_resolution)
+
+        xs = xs * resolution
+        ys = ys * resolution
+
+        # NOTE:
+        # We only care about a narrow frontal corridor:
+        # x in [0, near_obstacle_front_x], |y| <= near_obstacle_half_width
+        # Here we assume scan columns roughly correspond to forward x,
+        # rows roughly correspond to lateral y. If your scan indexing differs,
+        # swap xx / yy accordingly.
+        yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+
+        frontal_mask = (xx >= 0.0) & (xx <= near_obstacle_front_x-0.4) & (torch.abs(yy) <= near_obstacle_half_width-0.2)
+        frontal_mask = frontal_mask[None].expand(N, -1, -1)
+
+        obstacle_in_front = torch.any((height_scan > near_obstacle_height_th+0.2)& (height_scan < near_obstacle_height_th+4.2)& frontal_mask, dim=(1, 2))
+
+        # only treat as hard failure if robot is actually trying to move
+        near_obstacle = trying_to_move & obstacle_in_front
+
+    # --------------------------------------------------
+    # 6) Aggregate
+    # --------------------------------------------------
+    hard_now = bad_contact |fallen|stuck|near_obstacle
+
+    # --------------------------------------------------
+    # 7) Debounce with one-shot pulse
+    # --------------------------------------------------
+    if not hasattr(env, "_hard_failure_counter"):
+        env._hard_failure_counter = torch.zeros(env.num_envs, device=device, dtype=torch.long)
+
+    env._hard_failure_counter[hard_now] += 1
+    env._hard_failure_counter[~hard_now] = 0
+
+    hard_trigger = env._hard_failure_counter >= K
+
+    # one-shot pulse
+    env._hard_failure_counter[hard_trigger] = 0
+
+    return hard_trigger
+def hard_faliure_obs(
+    env: ManagerBasedRLEnv,
+    body_force_threshold: float = 20.0,
+    feet_support_threshold: float = 10.0,
+    min_base_height: float = 0.45,
+    max_abs_roll: float = 0.8,
+    max_abs_pitch: float = 0.8,
+    stuck_steps: int = 5,
+    min_progress: float = 0.003,
+    command_threshold: float = 0.15,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_forces"),
+    feet_cfg: SceneEntityCfg | None = None,
+    K: int = 1,
+    # near-obstacle patch
+    extero_key: str = "extero_obs",
+    near_obstacle_height_th: float = 0.08,
+    near_obstacle_front_x: float = 0.8,
+    near_obstacle_half_width: float = 0.35,
+) -> torch.Tensor:
+    collision = hard_faliure(
+        env=env,
+        body_force_threshold=body_force_threshold,
+        feet_support_threshold=feet_support_threshold,
+        min_base_height=min_base_height,
+        max_abs_roll=max_abs_roll,
+        max_abs_pitch=max_abs_pitch,
+        stuck_steps=stuck_steps,
+        min_progress=min_progress,
+        command_threshold=command_threshold,
+        sensor_cfg=sensor_cfg,
+        feet_cfg=feet_cfg,
+        K=K,
+        extero_key=extero_key,
+        near_obstacle_height_th=near_obstacle_height_th,
+        near_obstacle_front_x=near_obstacle_front_x,
+        near_obstacle_half_width=near_obstacle_half_width,
+    )
+    return collision.unsqueeze(-1)
 """
 Actions.
 """

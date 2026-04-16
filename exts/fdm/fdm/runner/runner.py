@@ -192,6 +192,8 @@ class FDMRunner:
             cfg=self.cfg.model_cfg, device=self.device
         )
         self.model.to(self.device)
+        print("[CFG-DBG] reset_base func =", self.cfg.env_cfg.events.reset_base.func, flush=True)
+        print("[CFG-DBG] reset_robot_joints =", getattr(self.cfg.env_cfg.events, "reset_robot_joints", None), flush=True)
 
         #print(
         #    "[DEBUG] encoder input_size =",
@@ -766,12 +768,13 @@ class FDMRunner:
 
             # counter for rendering
             render_counter = torch.zeros(self.env.num_envs, device=self.env.device, dtype=torch.int)
-
-        while not self.replay_buffer.is_filled:
+        print("draw_interface is None:", not (hasattr(self, "draw_interface") and self.draw_interface is not None), flush=True)
+        test_step = 0
+        max_test_steps = 50000
+        while test_step < max_test_steps:
             robot = self.env.scene.articulations["robot"]
             p = robot.data.root_pos_w[0].detach().cpu()
             v = robot.data.root_lin_vel_w[0].detach().cpu()
-            print("[DEBUG] root_z =", float(p[2]), "vz =", float(v[2]), flush=True)
             pelvis_z = float(robot.data.root_pos_w[0,2].item())
             # 用 ankle_roll_link 的刚体高度（需要你确认 body index）
             # 临时做法：直接打印所有 body z 的 min/max
@@ -789,7 +792,6 @@ class FDMRunner:
             robot = self.env.scene.articulations["robot"]
             v = robot.data.root_lin_vel_w[0].detach().cpu()
             w = robot.data.root_ang_vel_w[0].detach().cpu()
-            print(f"[DEBUG] root v_w={v.tolist()}  w_w={w.tolist()}", flush=True)
 
 
 
@@ -858,6 +860,69 @@ class FDMRunner:
 
                 # update predictions and save them for plotting
                 model_out = self._eval_predict(env_new_prediction)
+                # ===== DEBUG: print risk =====
+                risk_raw = model_out[1]
+
+                if risk_raw.ndim == 1:
+                    risk_traj = risk_raw
+                    print(
+                        "[RISK-DBG] unified risk shape =", tuple(risk_raw.shape),
+                        "min/max/mean =",
+                        float(risk_raw.min().item()),
+                        float(risk_raw.max().item()),
+                        float(risk_raw.mean().item()),
+                        "threshold =", float(self.cfg.model_cfg.collision_threshold),
+                        flush=True,
+                    )
+                    print(
+                        "[RISK-DBG] first 10 traj risk =",
+                        risk_traj[:10].detach().cpu().tolist(),
+                        flush=True,
+                    )
+                else:
+                    print(
+                        "[RISK-DBG] step risk shape =", tuple(risk_raw.shape),
+                        "min/max/mean =",
+                        float(risk_raw.min().item()),
+                        float(risk_raw.max().item()),
+                        float(risk_raw.mean().item()),
+                        "threshold =", float(self.cfg.model_cfg.collision_threshold),
+                        flush=True,
+                    )
+                    print(
+                        "[RISK-DBG] first env step risk =",
+                        risk_raw[0].detach().cpu().tolist(),
+                        flush=True,
+                    )
+
+                    risk_traj_mean = risk_raw.mean(dim=1)
+                    risk_traj_max = risk_raw.max(dim=1)[0]
+
+                    print(
+                        "[RISK-DBG] traj mean risk min/max/mean =",
+                        float(risk_traj_mean.min().item()),
+                        float(risk_traj_mean.max().item()),
+                        float(risk_traj_mean.mean().item()),
+                        flush=True,
+                    )
+                    print(
+                        "[RISK-DBG] traj max risk min/max/mean =",
+                        float(risk_traj_max.min().item()),
+                        float(risk_traj_max.max().item()),
+                        float(risk_traj_max.mean().item()),
+                        flush=True,
+                    )
+                    print(
+                        "[RISK-DBG] first 10 traj mean risk =",
+                        risk_traj_mean[:10].detach().cpu().tolist(),
+                        flush=True,
+                    )
+                    print(
+                        "[RISK-DBG] first 10 traj max risk =",
+                        risk_traj_max[:10].detach().cpu().tolist(),
+                        flush=True,
+                    )
+                # ===== END DEBUG =====
 
                 # append the initial state to the predictions for visualization
                 # NOTE: the yaw component is not used, here we augment to fit to the sin, cos encoding of the model_out
@@ -1078,8 +1143,9 @@ class FDMRunner:
                     render_counter[idx] += 1
 
                 # break if all environments are done
-                if torch.any(render_counter >= 500):
+                if torch.any(render_counter >= 50000):
                     break
+            test_step += 1
 
         # save the images as a video
         if cameras is not None:
@@ -1113,30 +1179,6 @@ class FDMRunner:
         # reset environment
         with torch.inference_mode():
             obs, _ = self.env.reset(random.randint(0, 1000000))
-            try:
-                robot = self.env.scene.articulations["robot"]
-                p = robot.data.root_pos_w[:5, 2].detach().cpu().numpy()
-                origins = self.env.scene.env_origins[:5].cpu().numpy()
-                print(f"[RESET-DBG] random post-reset root_z[:5]={p} env_origins[:5]={origins}", flush=True)
-                try:
-                    if getattr(self, "force_spawn_z", None) is not None:
-                        desired_z = float(self.force_spawn_z)
-                        world_pos = robot.data.root_pos_w.clone()
-                        origins = self.env.scene.env_origins.to(world_pos.device)
-                        world_pos[:, 2] = origins[:, 2] + desired_z
-                        orientations = robot.data.root_quat_w.clone()
-                        env_ids = torch.arange(world_pos.shape[0], device=world_pos.device)
-                        robot.write_root_pose_to_sim(torch.cat([world_pos, orientations], dim=-1), env_ids=env_ids)
-                        try:
-                            zero_vel = torch.zeros((world_pos.shape[0], 6), device=world_pos.device)
-                            robot.write_root_velocity_to_sim(zero_vel, env_ids=env_ids)
-                        except Exception:
-                            pass
-                        print(f"[FORCE-DBG] forced world_z_offset={desired_z} wrote world_z[:5]={world_pos[:5,2].cpu().numpy()}", flush=True)
-                except Exception as e:
-                    print(f"[FORCE-DBG] failed to force spawn z: {e}", flush=True)
-            except Exception:
-                pass
             # the contact sensor is delayed, execute delay+1 steps to reset all environments correctly
             if torch.any(obs["fdm_state"][..., 7]):
                 for _ in range(self.cfg.env_cfg.scene.contact_forces.history_length - self.cfg.env_cfg.decimation + 1):
@@ -1182,6 +1224,12 @@ class FDMRunner:
             sim_start = time.time()
             with torch.inference_mode():
                 obs, _, dones, _, _ = self.env.step(actions.clone())
+            if step_counter < 20 or step_counter % 2000 == 0:
+                coll_raw = obs["fdm_state"][..., 7].float()
+                print(
+                    f"[COLLECT-DBG][step={step_counter}] raw coll ratio after env.step = "
+                    f"{coll_raw.mean().item():.4f}, done ratio = {dones.float().mean().item():.4f}"
+                )
             sim_time += time.time() - sim_start
 
             ###
@@ -1189,6 +1237,9 @@ class FDMRunner:
             ###
             # Note: only start recording and changing actions when all feet have touched the ground
             feet_all_contact, dones, obs_new = self._feet_contact_handler(dones)
+            done_env_ids = torch.where(dones.to(torch.bool))[0]
+            if done_env_ids.numel() > 0:
+                self.replay_buffer.reset_local_history(done_env_ids)
             obs = obs_new if obs_new is not None else obs
 
             ###
@@ -1234,7 +1285,6 @@ class FDMRunner:
                 ),
             )
             process_time += time.time() - update_buffer_start
-
             ###
             # Update timers
             ###
@@ -1263,7 +1313,7 @@ class FDMRunner:
 
             if (
                 not self.replay_buffer.is_filled
-                and self.replay_buffer.fill_ratio > 0.95
+                and self.replay_buffer.fill_ratio > 0.85
                 and plan_time + sim_time + process_time > 1.5 * np.mean(collect_time)
             ):
                 print("[WARNING]: Collection took too long for some environments. Stopping collection.")
@@ -1523,7 +1573,7 @@ class FDMRunner:
                     model.hard_contact_obs_limits[1] - model.hard_contact_obs_limits[0]
                 )
 
-               # collect future actions  (SAFE indexing)
+        # collect future actions  (SAFE indexing)
         plan = self.agent._plan                       # (num_envs, H_plan, act_dim)
         plan_steps = self.agent._plan_step            # (num_envs,)
         H_plan = plan.shape[1]
@@ -1659,6 +1709,16 @@ class FDMRunner:
                 prev_coll = prev_coll[-self.cfg.model_cfg.prediction_horizon]
             else:
                 prev_coll = prev_coll[-self.cfg.model_cfg.prediction_horizon][-self.cfg.model_cfg.prediction_horizon :]
+            raw = self.replay_buffer.states[
+                env_idx,
+                self.replay_buffer.fill_idx[env_idx] - self.cfg.model_cfg.prediction_horizon : self.replay_buffer.fill_idx[env_idx],
+                0,
+            ]
+
+            print("[EVAL-TGT-DBG] raw first row =", raw[0].detach().cpu().tolist(), flush=True)
+            print("[EVAL-TGT-DBG] idx7 collision? =", raw[:, 7].detach().cpu().tolist(), flush=True)
+            print("[EVAL-TGT-DBG] idx8 hard_contact =", raw[:, 8].detach().cpu().tolist(), flush=True)
+            print("[EVAL-TGT-DBG] idx-1 current used =", raw[:, -1].detach().cpu().tolist(), flush=True)
 
             # get loss values
             future_states_yaw = math_utils.euler_xyz_from_quat(
@@ -1687,7 +1747,7 @@ class FDMRunner:
                         self.replay_buffer.fill_idx[env_idx]
                         - self.cfg.model_cfg.prediction_horizon : self.replay_buffer.fill_idx[env_idx],
                         0,
-                        -1,
+                        7,
                     ].unsqueeze(1),
                     # FIXME: quick fix for energy trajectory
                     torch.zeros((self.cfg.model_cfg.prediction_horizon, 1)),

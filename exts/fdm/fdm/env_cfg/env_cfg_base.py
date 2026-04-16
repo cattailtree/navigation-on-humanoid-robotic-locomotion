@@ -20,7 +20,7 @@ from isaaclab.sensors import ContactSensorCfg, RayCasterCfg, patterns
 from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 import isaaclab.envs.mdp as mdpp
-
+from .terrain_cfg import BASELINE_2D_TERRAIN_CFG, FDM_TERRAINS_CFG
 from nav_suite.terrains import NavTerrainImporterCfg
 
 import fdm.mdp as mdp
@@ -32,18 +32,28 @@ from fdm.env_cfg.robot_cfg_g1 import G1_CFG, G1_29DOF_JOINT_NAMES
 ##
 # Constants
 ##
-
 TERRAIN_ANALYSIS_CFG = mdp.TerrainAnalysisCfg(
     semantic_cost_mapping=None,
-    raycaster_sensor="height_scanner",  # 🔥 用我们在 Scene 里定义的 RayCasterCfg
+    raycaster_sensor="height_scanner",
+
     viz_graph=False,
     viz_height_map=False,
+
     sample_points=30000,
-    height_diff_threshold=0.2,
-    wall_height=2.25,
+
+    # 🔥 更严格
+    height_diff_threshold=0.08,   # 原来 0.2 → 太宽松
+
+    # 🔥 更低，让柱子被识别为墙
+    wall_height=0.50,             # 原来 2.25 → 错
+
     door_filtering=True,
+
     grid_resolution=0.05,
-    door_height_threshold=1.2,
+
+    # 🔥 防止柱子被当门
+    door_height_threshold=0.8,   # 原来 1.2 → 太高
+
     max_terrain_size=350.0,
 )
 
@@ -60,7 +70,8 @@ class TerrainSceneCfg(InteractiveSceneCfg):
     # USD TERRAIN
     terrain = NavTerrainImporterCfg(
         prim_path="/World/ground",
-        terrain_type="usd",
+        terrain_type="generator",
+        terrain_generator = FDM_TERRAINS_CFG,
         usd_path=os.path.join(
             FDM_DATA_DIR, "Terrains", "navigation_terrain_wall_usd_merge_large_single_object_maze.usd"
         ),
@@ -86,7 +97,7 @@ class TerrainSceneCfg(InteractiveSceneCfg):
     # 传感器：高度扫描（给 FDM / terrain analysis 用）
     height_scanner = RayCasterCfg(
         # ✅ G1 的 usd 根 prim 是 g1_29dof_rev_1_0，所以这里挂在那个 prim 上
-        prim_path="{ENV_REGEX_NS}/Robot",
+        prim_path="{ENV_REGEX_NS}/Robot/pelvis",
         offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.5)),  # 相对 G1 根往上 0.5m
         ray_alignment="yaw",
         pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=(1.6, 1.0)),
@@ -262,24 +273,49 @@ class ObservationsCfg:
         #base_position = ObsTerm(func=mdp.base_position)
         base_orientation = ObsTerm(func=mdp.base_orientation_xyzw)
         base_collision = ObsTerm(
-            func=mdp.base_collision_obs,
-            params={
-        "threshold": 100.0,
-        "K": 3,
-        "feet_support_threshold": 5.0,
-        "sensor_cfg": SceneEntityCfg(
-            "contact_forces",
-            body_names=[".*pelvis.*"],
-        ),
-        "feet_cfg": SceneEntityCfg(
-            "contact_forces",
-            body_names=[
-                "left_ankle_roll_link",
-                "right_ankle_roll_link",
-            ],
-        ),
-    },
-        )
+        func=mdp.hard_faliure_obs,
+        params={
+            "body_force_threshold": 20.0,
+            "feet_support_threshold": 10.0,
+            "min_base_height": 0.45,
+            "max_abs_roll": 0.8,
+            "max_abs_pitch": 0.8,
+            "stuck_steps": 5,
+            "min_progress": 0.003,
+            "command_threshold": 0.15,
+            "K": 1,
+
+            # near-obstacle patch
+            "extero_key": "extero_obs",
+            "near_obstacle_height_th": 0.08,
+            "near_obstacle_front_x": 0.8,
+            "near_obstacle_half_width": 0.35,
+
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces",
+                body_names=[
+                    "pelvis",
+                    "waist_yaw_link",
+                    "waist_roll_link",
+                    "torso_link",
+                    "left_hip_pitch_link",
+                    "left_hip_roll_link",
+                    "left_hip_yaw_link",
+                    "right_hip_pitch_link",
+                    "right_hip_roll_link",
+                    "right_hip_yaw_link",
+                ],
+            ),
+
+            "feet_cfg": SceneEntityCfg(
+                "contact_forces",
+                body_names=[
+                    "left_ankle_roll_link",
+                    "right_ankle_roll_link",
+                ],
+            ),
+        },
+    )
         hard_contact = ObsTerm(func=mdp.energy_consumption, params={"energy_scale_factor": 0.001})
         friction = ObsTerm(
             func=mdp.FrictionObservation(),
@@ -322,32 +358,10 @@ class EventsCfg:
 
     # reset：根据地形分析重置 base
     reset_base = EventTerm(
-        func=mdp.TerrainAnalysisRootReset(
-            cfg=TERRAIN_ANALYSIS_CFG,
-            robot_dim=0.6,
-        ),
+        func=mdp.reset_root_state_humanoid_stable,
         mode="reset",
         params={
             "asset_cfg": SceneEntityCfg("robot"),
-            "yaw_range": (-3.14, 3.14),
-            "velocity_range": {
-                "x": (-0.01, 0.01),
-                "y": (-0.01, 0.01),
-                "z": (0, 0),
-                "roll": (0, 0),
-                "pitch": (0, 0),
-                "yaw": (-0.01, 0.01),
-            },
-        },
-    )
-
-    reset_robot_joints = EventTerm(
-        func=mdp.reset_joints_by_scale,
-        mode="reset",
-        params={
-            "asset_cfg": SceneEntityCfg("robot"),
-            "position_range": (0.99, 1.01),
-            "velocity_range": (0.0, 0.0),
         },
     )
 

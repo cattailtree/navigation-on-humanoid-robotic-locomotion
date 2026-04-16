@@ -27,19 +27,6 @@ from fdm.model import EmpiricalNormalization, FDMModel
 from .early_stopping import EarlyStopping
 from .trainer_cfg import TrainerBaseCfg
 from .utils import combined_dataloader
-
-def _tensor_all_finite(self, x):
-    return x is None or torch.isfinite(x).all()
-
-def _inputs_all_finite(self, inputs):
-    # inputs:
-    # [state_history, obs_proprioceptive, obs_exteroceptive, actions,
-    #  add_obs_exteroceptive, states, perfect_velocity_following_local_frame]
-    for i, x in enumerate(inputs):
-        if x is not None and not torch.isfinite(x).all():
-            print(f"[WARNING] Non-finite values detected in inputs[{i}] with shape {tuple(x.shape)}", flush=True)
-        return False
-    return True
 class Trainer:
     def __init__(
         self,
@@ -278,8 +265,6 @@ class Trainer:
             mean_real_world_test_loss = 0
 
             # training loop
-            skipped_train_batches = 0
-
             for inputs in (
                 self.dataloader
                 if self.real_world_train_datasets is None
@@ -291,29 +276,15 @@ class Trainer:
                 else:
                     real_world_source = False
 
-                # apply noise
+                # inputs [state_history, obs_proprioceptive, obs_exteroceptive, actions, add_obs_extereoceptive, states, perfect_velocity_following_local_frame]
+                # apply noise to height map (not done during data collection to prevent overfitting)
                 if self.cfg.apply_noise and not real_world_source:
                     inputs = self._obs_noise(inputs)
 
-                # -------- 1) input finite check --------
-                if not self._inputs_all_finite(inputs):
-                    print("[WARNING] Skip train batch: non-finite input batch.", flush=True)
-                    skipped_train_batches += 1
-                    continue
-
-                # -------- 2) model update --------
+                # update model
                 loss, meta = self.model.update(
                     model_in=inputs[:5], optimizer=self.optimizer, target=inputs[5], eval_in=inputs[6:]
                 )
-
-                # -------- 3) loss finite check --------
-                if not torch.isfinite(loss):
-                    print("[WARNING] Skip train batch: non-finite loss returned by model.update().", flush=True)
-                    skipped_train_batches += 1
-                    # 防止 optimizer 里残留梯度
-                    self.optimizer.zero_grad(set_to_none=True)
-                    continue
-
                 mean_loss += loss
 
                 if self.cfg.logging:
@@ -325,40 +296,20 @@ class Trainer:
 
             # validation loop
             eval_meta = {}
-            skipped_val_batches = 0
-            valid_val_batches = 0
-            eval_meta = {}
-
             for inputs in self.validation_dataloader:
                 if self.cfg.apply_noise:
                     inputs = self._obs_noise(inputs)
 
-                if not self._inputs_all_finite(inputs):
-                    print("[WARNING] Skip val batch: non-finite input batch.", flush=True)
-                    skipped_val_batches += 1
-                    continue
-
                 loss, meta = self.model.evaluate(model_in=inputs[:5], target=inputs[5], eval_in=inputs[6:])
-
-                if not torch.isfinite(loss):
-                    print("[WARNING] Skip val batch: non-finite loss.", flush=True)
-                    skipped_val_batches += 1
-                    continue
-
                 mean_val_loss += loss
-                valid_val_batches += 1
                 for key, value in meta.items():
                     eval_meta[key] = value + eval_meta.get(key, 0)
             # get mean validation loss
-            if valid_val_batches == 0:
-                print("[WARNING] No valid validation batches in this epoch.", flush=True)
-                mean_val_loss = torch.tensor(float("nan"), device=self.device)
-            else:
-                mean_val_loss = mean_val_loss / valid_val_batches
-                for key, value in eval_meta.items():
-                    eval_meta[key] = value / valid_val_batches
-
-            epoch_mean_val_loss += mean_val_loss if torch.isfinite(mean_val_loss) else 0.0
+            mean_val_loss = mean_val_loss / batch_number_val
+            epoch_mean_val_loss += mean_val_loss
+            # scale eval meta as logged per batch
+            for key, value in eval_meta.items():
+                eval_meta[key] = value / batch_number_val
 
             # testing loop (in the case any test datasets are given)
             if self.test_datasets:
@@ -505,28 +456,16 @@ class Trainer:
             dataloader = self.validation_dataloader
         batch_number = len(dataloader)
 
-        valid_eval_batches = 0
-
         for batch_idx, inputs in enumerate(dataloader):
             if self.cfg.apply_noise:
                 inputs = self._obs_noise(inputs)
 
-            if not self._inputs_all_finite(inputs):
-                print("[WARNING] Skip eval batch: non-finite input batch.", flush=True)
-                continue
-
             loss, meta = self.model.evaluate(
                 model_in=inputs[:5], target=inputs[5], eval_in=inputs[6:], mode="eval" if not plot_mode else "plot"
             )
-
-            if not torch.isfinite(loss):
-                print("[WARNING] Skip eval batch: non-finite loss.", flush=True)
-                continue
-
             mean_eval_loss += loss
-            valid_eval_batches += 1
 
-            if valid_eval_batches == 1:
+            if batch_idx == 0:
                 meta_eval = meta
             else:
                 for key, value in meta.items():
@@ -535,14 +474,9 @@ class Trainer:
                     except KeyError:
                         meta_eval[key] = value
         # average meta_eval
-        if valid_eval_batches == 0:
-            print("[WARNING] No valid eval batches.", flush=True)
-            mean_eval_loss = torch.tensor(float("nan"), device=self.device)
-            meta_eval = {}
-        else:
-            for key, value in meta_eval.items():
-                meta_eval[key] = value / valid_eval_batches
-            mean_eval_loss = mean_eval_loss / valid_eval_batches
+        for key, value in meta_eval.items():
+            meta_eval[key] = value / batch_number
+        mean_eval_loss = mean_eval_loss / batch_number
 
         # print meta information
         self.print_meta_info(meta_eval)

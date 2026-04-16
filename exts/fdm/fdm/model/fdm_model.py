@@ -323,6 +323,8 @@ class FDMModel(Model):
 
         # scale losses by learning progress if enabled
         # --- Weighted BCE on probabilities (no shape change, no logits) ---
+         # scale losses by learning progress if enabled
+        # --- Weighted BCE on probabilities (no shape change, no logits) ---
         eps = 1e-6
         p = pred_collision_prob_traj.clamp(eps, 1 - eps)
         y = target_collision_state_traj
