@@ -67,6 +67,10 @@ def get_planner_cfg(
             "gamma": 1.0,
             "sigma": 0.87,
             "beta": 0.6,
+            "sampling_strategy": "gaussian",  # set to "cvae" to sample with a trained CVAE
+            "cvae_checkpoint": None,
+            "cvae_latent_dim": 16,
+            "cvae_temperature": 1.0,
             "lower_bound": ["${action_cfg.lower_bound}" for i in range(traj_dim)],
             "upper_bound": ["${action_cfg.upper_bound}" for i in range(traj_dim)],
             "device": device,

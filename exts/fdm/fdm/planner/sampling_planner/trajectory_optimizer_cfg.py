@@ -64,6 +64,14 @@ class MPPICfg:
     So basically beta of 0 means the action is repeated for all timesteps within the same trajectory.A setting of 1
     means it is fully uncorrelated.
     """
+    sampling_strategy: str = "gaussian"
+    """Noise source for trajectory sampling. One of: ``gaussian`` or ``cvae``."""
+    cvae_checkpoint: str | None = None
+    """Optional CVAE checkpoint path used when ``sampling_strategy='cvae'``."""
+    cvae_latent_dim: int = 16
+    """Latent dimension for the CVAE sampler."""
+    cvae_temperature: float = 1.0
+    """Sampling temperature for latent variables in the CVAE sampler."""
 
 
 @dataclass
