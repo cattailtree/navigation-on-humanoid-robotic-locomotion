@@ -6,6 +6,7 @@
 Dataset format (.pt):
 - mean_actions:   (N, H, A) MPPI mean trajectories (condition)
 - target_actions: (N, H, A) high-quality trajectories (expert/elites, reconstruction target)
+- context:        (N, C) optional fused context vector (e.g. proprio + extero + history embedding)
 """
 
 from __future__ import annotations
@@ -31,10 +32,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument(
+        "--context-key",
+        type=str,
+        default="context",
+        help="Optional key for context tensor in dataset. Set empty string to disable context.",
+    )
     return parser.parse_args()
 
 
-def load_dataset(path: str) -> TensorDataset:
+def load_dataset(path: str, context_key: str = "context") -> TensorDataset:
     data = torch.load(path, map_location="cpu")
     if "mean_actions" not in data or "target_actions" not in data:
         raise KeyError("Dataset must contain keys: mean_actions and target_actions")
@@ -43,6 +50,11 @@ def load_dataset(path: str) -> TensorDataset:
     target_actions = data["target_actions"].float()
     if mean_actions.shape != target_actions.shape:
         raise ValueError(f"Shape mismatch: {mean_actions.shape=} {target_actions.shape=}")
+    if len(context_key) > 0 and context_key in data:
+        context = data[context_key].float()
+        if context.shape[0] != mean_actions.shape[0]:
+            raise ValueError(f"Context length mismatch: {context.shape[0]=}, {mean_actions.shape[0]=}")
+        return TensorDataset(mean_actions, target_actions, context)
     return TensorDataset(mean_actions, target_actions)
 
 
@@ -58,12 +70,18 @@ def run_epoch(
 
     totals = {"loss": 0.0, "recon_loss": 0.0, "kl_loss": 0.0}
     n = 0
-    for cond, target in loader:
+    for batch in loader:
+        if len(batch) == 3:
+            cond, target, context = batch
+            context = context.to(device)
+        else:
+            cond, target = batch
+            context = None
         cond = cond.to(device)
         target = target.to(device)
 
         with torch.set_grad_enabled(train):
-            recon, mu, logvar = model(target=target, cond=cond)
+            recon, mu, logvar = model(target=target, cond=cond, context=context)
             loss, stats = model.loss(recon=recon, target=target, mu=mu, logvar=logvar, beta_kl=beta_kl)
 
         if train:
@@ -83,7 +101,7 @@ def main() -> None:
     args = parse_args()
     torch.manual_seed(args.seed)
 
-    dataset = load_dataset(args.dataset)
+    dataset = load_dataset(args.dataset, context_key=args.context_key)
     n_val = int(len(dataset) * args.val_ratio)
     n_train = len(dataset) - n_val
     train_set, val_set = random_split(dataset, [n_train, n_val], generator=torch.Generator().manual_seed(args.seed))

@@ -21,6 +21,7 @@ class ActionCVAE(nn.Module):
         encoder_hidden_dim: int = 128,
         cond_hidden_dim: int = 128,
         decoder_hidden_dim: int = 128,
+        context_hidden_dim: int = 128,
     ):
         super().__init__()
         self.action_dim = action_dim
@@ -34,8 +35,14 @@ class ActionCVAE(nn.Module):
             nn.LayerNorm(cond_hidden_dim),
             nn.SiLU(),
         )
+        self.context_encoder = nn.Sequential(
+            nn.LazyLinear(context_hidden_dim),
+            nn.LayerNorm(context_hidden_dim),
+            nn.SiLU(),
+            nn.Linear(context_hidden_dim, cond_hidden_dim),
+        )
         self.encoder = nn.Sequential(
-            nn.Linear(self.output_dim + self.cond_dim, encoder_hidden_dim),
+            nn.Linear(self.output_dim + cond_hidden_dim, encoder_hidden_dim),
             nn.LayerNorm(encoder_hidden_dim),
             nn.SiLU(),
             nn.Linear(encoder_hidden_dim, encoder_hidden_dim),
@@ -51,7 +58,17 @@ class ActionCVAE(nn.Module):
             nn.Linear(decoder_hidden_dim, self.output_dim),
         )
 
-    def encode(self, target: torch.Tensor, cond: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _condition_features(self, cond: torch.Tensor, context: torch.Tensor | None = None) -> torch.Tensor:
+        cond_flat = cond.reshape(cond.shape[0], -1)
+        cond_feat = self.cond_encoder(cond_flat)
+        if context is not None:
+            context = context.reshape(context.shape[0], -1)
+            cond_feat = cond_feat + self.context_encoder(context)
+        return cond_feat
+
+    def encode(
+        self, target: torch.Tensor, cond: torch.Tensor, context: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Encode target trajectory with condition into latent Gaussian parameters."""
         bs, horizon, action_dim = cond.shape
         if target.shape != cond.shape:
@@ -61,7 +78,8 @@ class ActionCVAE(nn.Module):
                 "Condition shape mismatch. "
                 f"Expected (*, {self.planning_horizon}, {self.action_dim}), got (*, {horizon}, {action_dim})."
             )
-        enc_in = torch.cat((target.reshape(bs, -1), cond.reshape(bs, -1)), dim=-1)
+        cond_feat = self._condition_features(cond, context=context)
+        enc_in = torch.cat((target.reshape(bs, -1), cond_feat), dim=-1)
         h = self.encoder(enc_in)
         return self.encoder_mu(h), self.encoder_logvar(h)
 
@@ -71,19 +89,20 @@ class ActionCVAE(nn.Module):
         eps = torch.randn_like(std)
         return mu + eps * std
 
-    def decode(self, z: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+    def decode(self, z: torch.Tensor, cond: torch.Tensor, context: torch.Tensor | None = None) -> torch.Tensor:
         bs, horizon, action_dim = cond.shape
-        cond_flat = cond.reshape(bs, -1)
-        cond_feat = self.cond_encoder(cond_flat)
+        cond_feat = self._condition_features(cond, context=context)
         decoder_in = torch.cat([cond_feat, z], dim=-1)
         out = self.decoder(decoder_in)
         return out.view(bs, horizon, action_dim)
 
-    def forward(self, target: torch.Tensor, cond: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(
+        self, target: torch.Tensor, cond: torch.Tensor, context: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Train-time forward pass for reconstruction + KL loss."""
-        mu, logvar = self.encode(target, cond)
+        mu, logvar = self.encode(target, cond, context=context)
         z = self.reparameterize(mu, logvar)
-        recon = self.decode(z, cond)
+        recon = self.decode(z, cond, context=context)
         return recon, mu, logvar
 
     @staticmethod
@@ -100,7 +119,9 @@ class ActionCVAE(nn.Module):
         return total, {"loss": total.detach(), "recon_loss": recon_loss.detach(), "kl_loss": kl.detach()}
 
     @torch.inference_mode()
-    def sample(self, cond: torch.Tensor, num_samples: int, temperature: float = 1.0) -> torch.Tensor:
+    def sample(
+        self, cond: torch.Tensor, num_samples: int, temperature: float = 1.0, context: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """Sample action trajectories from the CVAE decoder.
 
         Args:
@@ -120,8 +141,10 @@ class ActionCVAE(nn.Module):
 
         z = torch.randn(num_samples, bs, self.latent_dim, device=cond.device, dtype=cond.dtype) * temperature
         cond_expanded = cond.unsqueeze(0).expand(num_samples, -1, -1, -1).reshape(-1, horizon, action_dim)
+        if context is not None:
+            context = context.unsqueeze(0).expand(num_samples, -1, -1).reshape(-1, context.shape[-1])
         z = z.reshape(-1, self.latent_dim)
-        out = self.decode(z, cond_expanded)
+        out = self.decode(z, cond_expanded, context=context)
         out = out.view(num_samples, bs, horizon, action_dim)
         return out.view(num_samples, bs, horizon, action_dim)
 
@@ -154,11 +177,13 @@ class CVAEActionSampler:
             self.model.load_state_dict(state, strict=False)
 
     @torch.inference_mode()
-    def sample_population(self, mean: torch.Tensor, population_size: int) -> torch.Tensor:
+    def sample_population(
+        self, mean: torch.Tensor, population_size: int, context: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """Sample action trajectories around current mean.
 
         Returns:
             (N, BS, H, A) sampled actions.
         """
-        sampled = self.model.sample(mean, num_samples=population_size, temperature=self.temperature)
+        sampled = self.model.sample(mean, num_samples=population_size, temperature=self.temperature, context=context)
         return sampled

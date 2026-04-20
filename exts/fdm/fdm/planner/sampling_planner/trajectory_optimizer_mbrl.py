@@ -1132,12 +1132,15 @@ class BatchedMPPIOptimizer(Optimizer):
 
         for k in range(self.num_iterations):
             # sample noise and update constrained variances
+            cvae_context: torch.Tensor | None = kwargs.get("cvae_context", None)
             lb_dist = self.mean[env_ids] - self.lower_bound
             ub_dist = self.upper_bound - self.mean[env_ids]
             mv = torch.minimum(torch.square(lb_dist / 2), torch.square(ub_dist / 2))
             constrained_var = torch.minimum(mv, self.var)
             if self.cvae_sampler is not None:
-                population = self.cvae_sampler.sample_population(self.mean[env_ids], self.population_size)
+                population = self.cvae_sampler.sample_population(
+                    self.mean[env_ids], self.population_size, context=cvae_context
+                )
             else:
                 noise = torch.empty(
                     size=(

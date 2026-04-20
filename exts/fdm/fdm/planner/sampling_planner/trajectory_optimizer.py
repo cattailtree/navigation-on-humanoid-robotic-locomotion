@@ -94,6 +94,28 @@ class SimpleSE2TrajectoryOptimizer:
 
         self.debug_info = {}
 
+    def _build_cvae_context(self, env_ids: torch.Tensor | list[int] | slice | None = None) -> torch.Tensor | None:
+        """Build flattened conditioning context for the CVAE sampler from planner observations."""
+        if "cvae_context" in self.obs and torch.is_tensor(self.obs["cvae_context"]):
+            context = self.obs["cvae_context"]
+        else:
+            context_keys = ["goal", "proprio", "proprioception", "history", "height_scan", "state"]
+            context_parts = []
+            for key in context_keys:
+                if key not in self.obs or not torch.is_tensor(self.obs[key]):
+                    continue
+                tensor = self.obs[key]
+                if tensor.dtype not in (torch.float16, torch.float32, torch.float64):
+                    tensor = tensor.float()
+                context_parts.append(tensor.reshape(tensor.shape[0], -1))
+            if len(context_parts) == 0:
+                return None
+            context = torch.cat(context_parts, dim=-1)
+
+        if env_ids is not None and env_ids != slice(None):
+            context = context[env_ids]
+        return context.to(self.device)
+
     def set_fdm_classes(self, fdm_model: FDMModel, env: ManagerBasedRLEnv):
         self.fdm_model = fdm_model
         self.terrain_analysis = TerrainAnalysis(cfg=TERRAIN_ANALYSIS_CFG, scene=env.scene)
@@ -197,6 +219,7 @@ class SimpleSE2TrajectoryOptimizer:
             x0_env_ids=resample_env_ids,
             var0=None,
             callback=self.logging_callback,
+            cvae_context=self._build_cvae_context(self.env_ids),
         )
         # self.var is shape := (BS, TRAJ_LENGTH, CONTROL_DIM)
         # best_population is shape := (BS, TRAJ_LENGTH, CONTROL_DIM)
