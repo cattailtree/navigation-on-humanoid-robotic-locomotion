@@ -59,6 +59,10 @@ def get_planner_cfg(
             "states_cost_w_cost_map": False,
             # mini batch size for FDM
             "batch_size": 15000,
+            # optional online CVAE dataset dumping
+            "cvae_dataset_dump_path": None,
+            "cvae_dataset_topk": 4,
+            "cvae_dataset_max_samples": 200000,
         },
         "optim": {
             "_target_": "fdm.planner.BatchedMPPIOptimizer",

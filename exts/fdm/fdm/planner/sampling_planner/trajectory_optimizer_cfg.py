@@ -90,6 +90,12 @@ class TrajectoryOptimizerCfg:
     set_actions_below_threshold_to_0: bool = False
     vel_limit_lin: float = 0.1
     vel_limit_ang: float = 0.1
+    cvae_dataset_dump_path: str | None = None
+    """Optional output path to dump CVAE training tuples from online MPPI planning."""
+    cvae_dataset_topk: int = 4
+    """Top-k trajectories per environment used as supervised targets in dataset dumping."""
+    cvae_dataset_max_samples: int = 200000
+    """Maximum number of dumped CVAE samples kept on disk."""
 
     # compute state costs from a cost map build from the height scan
     states_cost_w_cost_map: bool = False

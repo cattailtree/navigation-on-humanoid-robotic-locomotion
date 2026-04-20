@@ -93,6 +93,10 @@ class SimpleSE2TrajectoryOptimizer:
             self.func = self.b_obj_func
 
         self.debug_info = {}
+        self._cvae_mean_buffer: list[torch.Tensor] = []
+        self._cvae_target_buffer: list[torch.Tensor] = []
+        self._cvae_context_buffer: list[torch.Tensor] = []
+        self._last_cvae_context: torch.Tensor | None = None
 
     def _build_cvae_context(self, env_ids: torch.Tensor | list[int] | slice | None = None) -> torch.Tensor | None:
         """Build flattened conditioning context for the CVAE sampler from planner observations."""
@@ -212,6 +216,7 @@ class SimpleSE2TrajectoryOptimizer:
         # else:
         #     population = self.previous_solution
 
+        self._last_cvae_context = self._build_cvae_context(self.env_ids)
         best_population, self.var = self.optim.optimize(
             obj_fun=self.func,
             env_ids=self.env_ids,
@@ -219,7 +224,7 @@ class SimpleSE2TrajectoryOptimizer:
             x0_env_ids=resample_env_ids,
             var0=None,
             callback=self.logging_callback,
-            cvae_context=self._build_cvae_context(self.env_ids),
+            cvae_context=self._last_cvae_context,
         )
         # self.var is shape := (BS, TRAJ_LENGTH, CONTROL_DIM)
         # best_population is shape := (BS, TRAJ_LENGTH, CONTROL_DIM)
@@ -975,6 +980,54 @@ class SimpleSE2TrajectoryOptimizer:
         if self.to_cfg.debug:
             min_v = values.min()
             print(f"Iteration: {iteration}, Values: {min_v}")
+        if self.to_cfg.cvae_dataset_dump_path is None:
+            return
+        if iteration != self.optim.num_iterations - 1:
+            return
+
+        # population: (N, BS, H, A), values: (N, BS)
+        pop_size, bs = population.shape[0], population.shape[1]
+        k = min(self.to_cfg.cvae_dataset_topk, pop_size)
+        _, topk_idx = torch.topk(values, k=k, dim=0, largest=True)
+        batch_idx = torch.arange(bs, device=population.device).unsqueeze(0).expand(k, -1)
+        topk_traj = population[topk_idx, batch_idx]  # (k, BS, H, A)
+
+        mean = self.optim.mean[self.env_ids].detach().clone()
+        mean_expand = mean.unsqueeze(0).expand(k, -1, -1, -1)
+        self._cvae_mean_buffer.append(mean_expand.reshape(-1, mean.shape[1], mean.shape[2]).to("cpu"))
+        self._cvae_target_buffer.append(topk_traj.reshape(-1, topk_traj.shape[2], topk_traj.shape[3]).to("cpu"))
+        if self._last_cvae_context is not None:
+            context_expand = self._last_cvae_context.unsqueeze(0).expand(k, -1, -1)
+            self._cvae_context_buffer.append(context_expand.reshape(-1, context_expand.shape[-1]).to("cpu"))
+
+        self._flush_cvae_dataset()
+
+    def _flush_cvae_dataset(self) -> None:
+        if self.to_cfg.cvae_dataset_dump_path is None:
+            return
+        mean_actions = torch.cat(self._cvae_mean_buffer, dim=0) if len(self._cvae_mean_buffer) > 0 else None
+        target_actions = torch.cat(self._cvae_target_buffer, dim=0) if len(self._cvae_target_buffer) > 0 else None
+        if mean_actions is None or target_actions is None:
+            return
+
+        max_n = self.to_cfg.cvae_dataset_max_samples
+        if mean_actions.shape[0] > max_n:
+            mean_actions = mean_actions[-max_n:]
+            target_actions = target_actions[-max_n:]
+            if len(self._cvae_context_buffer) > 0:
+                context = torch.cat(self._cvae_context_buffer, dim=0)[-max_n:]
+                self._cvae_context_buffer = [context]
+            self._cvae_mean_buffer = [mean_actions]
+            self._cvae_target_buffer = [target_actions]
+
+        payload = {"mean_actions": mean_actions, "target_actions": target_actions}
+        if len(self._cvae_context_buffer) > 0:
+            payload["context"] = torch.cat(self._cvae_context_buffer, dim=0)
+
+        dump_dir = os.path.dirname(self.to_cfg.cvae_dataset_dump_path)
+        if len(dump_dir) > 0:
+            os.makedirs(dump_dir, exist_ok=True)
+        torch.save(payload, self.to_cfg.cvae_dataset_dump_path)
 
     def forward_dynamics(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
         """
