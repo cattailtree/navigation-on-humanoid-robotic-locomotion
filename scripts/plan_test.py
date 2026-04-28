@@ -49,6 +49,34 @@ parser.add_argument(
     choices=["None", "Cost", "Goal_Distance", "Collision", "Height_Scan_Cost", "Pose_Reward"],
     help="Cost visualization mode.",
 )
+parser.add_argument(
+    "--debug_risk",
+    action="store_true",
+    help="Print risk prediction statistics during planning.",
+)
+parser.add_argument(
+    "--collect_cvae_data",
+    action="store_true",
+    help="Collect MPPI mean/top-k trajectories for CVAE training.",
+)
+parser.add_argument(
+    "--cvae_dump_path",
+    type=str,
+    default="logs/fdm/cvae_dataset/mppi_cvae_dataset.pt",
+    help="Path to save the CVAE dataset (.pt).",
+)
+parser.add_argument(
+    "--cvae_topk",
+    type=int,
+    default=4,
+    help="Number of top trajectories per env to store as supervision targets.",
+)
+parser.add_argument(
+    "--cvae_max_samples",
+    type=int,
+    default=200000,
+    help="Maximum number of samples kept in dumped CVAE dataset.",
+)
 
 # append common FDM cli arguments
 cli_args.add_fdm_args(parser, default_num_envs=24)
@@ -199,6 +227,17 @@ def main():
     sampling_planner_cfg_dict = get_planner_cfg(
         args_cli.num_envs, traj_dim=10, debug=False, device="cuda", population_size=512
     )
+    if args_cli.debug_risk:
+        sampling_planner_cfg_dict["to_cfg"]["debug"] = True
+    if args_cli.collect_cvae_data:
+        args_cli.cvae_dump_path = os.path.abspath(args_cli.cvae_dump_path)
+        sampling_planner_cfg_dict["to_cfg"]["cvae_dataset_dump_path"] = args_cli.cvae_dump_path
+        sampling_planner_cfg_dict["to_cfg"]["cvae_dataset_topk"] = args_cli.cvae_topk
+        sampling_planner_cfg_dict["to_cfg"]["cvae_dataset_max_samples"] = args_cli.cvae_max_samples
+        print(
+            "[CVAE] enabled data collection: "
+            f"path={args_cli.cvae_dump_path}, topk={args_cli.cvae_topk}, max_samples={args_cli.cvae_max_samples}"
+        )
 
     if args_cli.env == "heuristic":
         sampling_planner_cfg_dict["to_cfg"]["control"] = "velocity_control"
