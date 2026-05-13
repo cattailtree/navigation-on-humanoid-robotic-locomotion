@@ -59,6 +59,17 @@ def get_planner_cfg(
             "states_cost_w_cost_map": False,
             # mini batch size for FDM
             "batch_size": 15000,
+            # optional online CVAE dataset dumping
+            "cvae_dataset_dump_path": None,
+            "cvae_dataset_topk": 4,
+            "cvae_dataset_max_samples": 200000,
+            "cvae_require_context": True,
+            "cvae_collect_all_iterations": True,
+            "cvae_collect_iteration_stride": 1,
+            "cvae_bucket_ratio_high": 0.4,
+            "cvae_bucket_ratio_mid": 0.3,
+            "cvae_bucket_ratio_low": 0.3,
+            "cvae_labeled_ratio_min": 0.60,
         },
         "optim": {
             "_target_": "fdm.planner.BatchedMPPIOptimizer",
@@ -67,6 +78,10 @@ def get_planner_cfg(
             "gamma": 1.0,
             "sigma": 0.87,
             "beta": 0.6,
+            "sampling_strategy": "gaussian",  # set to "cvae" to sample with a trained CVAE
+            "cvae_checkpoint": None,
+            "cvae_latent_dim": 16,
+            "cvae_temperature": 1.0,
             "lower_bound": ["${action_cfg.lower_bound}" for i in range(traj_dim)],
             "upper_bound": ["${action_cfg.upper_bound}" for i in range(traj_dim)],
             "device": device,

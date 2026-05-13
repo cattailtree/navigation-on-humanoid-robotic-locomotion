@@ -64,6 +64,14 @@ class MPPICfg:
     So basically beta of 0 means the action is repeated for all timesteps within the same trajectory.A setting of 1
     means it is fully uncorrelated.
     """
+    sampling_strategy: str = "gaussian"
+    """Noise source for trajectory sampling. One of: ``gaussian`` or ``cvae``."""
+    cvae_checkpoint: str | None = None
+    """Optional CVAE checkpoint path used when ``sampling_strategy='cvae'``."""
+    cvae_latent_dim: int = 16
+    """Latent dimension for the CVAE sampler."""
+    cvae_temperature: float = 1.0
+    """Sampling temperature for latent variables in the CVAE sampler."""
 
 
 @dataclass
@@ -82,6 +90,23 @@ class TrajectoryOptimizerCfg:
     set_actions_below_threshold_to_0: bool = False
     vel_limit_lin: float = 0.1
     vel_limit_ang: float = 0.1
+    cvae_dataset_dump_path: str | None = None
+    """Optional output path to dump CVAE training tuples from online MPPI planning."""
+    cvae_dataset_topk: int = 4
+    """Top-k trajectories per environment used as supervised targets in dataset dumping."""
+    cvae_dataset_max_samples: int = 200000
+    """Maximum number of dumped CVAE samples kept on disk."""
+    cvae_require_context: bool = True
+    """If true, skip CVAE dataset dumping for batches without context."""
+    cvae_collect_all_iterations: bool = True
+    """Collect dataset samples for all optimizer iterations instead of only the final iteration."""
+    cvae_collect_iteration_stride: int = 1
+    """Collect one sample round every N optimizer iterations."""
+    cvae_bucket_ratio_high: float = 0.4
+    cvae_bucket_ratio_mid: float = 0.3
+    cvae_bucket_ratio_low: float = 0.3
+    cvae_labeled_ratio_min: float = 0.60
+    """Minimum share of labeled (executed) samples to keep in dumped payload."""
 
     # compute state costs from a cost map build from the height scan
     states_cost_w_cost_map: bool = False
