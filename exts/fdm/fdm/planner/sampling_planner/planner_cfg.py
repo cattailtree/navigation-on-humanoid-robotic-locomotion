@@ -63,6 +63,13 @@ def get_planner_cfg(
             "cvae_dataset_dump_path": None,
             "cvae_dataset_topk": 4,
             "cvae_dataset_max_samples": 200000,
+            "cvae_require_context": True,
+            "cvae_collect_all_iterations": True,
+            "cvae_collect_iteration_stride": 1,
+            "cvae_bucket_ratio_high": 0.4,
+            "cvae_bucket_ratio_mid": 0.3,
+            "cvae_bucket_ratio_low": 0.3,
+            "cvae_labeled_ratio_min": 0.60,
         },
         "optim": {
             "_target_": "fdm.planner.BatchedMPPIOptimizer",

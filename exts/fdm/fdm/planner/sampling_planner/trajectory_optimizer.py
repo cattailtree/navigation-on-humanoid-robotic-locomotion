@@ -96,6 +96,12 @@ class SimpleSE2TrajectoryOptimizer:
         self._cvae_mean_buffer: list[torch.Tensor] = []
         self._cvae_target_buffer: list[torch.Tensor] = []
         self._cvae_context_buffer: list[torch.Tensor] = []
+        self._cvae_goal_state_buffer: list[torch.Tensor] = []
+        self._cvae_outcome_success_buffer: list[torch.Tensor] = []
+        self._cvae_risk_max_buffer: list[torch.Tensor] = []
+        self._cvae_risk_sum_buffer: list[torch.Tensor] = []
+        self._cvae_success_mask_buffer: list[torch.Tensor] = []
+        self._cvae_sample_weight_buffer: list[torch.Tensor] = []
         self._last_cvae_context: torch.Tensor | None = None
 
     def _build_cvae_context(self, env_ids: torch.Tensor | list[int] | slice | None = None) -> torch.Tensor | None:
@@ -982,22 +988,47 @@ class SimpleSE2TrajectoryOptimizer:
             print(f"Iteration: {iteration}, Values: {min_v}")
         if self.to_cfg.cvae_dataset_dump_path is None:
             return
-        if iteration != self.optim.num_iterations - 1:
+        if self.to_cfg.cvae_collect_all_iterations:
+            stride = max(int(self.to_cfg.cvae_collect_iteration_stride), 1)
+            if iteration % stride != 0:
+                return
+        elif iteration != self.optim.num_iterations - 1:
+            return
+        if self.to_cfg.cvae_require_context and self._last_cvae_context is None:
             return
 
         # population: (N, BS, H, A), values: (N, BS)
         pop_size, bs = population.shape[0], population.shape[1]
         k = min(self.to_cfg.cvae_dataset_topk, pop_size)
-        _, topk_idx = torch.topk(values, k=k, dim=0, largest=True)
-        batch_idx = torch.arange(bs, device=population.device).unsqueeze(0).expand(k, -1)
-        topk_traj = population[topk_idx, batch_idx]  # (k, BS, H, A)
+        high_k = max(int(round(k * self.to_cfg.cvae_bucket_ratio_high)), 1)
+        mid_k = max(int(round(k * self.to_cfg.cvae_bucket_ratio_mid)), 1)
+        low_k = max(k - high_k - mid_k, 1)
+        if high_k + mid_k + low_k > pop_size:
+            low_k = max(pop_size - high_k - mid_k, 0)
+        sorted_idx = torch.argsort(values, dim=0, descending=True)
+        high_idx = sorted_idx[:high_k]
+        mid_start = max((pop_size - mid_k) // 2, high_k)
+        mid_idx = sorted_idx[mid_start : mid_start + mid_k]
+        low_idx = sorted_idx[-low_k:] if low_k > 0 else sorted_idx[:0]
+        mixed_idx = torch.cat([high_idx, mid_idx, low_idx], dim=0)
+        batch_idx = torch.arange(bs, device=population.device).unsqueeze(0).expand(mixed_idx.shape[0], -1)
+        mixed_traj = population[mixed_idx, batch_idx]  # (k_mix, BS, H, A)
 
         mean = self.optim.mean[self.env_ids].detach().clone()
-        mean_expand = mean.unsqueeze(0).expand(k, -1, -1, -1)
+        keep_k = mixed_traj.shape[0]
+        mean_expand = mean.unsqueeze(0).expand(keep_k, -1, -1, -1)
         self._cvae_mean_buffer.append(mean_expand.reshape(-1, mean.shape[1], mean.shape[2]).to("cpu"))
-        self._cvae_target_buffer.append(topk_traj.reshape(-1, topk_traj.shape[2], topk_traj.shape[3]).to("cpu"))
+        self._cvae_target_buffer.append(mixed_traj.reshape(-1, mixed_traj.shape[2], mixed_traj.shape[3]).to("cpu"))
+        flat_n = keep_k * bs
+        self._cvae_goal_state_buffer.append(torch.zeros(flat_n, dtype=torch.int64))
+        self._cvae_outcome_success_buffer.append(torch.zeros(flat_n, dtype=torch.bool))
+        self._cvae_success_mask_buffer.append(torch.zeros(flat_n, dtype=torch.bool))
+        self._cvae_sample_weight_buffer.append(torch.ones(flat_n, dtype=torch.float32))
+        risk_proxy = (-values[mixed_idx, batch_idx]).reshape(-1).detach().to("cpu")
+        self._cvae_risk_max_buffer.append(risk_proxy)
+        self._cvae_risk_sum_buffer.append(risk_proxy.clone())
         if self._last_cvae_context is not None:
-            context_expand = self._last_cvae_context.unsqueeze(0).expand(k, -1, -1)
+            context_expand = self._last_cvae_context.unsqueeze(0).expand(keep_k, -1, -1)
             self._cvae_context_buffer.append(context_expand.reshape(-1, context_expand.shape[-1]).to("cpu"))
 
         self._flush_cvae_dataset()
@@ -1009,6 +1040,14 @@ class SimpleSE2TrajectoryOptimizer:
         target_actions = torch.cat(self._cvae_target_buffer, dim=0) if len(self._cvae_target_buffer) > 0 else None
         if mean_actions is None or target_actions is None:
             return
+        goal_state = torch.cat(self._cvae_goal_state_buffer, dim=0) if len(self._cvae_goal_state_buffer) > 0 else None
+        outcome_success = (
+            torch.cat(self._cvae_outcome_success_buffer, dim=0) if len(self._cvae_outcome_success_buffer) > 0 else None
+        )
+        risk_max = torch.cat(self._cvae_risk_max_buffer, dim=0) if len(self._cvae_risk_max_buffer) > 0 else None
+        risk_sum = torch.cat(self._cvae_risk_sum_buffer, dim=0) if len(self._cvae_risk_sum_buffer) > 0 else None
+        success_mask = torch.cat(self._cvae_success_mask_buffer, dim=0) if len(self._cvae_success_mask_buffer) > 0 else None
+        sample_weight = torch.cat(self._cvae_sample_weight_buffer, dim=0) if len(self._cvae_sample_weight_buffer) > 0 else None
 
         max_n = self.to_cfg.cvae_dataset_max_samples
         if mean_actions.shape[0] > max_n:
@@ -1019,10 +1058,69 @@ class SimpleSE2TrajectoryOptimizer:
                 self._cvae_context_buffer = [context]
             self._cvae_mean_buffer = [mean_actions]
             self._cvae_target_buffer = [target_actions]
+            if goal_state is not None:
+                goal_state = goal_state[-max_n:]
+                self._cvae_goal_state_buffer = [goal_state]
+            if outcome_success is not None:
+                outcome_success = outcome_success[-max_n:]
+                self._cvae_outcome_success_buffer = [outcome_success]
+            if risk_max is not None:
+                risk_max = risk_max[-max_n:]
+                self._cvae_risk_max_buffer = [risk_max]
+            if risk_sum is not None:
+                risk_sum = risk_sum[-max_n:]
+                self._cvae_risk_sum_buffer = [risk_sum]
+            if success_mask is not None:
+                success_mask = success_mask[-max_n:]
+                self._cvae_success_mask_buffer = [success_mask]
+            if sample_weight is not None:
+                sample_weight = sample_weight[-max_n:]
+                self._cvae_sample_weight_buffer = [sample_weight]
+
+        if success_mask is not None:
+            labeled_ratio = success_mask.float().mean().item()
+            if labeled_ratio < self.to_cfg.cvae_labeled_ratio_min:
+                labeled_idx = torch.where(success_mask)[0]
+                unlabeled_idx = torch.where(~success_mask)[0]
+                if labeled_idx.numel() > 0:
+                    max_unlabeled = int(labeled_idx.numel() * (1 - self.to_cfg.cvae_labeled_ratio_min) / self.to_cfg.cvae_labeled_ratio_min)
+                    keep_unlabeled = unlabeled_idx[-max_unlabeled:] if max_unlabeled > 0 else unlabeled_idx[:0]
+                    keep_idx = torch.cat([labeled_idx, keep_unlabeled], dim=0)
+                    mean_actions = mean_actions[keep_idx]
+                    target_actions = target_actions[keep_idx]
+                    goal_state = goal_state[keep_idx] if goal_state is not None else None
+                    outcome_success = outcome_success[keep_idx] if outcome_success is not None else None
+                    risk_max = risk_max[keep_idx] if risk_max is not None else None
+                    risk_sum = risk_sum[keep_idx] if risk_sum is not None else None
+                    success_mask = success_mask[keep_idx]
+                    sample_weight = sample_weight[keep_idx] if sample_weight is not None else None
+                    if len(self._cvae_context_buffer) > 0:
+                        context = torch.cat(self._cvae_context_buffer, dim=0)[keep_idx]
+                        self._cvae_context_buffer = [context]
+                    self._cvae_mean_buffer = [mean_actions]
+                    self._cvae_target_buffer = [target_actions]
+                    self._cvae_goal_state_buffer = [goal_state] if goal_state is not None else []
+                    self._cvae_outcome_success_buffer = [outcome_success] if outcome_success is not None else []
+                    self._cvae_risk_max_buffer = [risk_max] if risk_max is not None else []
+                    self._cvae_risk_sum_buffer = [risk_sum] if risk_sum is not None else []
+                    self._cvae_success_mask_buffer = [success_mask]
+                    self._cvae_sample_weight_buffer = [sample_weight] if sample_weight is not None else []
 
         payload = {"mean_actions": mean_actions, "target_actions": target_actions}
         if len(self._cvae_context_buffer) > 0:
             payload["context"] = torch.cat(self._cvae_context_buffer, dim=0)
+        if goal_state is not None:
+            payload["goal_state_3way"] = goal_state
+        if outcome_success is not None:
+            payload["outcome_success"] = outcome_success
+        if risk_max is not None:
+            payload["outcome_risk_max"] = risk_max
+        if risk_sum is not None:
+            payload["outcome_risk_sum"] = risk_sum
+        if success_mask is not None:
+            payload["success_supervision_mask"] = success_mask
+        if sample_weight is not None:
+            payload["sample_weight"] = sample_weight
 
         dump_dir = os.path.dirname(self.to_cfg.cvae_dataset_dump_path)
         if len(dump_dir) > 0:
