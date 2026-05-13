@@ -109,7 +109,8 @@ def main() -> None:
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, drop_last=False)
     val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, drop_last=False)
 
-    sample_cond, _ = dataset[0]
+    sample = dataset[0]
+    sample_cond = sample[0]
     horizon, action_dim = sample_cond.shape
     device = torch.device(args.device)
 

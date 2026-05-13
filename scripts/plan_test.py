@@ -77,6 +77,23 @@ parser.add_argument(
     default=200000,
     help="Maximum number of samples kept in dumped CVAE dataset.",
 )
+parser.add_argument(
+    "--cvae_collect_all_iterations",
+    action="store_true",
+    help="Collect CVAE tuples at all optimizer iterations (subject to stride).",
+)
+parser.add_argument(
+    "--cvae_collect_iteration_stride",
+    type=int,
+    default=1,
+    help="Collect one dataset sample round every N optimizer iterations.",
+)
+parser.add_argument(
+    "--cvae_labeled_ratio_min",
+    type=float,
+    default=0.60,
+    help="Minimum labeled share kept in dumped CVAE dataset.",
+)
 
 # append common FDM cli arguments
 cli_args.add_fdm_args(parser, default_num_envs=24)
@@ -234,9 +251,14 @@ def main():
         sampling_planner_cfg_dict["to_cfg"]["cvae_dataset_dump_path"] = args_cli.cvae_dump_path
         sampling_planner_cfg_dict["to_cfg"]["cvae_dataset_topk"] = args_cli.cvae_topk
         sampling_planner_cfg_dict["to_cfg"]["cvae_dataset_max_samples"] = args_cli.cvae_max_samples
+        sampling_planner_cfg_dict["to_cfg"]["cvae_collect_all_iterations"] = args_cli.cvae_collect_all_iterations
+        sampling_planner_cfg_dict["to_cfg"]["cvae_collect_iteration_stride"] = args_cli.cvae_collect_iteration_stride
+        sampling_planner_cfg_dict["to_cfg"]["cvae_labeled_ratio_min"] = args_cli.cvae_labeled_ratio_min
         print(
             "[CVAE] enabled data collection: "
-            f"path={args_cli.cvae_dump_path}, topk={args_cli.cvae_topk}, max_samples={args_cli.cvae_max_samples}"
+            f"path={args_cli.cvae_dump_path}, topk={args_cli.cvae_topk}, max_samples={args_cli.cvae_max_samples}, "
+            f"all_iters={args_cli.cvae_collect_all_iterations}, stride={args_cli.cvae_collect_iteration_stride}, "
+            f"labeled_ratio_min={args_cli.cvae_labeled_ratio_min}"
         )
 
     if args_cli.env == "heuristic":
