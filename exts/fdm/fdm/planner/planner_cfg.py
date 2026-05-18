@@ -23,14 +23,22 @@ import fdm.mdp as mdp
 import fdm.model as fdm_model_cfg
 from fdm.env_cfg.ui.planner_ui_window import PlannerEnvWindow
 
-# ==
+# =============================================================================
+# G1-specific body names
+# =============================================================================
+
+G1_BASE_BODY = "pelvis"
+G1_FOOT_BODIES = ["left_ankle_roll_link", "right_ankle_roll_link"]
+
+
+# =============================================================================
 # BASE
-# ==
+# =============================================================================
 
 
 @configclass
 class PlannerObsCfg(ObsGroup):
-    """Observations for the sampling based planner"""
+    """Observations for the sampling based planner."""
 
     goal = ObsTerm(func=mdp.goal_command_w_se2, params={"command_name": "command"})
     start = ObsTerm(func=mdp.se2_root_position)
@@ -42,13 +50,13 @@ class PlannerObsCfg(ObsGroup):
 @configclass
 class FDMPlannerCfg:
     model_cfg: fdm_model_cfg.FDMBaseModelCfg = MISSING
-    """Model config class"""
+    """Model config class."""
     env_cfg: fdm_env_cfg.FDMCfg = MISSING
-    """Environment config class"""
+    """Environment config class."""
 
     # configurations to load the previous runs
     experiment_name: str = "fdm_se2_prediction_depth"
-    """Name of the experiment. """
+    """Name of the experiment."""
 
     load_run: str = ".*"
     """The run directory to load. Default is ".*" (all).
@@ -78,25 +86,30 @@ class FDMPlannerCfg:
     movement_resample_count: int = 30
     """Number of consecutive steps to be considered stopped. Default is 30.
 
-    Will resample the population if the robot is stopped for this many steps."""
+    Will resample the population if the robot is stopped for this many steps.
+    """
 
     max_path_time: float = 20.0
-    """Maximum time to come to the goal in sec. Default is 15.0."""
+    """Maximum time to come to the goal in sec. Default is 20.0."""
 
     def __post_init__(self):
-        # set the correct length of the max torque buffer if the term exists
+        # ---------------------------------------------------------------------
+        # Hard-contact observation adaptation for G1
+        # ---------------------------------------------------------------------
         if not isinstance(self.env_cfg, type(MISSING)) and self.model_cfg.hard_contact_metric == "torque":
             self.env_cfg.observations.fdm_state.hard_contact = mdp.MaxJointTorqueCfg(history_length=10)
             self.env_cfg.observations.fdm_state.hard_contact.history_length = math.ceil(
                 self.model_cfg.command_timestep
                 / (self.env_cfg.sim.dt * self.env_cfg.decimation * self.model_cfg.history_length)
             )
+
         if not isinstance(self.env_cfg, type(MISSING)) and self.model_cfg.hard_contact_metric == "contact":
             self.env_cfg.observations.fdm_state.hard_contact = mdp.MaxContactForceObsCfg(
                 history_length=10,
                 params={
                     "sensor_cfg": SceneEntityCfg(
-                        "contact_forces", body_names=["LF_FOOT", "LH_FOOT", "RF_FOOT", "RH_FOOT"]
+                        "contact_forces",
+                        body_names=G1_FOOT_BODIES,
                     )
                 },
             )
@@ -105,7 +118,9 @@ class FDMPlannerCfg:
                 / (self.env_cfg.sim.dt * self.env_cfg.decimation * self.model_cfg.history_length)
             )
 
-        # add planner command
+        # ---------------------------------------------------------------------
+        # Planner command
+        # ---------------------------------------------------------------------
         self.env_cfg.commands.command = mdp.GoalCommandCfg(
             resampling_time_range=(1000000.0, 1000000.0),  # only resample once at the beginning
             sampling_mode="bounded",
@@ -114,60 +129,79 @@ class FDMPlannerCfg:
                 terrain_analysis=fdm_env_cfg.TERRAIN_ANALYSIS_CFG,
             ),
         )
-        # disable saved paths loading if terrains are randomly generated
+
+        # Disable saved paths loading if terrains are randomly generated
         if self.env_cfg.scene.terrain.terrain_type == "generator":
             self.env_cfg.commands.command.traj_sampling.enable_saved_paths_loading = False
 
-        # add planner observation space
+        # ---------------------------------------------------------------------
+        # Planner observation space
+        # ---------------------------------------------------------------------
         self.env_cfg.observations.planner_obs = PlannerObsCfg()
 
-        # adjust root state reset based on goal commands spawn positions
+        # ---------------------------------------------------------------------
+        # Reset logic
+        # ---------------------------------------------------------------------
         self.env_cfg.events.reset_base = EventTerm(
             func=mdp.reset_robot_position_planner,
             mode="reset",
             params={
                 "asset_cfg": SceneEntityCfg("robot"),
-                "yaw_range": (-3.14, 3.14),
+                "yaw_range": (-0.01, 0.01),
                 "velocity_range": {
-                    "x": (-0.5, 0.5),
-                    "y": (-0.5, 0.5),
+                    "x": (0.0, 0.0),
+                    "y": (0.0, 0.0),
                     "z": (0, 0),
                     "roll": (0, 0),
                     "pitch": (0, 0),
-                    "yaw": (-0.5, 0.5),
+                    "yaw": (-0.01, 0.01),
                 },
                 "goal_command_generator_name": "command",
             },
         )
         self.env_cfg.events.reset_robot_joints = None
 
-        # add termination when the goal is reached
+        # ---------------------------------------------------------------------
+        # Terminations
+        # ---------------------------------------------------------------------
         self.env_cfg.terminations.goal_reached = DoneTerm(
             func=mdp.at_goal,
-            params={"distance_threshold": 0.5, "speed_threshold": 1.0, "command_generator_term_name": "command"},
+            params={
+                "distance_threshold": 0.5,
+                "command_generator_term_name": "command",
+            },
             time_out=True,
         )
-        # change to non-delayed collision termination bc not interested anymore in recording
+
+        # G1 adaptation:
+        # legacy quadruped config used body_names="base", but G1 root body is "pelvis"
         self.env_cfg.terminations.base_contact = DoneTerm(
             func=mdp.illegal_contact,
-            params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names="base"), "threshold": 1.0},
+            params={
+                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=G1_BASE_BODY),
+                "threshold": 100.0,
+            },
         )
+
         self.env_cfg.scene.contact_forces.history_length = 3
-        # add a timeout termination
-        # NOTE: has timeout set to false to classify the run as unsuccessful
+
+        # Add timeout termination
+        # NOTE: has time_out set to false to classify the run as unsuccessful
         self.env_cfg.terminations.timeout = DoneTerm(func=mdp.time_out, time_out=False)
         self.env_cfg.episode_length_s = 20.0
 
-        # add ui window for planning
+        # ---------------------------------------------------------------------
+        # UI window
+        # ---------------------------------------------------------------------
         self.env_cfg.ui_window_class_type = PlannerEnvWindow
 
-        # make environment origins regular
+        # Make environment origins regular
         self.env_cfg.scene.terrain.regular_spawning = True
 
 
-# ==
+# =============================================================================
 # Baseline
-# ==
+# =============================================================================
 
 
 @configclass
@@ -179,27 +213,25 @@ class PlannerBaselineCfg(FDMPlannerCfg):
 
     def __post_init__(self):
         super().__post_init__()
-
-        # adjust the experiment name
         self.experiment_name = "fdm_baseline"
 
 
-# ==
+# =============================================================================
 # DEPTH CAMERA BASED PLANNER
-# ==
+# =============================================================================
 
 
 @configclass
 class PlannerDepthCfg(FDMPlannerCfg):
-    """Configuration for the Planner with height scanner data."""
+    """Configuration for the Planner with depth / exteroceptive observations."""
 
     env_cfg: fdm_env_cfg.FDMDepthCfg = fdm_env_cfg.FDMDepthCfg()
     model_cfg: fdm_model_cfg.FDMDepthModelCfg = fdm_model_cfg.FDMDepthModelCfg()
 
 
-# ==
+# =============================================================================
 # Ours: HEIGHT SCAN BASED PLANNER
-# ==
+# =============================================================================
 
 
 @configclass
@@ -212,10 +244,11 @@ class PlannerHeightCfg(FDMPlannerCfg):
 
 @configclass
 class PlannerHeightSingleStepCfg(PlannerHeightCfg):
-    """Configuration for the Planner with height scan observations using the percpetive locomotion policy.
+    """Configuration for the Planner with height scan observations using the perceptive locomotion policy.
 
-    Select the model that predicts one step and feedbacks the collision, energy and correction velocity back to the
-    input of the recurrent layer."""
+    Select the model that predicts one step and feeds collision, energy and correction velocity
+    back to the recurrent layer input.
+    """
 
     model_cfg: fdm_model_cfg.FDMHeightModelSingleStepCfg = fdm_model_cfg.FDMHeightModelSingleStepCfg()
 
@@ -225,10 +258,7 @@ class PlannerHeightSingleStepCfg(PlannerHeightCfg):
 
 @configclass
 class PlannerHeightSingleStepHeightAdjustCfg(PlannerHeightCfg):
-    """Configuration for the Planner with height scan observations using the percpetive locomotion policy.
-
-    Select the model that predicts one step and feedbacks the collision, energy and correction velocity back to the
-    input of the recurrent layer."""
+    """Configuration for the Planner with height scan observations using the perceptive locomotion policy."""
 
     model_cfg: fdm_model_cfg.FDMModelVelocitySingleStepHeightAdjustCfg = (
         fdm_model_cfg.FDMModelVelocitySingleStepHeightAdjustCfg()
@@ -245,9 +275,9 @@ class PlannerHeightSingleStepHeightAdjustCfg(PlannerHeightCfg):
         self.env_cfg.observations.fdm_obs_exteroceptive.env_sensor.params["shape"] = (120, 92)
 
 
-# ==
+# =============================================================================
 # Comparisons Planner
-# ==
+# =============================================================================
 
 
 @configclass
@@ -256,4 +286,4 @@ class PlannerHeuristicCfg(FDMPlannerCfg):
 
     env_cfg: fdm_env_cfg.FDMHeuristicsHeightCfg = fdm_env_cfg.FDMHeuristicsHeightCfg()
     model_cfg: fdm_model_cfg.FDMHeightModelMultiStepCfg = fdm_model_cfg.FDMHeightModelMultiStepCfg()
-    # NOTE: technicall the model config is not necessary, however, the config is used at some parts in the code
+    # NOTE: technically the model config is not necessary, however, the config is used in some parts of the code

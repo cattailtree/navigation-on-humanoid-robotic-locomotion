@@ -233,3 +233,27 @@ class NavigationSE2Action(ActionTerm):
 
         # 🔥 新增：SE2 命令 buffer（例如 [vx, vy, yaw_rate]）
         self._se2_commands = torch.zeros(self.num_envs, self.cfg.action_dim, device=self.device)
+
+    def reset(self, env_ids: torch.Tensor | None = None):
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, device=self.device)
+
+        # 清导航命令
+        self._raw_navigation_velocity_actions[env_ids] = 0.0
+        self._processed_navigation_velocity_actions[env_ids] = 0.0
+        self._se2_commands[env_ids] = 0.0
+
+        # 清底层 action 记忆
+        self._low_level_actions[env_ids] = 0.0
+        self._prev_low_level_actions[env_ids] = 0.0
+
+        # 关键：让 reset 后第一个 physics step 必定重新推理低层 policy
+        self._counter = 0
+
+        # 清子 action terms
+        for term in self.low_level_action_terms:
+            if hasattr(term, "reset"):
+                term.reset(env_ids)
+
+        # 确保 env 上的 command 也是 0
+        setattr(self._env, "navigation_commands", self._se2_commands)

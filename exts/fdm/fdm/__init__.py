@@ -38,23 +38,21 @@ PLANNER_MODE_BASELINE = False
 """Whether to use the planner mode for the sampling-based planner."""
 
 if LARGE_UNIFIED_HEIGHT_SCAN:
-    VEL_RANGE_X = (-1.0, 1.0)  # m/s
-    VEL_RANGE_Y = (-0.7, 0.7)  # m/s
-    VEL_RANGE_YAW = (-1.0, 1.0)  # rad/s
-elif PLANNER_MODE:
-    # Restrict the movement space to make it easier for the sampling-based planner
     VEL_RANGE_X = (-0.1, 1.0)
     VEL_RANGE_Y = (-0.1, 0.1)
-    # VEL_RANGE_YAW = (-0.33, 0.33)
+    VEL_RANGE_YAW = (-0.66, 0.66)
+elif PLANNER_MODE:
+    VEL_RANGE_X = (-0.1, 1.0)
+    VEL_RANGE_Y = (-0.1, 0.1)
     VEL_RANGE_YAW = (-0.66, 0.66)
 elif PLANNER_MODE_BASELINE:
-    VEL_RANGE_X = (-0.1, 0.75)
-    VEL_RANGE_Y = (-0.2, 0.2)
-    VEL_RANGE_YAW = (-0.7, 0.7)
+    VEL_RANGE_X = (-0.1, 1.0)
+    VEL_RANGE_Y = (-0.1, 0.1)
+    VEL_RANGE_YAW = (-0.66, 0.66)
 else:
-    VEL_RANGE_X = (-0.1, 1.5)  # m/s  (prev. 0.2, 1.5)
-    VEL_RANGE_Y = (-0.4, 0.4)  # m/s  (prev. -0.1, 0.1)
-    VEL_RANGE_YAW = (-1.0, 1.0)  # rad/s
+    VEL_RANGE_X = (-0.1, 1.0)
+    VEL_RANGE_Y = (-0.1, 0.1)
+    VEL_RANGE_YAW = (-0.66, 0.66)
 
 
 ####

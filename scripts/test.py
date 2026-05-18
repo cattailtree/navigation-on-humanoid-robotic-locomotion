@@ -42,11 +42,11 @@ parser.add_argument(
 parser.add_argument("--equal-actions", action="store_true", default=False, help="Have the same actions for all envs.")
 parser.add_argument("--paper-figure", action="store_true", default=False, help="Run paper figure test.")
 parser.add_argument("--paper-platform-figure", action="store_true", default=False, help="Run paper platform figure test.")
-parser.add_argument("--terrain_analysis_points", type=int, default=2000, help="Number of points for terrain analysis.")
+parser.add_argument("--terrain_analysis_points", type=int, default=5000, help="Number of points for terrain analysis.")
 parser.add_argument("--record", action="store_true", default=False, help="Record the simulation.")
 
 # append common FDM cli arguments
-cli_args.add_fdm_args(parser, default_num_envs=360)
+cli_args.add_fdm_args(parser, default_num_envs=36)
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 
@@ -202,7 +202,7 @@ def _make_default_record_cameras(runner: FDMRunner):
 
     cam = Camera(
         prim_path="/World/record_camera",
-        resolution=(1920, 1080),
+        resolution=(320, 240),
     )
     # 一个通用视角：斜后上方看原点附近（足够先跑通）
     cam.set_world_pose(
@@ -384,11 +384,8 @@ def main():
 
     finally:
         if runner is not None:
-            runner.close()
+            print("Simulation will stop running.")
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    finally:
-        simulation_app.close()
+    main()

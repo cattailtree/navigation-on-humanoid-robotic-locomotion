@@ -21,7 +21,7 @@ from nav_suite.terrain_analysis import TerrainAnalysis
 
 from fdm import FDM_DATA_DIR
 from fdm.env_cfg import TERRAIN_ANALYSIS_CFG
-
+from scipy.ndimage import distance_transform_edt
 from .robot_shape import get_robot_shape
 from .trajectory_optimizer_cfg import ActionCfg, RobotCfg, TrajectoryOptimizerCfg
 from .trajectory_optimizer_mbrl import BatchedICEMOptimizer, BatchedMPPIOptimizer
@@ -37,7 +37,6 @@ from .utils import (
 
 if TYPE_CHECKING:
     from fdm.model import FDMModel
-
 
 class SimpleSE2TrajectoryOptimizer:
     def __init__(
@@ -59,7 +58,12 @@ class SimpleSE2TrajectoryOptimizer:
             device (torch.device): The device (CPU/GPU) on which to perform the computations.
         """
 
-        self.action_cfg = action_cfg
+        self.action_cfg  = ActionCfg(
+        action_dim=3,
+        traj_dim=10,   # 按你的 horizon 改
+        lower_bound=[-0.1, -0.1, -1.0],
+        upper_bound=[1.5,  0.1,  1.0],
+        )
         self.to_cfg = to_cfg
         self.device = device
         self.frame_id = "odom"
@@ -93,6 +97,49 @@ class SimpleSE2TrajectoryOptimizer:
             self.func = self.b_obj_func
 
         self.debug_info = {}
+        self._cvae_mean_buffer: list[torch.Tensor] = []
+        self._cvae_target_buffer: list[torch.Tensor] = []
+        self._cvae_context_buffer: list[torch.Tensor] = []
+        self._cvae_goal_state_buffer: list[torch.Tensor] = []
+        self._cvae_outcome_success_buffer: list[torch.Tensor] = []
+        self._cvae_risk_max_buffer: list[torch.Tensor] = []
+        self._cvae_risk_sum_buffer: list[torch.Tensor] = []
+        self._cvae_success_mask_buffer: list[torch.Tensor] = []
+        self._cvae_sample_weight_buffer: list[torch.Tensor] = []
+        self._last_cvae_context: torch.Tensor | None = None
+        self._cvae_samples_since_flush = 0
+        # latest rollout in local/base frame for running terrain-aware costs
+        self.latest_local_states: torch.Tensor | None = None
+
+    def _build_cvae_context(self, env_ids: torch.Tensor | list[int] | slice | None = None) -> torch.Tensor | None:
+        """Build flattened conditioning context for the CVAE sampler from planner observations."""
+        if "cvae_context" in self.obs and torch.is_tensor(self.obs["cvae_context"]):
+            context = self.obs["cvae_context"]
+        else:
+            context_keys = [
+                "goal",
+                "proprio",
+                "proprioception",
+                "proprio_obs",
+                "history",
+                "state",
+                "states",
+            ]
+            context_parts = []
+            for key in context_keys:
+                if key not in self.obs or not torch.is_tensor(self.obs[key]):
+                    continue
+                tensor = self.obs[key]
+                if tensor.dtype not in (torch.float16, torch.float32, torch.float64):
+                    tensor = tensor.float()
+                context_parts.append(tensor.reshape(tensor.shape[0], -1))
+            if len(context_parts) == 0:
+                return None
+            context = torch.cat(context_parts, dim=-1)
+
+        if env_ids is not None and env_ids != slice(None):
+            context = context[env_ids]
+        return context.to(self.device)
 
     def set_fdm_classes(self, fdm_model: FDMModel, env: ManagerBasedRLEnv):
         self.fdm_model = fdm_model
@@ -134,47 +181,6 @@ class SimpleSE2TrajectoryOptimizer:
             self.env_ids = env_ids
             assert BS != 0, "No environments to plan for. This case should be handled by the planner."
 
-        # resample goal position if its out the height scan range (out of distribution for the training set)
-        # -- check if outside the height scan range
-        # start_state = self.get_start_state(1, 1)[:, 0].clone()
-        # se2_odom_base = get_se2(start_state)  # Transformation from base to odom frame
-        # se2_odom_goal = get_se2(self.obs["goal"])  # Transformation from goal to odom frame
-        # se2_base_goal = torch.inverse(se2_odom_base) @ se2_odom_goal  # Transformation from base to goal frame
-        # xyyaw_base_goal = get_x_y_yaw(se2_base_goal)
-        # goal_outside_range = torch.logical_or(
-        #     torch.abs(xyyaw_base_goal[..., 0]) > (self.height_scan_size[0]/ 2 + self.height_scan_offset[0]),
-        #     torch.abs(xyyaw_base_goal[..., 1]) > (self.height_scan_size[1] / 2 + self.height_scan_offset[1]),
-        # )
-        # if torch.any(goal_outside_range):
-        #     # -- each side of the height scan is descrited into n points, compute the minimal distance between goal and
-        #     #    the height scan points, then select the n clostest points as goal points
-        #     n_sample_points = 5
-        #     x_sample_points = torch.linspace(-self.height_scan_size[0]/ 2 + self.height_scan_offset[0], self.height_scan_size[0]/ 2 + self.height_scan_offset[0], n_sample_points, device=self.device)
-        #     y_sample_points = torch.linspace(-self.height_scan_size[1]/ 2 + self.height_scan_offset[1], self.height_scan_size[1]/ 2 + self.height_scan_offset[1], n_sample_points, device=self.device)
-        #     # NOTE: corner points are duplicated, so we remove them
-        #     height_scan_points = torch.concatenate((
-        #         torch.stack((x_sample_points, torch.ones(n_sample_points, device=self.device) * -self.height_scan_size[1]/ 2 + self.height_scan_offset[1]), dim=1),
-        #         torch.stack((x_sample_points, torch.ones(n_sample_points, device=self.device) * self.height_scan_size[1]/ 2 + self.height_scan_offset[1]), dim=1),
-        #         torch.stack((torch.ones(n_sample_points, device=self.device) * -self.height_scan_size[0]/ 2 + self.height_scan_offset[0], y_sample_points), dim=1)[1 : -1],
-        #         torch.stack((torch.ones(n_sample_points, device=self.device) * self.height_scan_size[0]/ 2 + self.height_scan_offset[0], y_sample_points), dim=1)[1 : -1],
-        #     ), dim=0)
-        #     distance = xyyaw_base_goal[goal_outside_range][:, None, :2] - height_scan_points[None, :, :]
-        #     distance = torch.norm(distance, dim=-1)
-        #     closest_points_idx = torch.argsort(distance, dim=1)[:, :n_sample_points]
-        #     closest_points = height_scan_points[closest_points_idx.flatten()]
-        #     # -- transform the clostest points in the odom frame
-        #     se2_clostest_points_base = get_se2(torch.concatenate((closest_points, torch.zeros_like(closest_points[..., 0])[..., None]), dim=-1))
-        #     se2_clostest_points_odom = se2_odom_base[goal_outside_range, None, :, :].repeat(1, n_sample_points, 1, 1).reshape(-1, 3, 3) @ se2_clostest_points_base
-        #     closest_points_odom = get_x_y_yaw(se2_clostest_points_odom)
-        #     closest_points_odom[..., 2] *= 0.0
-        #     # -- exchange the goal position, if the goal is outside the height scan range and repeat the env_ids and start_points
-        #     self.obs["start"] = torch.cat((self.obs["start"][~goal_outside_range], self.obs["start"][goal_outside_range][:, None, :].repeat(1, n_sample_points, 1).view(-1, 3)), dim=0)
-        #     self.obs["goal"] = torch.cat((self.obs["goal"][~goal_outside_range], closest_points_odom), dim=0)
-        #     env_ids = torch.tensor(self.env_ids, dtype=torch.long, device=self.device)
-        #     env_ids = torch.cat((env_ids[~goal_outside_range], env_ids[goal_outside_range][:, None].repeat(1, n_sample_points).view(-1)), dim=0)
-        #     self.env_ids = env_ids.tolist()
-        #     self.mapping_goal_to_env_ids = # TODO !!!!
-
         # MPPI
         population = None
         resample_env_ids = None
@@ -184,11 +190,7 @@ class SimpleSE2TrajectoryOptimizer:
             # get resample environments
             resample_env_ids = torch.where(self.obs["resample_population"])[0].tolist()
             self.optim.reset(resample_env_ids)
-            # # MPPI
-            # self.previous_solution[resample_env_ids] *= 0.0
-            # population = self.previous_solution
-        # else:
-        #     population = self.previous_solution
+        self._last_cvae_context = self._build_cvae_context(self.env_ids)
 
         best_population, self.var = self.optim.optimize(
             obj_fun=self.func,
@@ -197,15 +199,11 @@ class SimpleSE2TrajectoryOptimizer:
             x0_env_ids=resample_env_ids,
             var0=None,
             callback=self.logging_callback,
+            cvae_context=self._last_cvae_context,
         )
-        # self.var is shape := (BS, TRAJ_LENGTH, CONTROL_DIM)
-        # best_population is shape := (BS, TRAJ_LENGTH, CONTROL_DIM)
-
-        # self.previous_solution = best_population
 
         if return_states:
             states = self.func(best_population[None], only_rollout=True)
-            # states is shape := (BS, NR_TRAJ, TRAJ_LENGTH, CONTROL_DIM)
         else:
             states = None
 
@@ -234,7 +232,6 @@ class SimpleSE2TrajectoryOptimizer:
         if env_ids is not None:
             self.env_ids = env_ids
 
-        # start_state = self.get_start_state(BS, NR_TRAJ, env_ids=env_ids).clone()
         start_state = self.get_start_state(BS, NR_TRAJ).clone()
 
         if control_mode is None:
@@ -270,26 +267,25 @@ class SimpleSE2TrajectoryOptimizer:
 
             so2 = torch.stack([r_vec1, r_vec2], dim=4)
 
-            # Move the rotation in time and fill first timestep with identity - see math chapter
+            # Move the rotation in time and fill first timestep with identity
             so2 = torch.roll(so2, shifts=1, dims=2)
             so2[:, :, 0, :, :] = torch.eye(2, device=so2.device)[None, None].repeat(BS, NR_TRAJ, 1, 1)
-
-            # TODO this may be not needed given that max velocity in the x,y should stay enforced
-            # actions[:,:,:,:2] /= torch.norm(actions[:,:,:,:2],p=2, dim=3)[None] * 1.2
 
             actions_local_frame = so2.contiguous().reshape(-1, 2, 2) @ actions[:, :, :, :2].contiguous().reshape(
                 -1, 2, 1
             )
             actions_local_frame = actions_local_frame.contiguous().reshape(BS, NR_TRAJ, TRAJ_LENGTH, 2)
-            cumulative_position = (actions_local_frame).cumsum(dim=2)
+            cumulative_position = actions_local_frame.cumsum(dim=2)
             local_states = torch.cat([cumulative_position, cummulative_yaw[:, :, :, None]], dim=3)
 
             # Transform the states from the current base frame to the odom frame
             se2_odom_base = get_se2(start_state[:, :, None, :].repeat(1, 1, TRAJ_LENGTH, 1))
-            se2_base_points = get_se2(local_states)  # this here should be from base to points -> se2_points_base
-
+            se2_base_points = get_se2(local_states)
             se2_odom_points = se2_odom_base @ se2_base_points
             states = get_x_y_yaw(se2_odom_points)
+
+            # save local rollout for terrain-aware running cost
+            self.latest_local_states = local_states.clone()
 
         elif control_mode == "fdm" or control_mode == "fdm_baseline":
 
@@ -298,6 +294,25 @@ class SimpleSE2TrajectoryOptimizer:
 
             # Each population / action is given in the base frame of the robot
             population = population.permute(1, 0, 2, 3).contiguous()  # BS, NR_TRAJ, TRAJ_LENGTH, CONTROL_DIM
+            if getattr(self.to_cfg, "debug", False):
+                pop_dbg = population.detach()
+
+                # 看 env0 的所有轨迹在第1个控制步的动作分布
+                u0 = pop_dbg[0, :, 0, :]  # (NR_TRAJ, act_dim)
+
+            #    print("\n[SAMPLE-DBG] =====================================", flush=True)
+            #    print(f"[SAMPLE-DBG] population shape={tuple(pop_dbg.shape)}", flush=True)
+            #    print(f"[SAMPLE-DBG] first-step action mean={u0.mean(dim=0).cpu().tolist()}", flush=True)
+            #    print(f"[SAMPLE-DBG] first-step action std ={u0.std(dim=0).cpu().tolist()}", flush=True)
+            #    print(f"[SAMPLE-DBG] first-step action min ={u0.min(dim=0).values.cpu().tolist()}", flush=True)
+            #    print(f"[SAMPLE-DBG] first-step action max ={u0.max(dim=0).values.cpu().tolist()}", flush=True)
+
+                q = torch.quantile(
+                    u0,
+                    torch.tensor([0.01, 0.1, 0.5, 0.9, 0.99], device=u0.device),
+                    dim=0,
+                )
+            #    print(f"[SAMPLE-DBG] first-step action quantiles(1,10,50,90,99%)=\n{q.cpu()}", flush=True)
 
             # get initial states
             if self.env_ids == slice(None):
@@ -338,14 +353,9 @@ class SimpleSE2TrajectoryOptimizer:
                 ).to(self.device)
 
                 if control_mode == "fdm":
-                    # Scale the extra observations
-                    state_history[..., 5] = (state_history[..., 5] - self.fdm_model.hard_contact_obs_limits[0]) / (
-                        self.fdm_model.hard_contact_obs_limits[1] - self.fdm_model.hard_contact_obs_limits[0]
-                    )
+                    pass
 
                 # make predictions
-                # the population is BS, NR_TRAJ which is transformed to BS x NR_TRAJ
-                # all other terms are repeated by the number of trajectories
                 model_in = (
                     state_history.unsqueeze(1)
                     .repeat(1, NR_TRAJ, 1, 1)
@@ -379,14 +389,44 @@ class SimpleSE2TrajectoryOptimizer:
                         else torch.zeros(1)
                     ),
                 )
+                if mini_batch_idx == 0:
+                    sh, prop, ext, act, add_ext = model_in
                 # make prediction
                 with torch.no_grad():
                     if control_mode == "fdm":
-                        curr_states, curr_collision_prob_traj, curr_energy_traj = self.fdm_model.forward(model_in)
+                        model_out = self.fdm_model.forward(model_in)
+                        curr_states = model_out[0]
+                        curr_dynamic_collision_prob_traj = model_out[1]
+                        curr_energy_traj = model_out[2]
+                        if len(model_out) > 3:
+                            curr_geometric_collision_prob_traj = model_out[3]
+                            curr_collision_prob_traj = torch.maximum(
+                                curr_dynamic_collision_prob_traj,
+                                curr_geometric_collision_prob_traj,
+                            )
+                        else:
+                            curr_collision_prob_traj = curr_dynamic_collision_prob_traj
                     else:
-                        curr_states, curr_collision_prob_traj = self.fdm_model.forward(model_in)
+                        model_out = self.fdm_model.forward(model_in)
+                        curr_states = model_out[0]
+                        curr_collision_prob_traj = model_out[1]
                         if self.fdm_model.cfg.unified_failure_prediction:
                             curr_collision_prob_traj = torch.max(curr_collision_prob_traj, dim=-1)[0]
+                if getattr(self.to_cfg, "debug", False) and mini_batch_idx == 0:
+                    x = curr_collision_prob_traj.detach()
+
+                #    print("\n[RISK-DBG] =====================================", flush=True)
+                #    print(f"[RISK-DBG] control_mode={control_mode}", flush=True)
+                #    print(f"[RISK-DBG] unified_failure_prediction={self.fdm_model.cfg.unified_failure_prediction}",
+                 #         flush=True)
+                 #   print(f"[RISK-DBG] curr_collision_prob_traj.shape={tuple(x.shape)}", flush=True)
+                 #   print(
+                 #       f"[RISK-DBG] min={x.min().item():.6f} max={x.max().item():.6f} mean={x.mean().item():.6f}",
+                 #       flush=True,
+                 #   )
+
+                    flat = x.reshape(-1)
+                    q = torch.quantile(flat, torch.tensor([0.5, 0.9, 0.99], device=flat.device))
 
                 # reshape states back to BS, NR_TRAJ
                 local_states[curr_idx_range[0] : curr_idx_range[1]] = curr_states.view(
@@ -407,11 +447,15 @@ class SimpleSE2TrajectoryOptimizer:
             else:
                 # append a zero yaw angle to the states
                 local_states = torch.cat([local_states, torch.zeros_like(local_states[..., 0])[..., None]], dim=-1)
+
             # transform states into odom frame
             se2_odom_base = get_se2(start_state[:, :, None, :].repeat(1, 1, TRAJ_LENGTH, 1))
-            se2_base_points = get_se2(local_states)  # this here should be from base to points -> se2_points_base
+            se2_base_points = get_se2(local_states)
             se2_odom_points = se2_odom_base @ se2_base_points
             states = get_x_y_yaw(se2_odom_points)
+
+            # save local rollout for terrain-aware running cost
+            self.latest_local_states = local_states.clone()
 
             # Integrate the velocity actions to positions for loss calculation
             actions = population * self.to_cfg.dt
@@ -421,10 +465,6 @@ class SimpleSE2TrajectoryOptimizer:
                 "Not correctly implemented in the cost function handling the yaw actions forward, sidward motion"
                 " correctly."
             )
-            # Each population / action is given in the base frame of the robot
-            population = population.permute(1, 0, 2, 3).contiguous()  # BS, NR_TRAJ, TRAJ_LENGTH, CONTROL_DIM
-            actions = population * self.to_cfg.dt
-            states = start_state[:, :, None, :] + actions.cumsum(dim=2)
 
         else:
             raise ValueError(f"Control mode {control_mode} not supported")
@@ -463,8 +503,30 @@ class SimpleSE2TrajectoryOptimizer:
         self.states = states
         self.total_cost = total_cost
         self.population = population.permute(1, 0, 2, 3)
+        if self.to_cfg.control == "fdm" or self.to_cfg.control == "fdm_baseline":
+            if self.fdm_model.cfg.unified_failure_prediction:
+                peak_risk = collision_prob_traj
+            else:
+                peak_risk = collision_prob_traj.max(dim=-1).values  # (BS, NR_TRAJ)
 
-        # Return objective that needs to be maximized
+            # env0 先看
+            b = 0
+            best_idx = torch.argmin(total_cost[b])
+
+            q = torch.quantile(
+                peak_risk[b],
+                torch.tensor([0.5, 0.9, 0.99], device=peak_risk.device)
+            )
+
+            #print(
+            #    f"[BEST-RISK-DBG] env={b} "
+            #    f"best_idx={best_idx.item()} "
+            #    f"best_peak_risk={peak_risk[b, best_idx].item():.6f} "
+            #    f"best_total_cost={total_cost[b, best_idx].item():.6f} "
+            #    f"best_terminal={terminal_cost[b, best_idx].item():.6f}",
+            #    flush=True,
+            #)
+
         return -total_cost.T  # N_traj, BS
 
     def b_obj_func(
@@ -473,7 +535,6 @@ class SimpleSE2TrajectoryOptimizer:
         """
         Objective function called by optimizer.
         """
-        # We dynamicially allocate all these things given that the population can grow or shrink
         NR_TRAJ = population.shape[0]
         BS = population.shape[1]
         TRAJ_LENGTH = population.shape[2]
@@ -485,12 +546,10 @@ class SimpleSE2TrajectoryOptimizer:
             running_cost = torch.zeros((BS, NR_TRAJ), device=self.device)
 
         if self.to_cfg or only_rollout:
-            # state sequence
             states = torch.zeros((BS, NR_TRAJ, TRAJ_LENGTH, STATE_DIM), device=self.device)
 
         action = population.permute(1, 0, 2, 3).contiguous()  # BS, NR_TRAJ, TRAJ_LENGTH, CONTROL_DIM
 
-        # with Timer(f"full rollout time {self.debug}, {only_rollout}"):
         for i in range(TRAJ_LENGTH):
             if not only_rollout:
                 running_cost += self.states_cost(state[:, :, None], action[:, :, i, :][:, :, None])[:, :, 0]
@@ -523,61 +582,116 @@ class SimpleSE2TrajectoryOptimizer:
         Returns:
             (torch.Tensor, dtype=torch.float32, shape=(BS, NR_TRAJ, TRAJ_LENGTH)): Sequence of costs per state
         """
-        # Compute action cost
+        # ------------------------------------------------------------------
+        # basic control effort
+        # ------------------------------------------------------------------
         control_effort_trans_forward = torch.abs(actions[:, :, :, 0]) * self.to_cfg.state_cost_w_action_trans_forward
-        control_effort_trans_side = torch.abs(actions[:, :, :, 1]) * self.to_cfg.state_cost_w_action_trans_side
+
+        side_weight = getattr(
+            self.to_cfg,
+            "state_cost_w_action_trans_side_biped",
+            self.to_cfg.state_cost_w_action_trans_side,
+        )
+        control_effort_trans_side = torch.abs(actions[:, :, :, 1]) * side_weight
+
         control_effort_rot = torch.abs(actions[:, :, :, 2]) * self.to_cfg.state_cost_w_action_rot
 
-        # Compute early_goal_bonus:
+        # ------------------------------------------------------------------
+        # early goal reaching mask
+        # ------------------------------------------------------------------
         position_offset = torch.norm(states[:, :, :, :2] - self.obs["goal"][self.env_ids, None, None, :2], dim=3)
-        # heading 0 if same; heading 1 if opposite
         goal_yaw = self.obs["goal"][self.env_ids, None, None, 2].repeat(1, states.shape[1], states.shape[2])
         heading = cosine_distance(states[:, :, :, 2], goal_yaw) / 2
 
-        m = (position_offset < self.to_cfg.state_cost_early_goal_distance_offset) * (
+        reached_mask = (position_offset < self.to_cfg.state_cost_early_goal_distance_offset) * (
             heading < self.to_cfg.state_cost_early_goal_heading_offset
         )
 
-        # Velocity tracking
+        # ------------------------------------------------------------------
+        # velocity tracking
+        # ------------------------------------------------------------------
         velocity_tracking_cost = (
             torch.abs(torch.norm(actions[:, :, :, :2], p=2, dim=3) - self.to_cfg.state_cost_desired_velocity)
             * self.to_cfg.state_cost_velocity_tracking
         )
 
-        # No action cost if we reached the goal
-        control_effort_trans_forward[m] = 0
-        control_effort_trans_side[m] = 0
-        control_effort_rot[m] = 0
-        velocity_tracking_cost[m] = 0
+        # ------------------------------------------------------------------
+        # running heading-to-goal alignment
+        # ------------------------------------------------------------------
+        heading_running_cost = self.heading_running_cost(states)
 
-        # Early goal reaching reward
+        # ------------------------------------------------------------------
+        # smoothness / curvature suppression
+        # ------------------------------------------------------------------
+        smoothness_cost = self.smoothness_cost(actions)
+
+        # ------------------------------------------------------------------
+        # stair alignment cost (only active when local rollout + extero exists)
+        # ------------------------------------------------------------------
+        stair_alignment_cost = torch.zeros_like(control_effort_trans_forward)
+        if self.latest_local_states is not None and "extero_obs" in self.obs:
+            if (
+                self.latest_local_states.shape[0] == states.shape[0]
+                and self.latest_local_states.shape[1] == states.shape[1]
+                and self.latest_local_states.shape[2] == states.shape[2]
+            ):
+                stair_alignment_cost = self.stair_alignment_cost(self.latest_local_states, actions)
+
+        # ------------------------------------------------------------------
+        # optional yaw-rate change penalty (extra zig-zag suppression)
+        # ------------------------------------------------------------------
+        yaw_rate_change_cost = self.yaw_rate_change_cost(actions)
+        near_obstacle_cost = torch.zeros_like(control_effort_trans_forward)
+        if self.latest_local_states is not None and "extero_obs" in self.obs:
+            if (
+                    self.latest_local_states.shape[0] == states.shape[0]
+                    and self.latest_local_states.shape[1] == states.shape[1]
+                    and self.latest_local_states.shape[2] == states.shape[2]
+            ):
+                near_obstacle_cost = self.near_obstacle_cost(self.latest_local_states)
+
+        # ------------------------------------------------------------------
+        # zero action-related costs if goal already reached
+        # ------------------------------------------------------------------
+        control_effort_trans_forward[reached_mask] = 0
+        control_effort_trans_side[reached_mask] = 0
+        control_effort_rot[reached_mask] = 0
+        velocity_tracking_cost[reached_mask] = 0
+        heading_running_cost[reached_mask] = 0
+        smoothness_cost[reached_mask] = 0
+        stair_alignment_cost[reached_mask] = 0
+        yaw_rate_change_cost[reached_mask] = 0
+        near_obstacle_cost[reached_mask] = 0
+        # ------------------------------------------------------------------
+        # early goal reward
+        # ------------------------------------------------------------------
         early_goal_cost = -torch.ones_like(control_effort_trans_forward) * self.to_cfg.state_cost_w_early_goal_reaching
-        early_goal_cost[~m] = 0
+        early_goal_cost[~reached_mask] = 0
 
-        # Early stopping reward
-        # Minus Sign - maximize the percentage early stopping by minimizing the cost
+        # ------------------------------------------------------------------
+        # early stopping reward
+        # ------------------------------------------------------------------
         res = get_non_zero_action_length(actions)
         precentage_early_stopping = ((actions.shape[2] - (res + 1)) / actions.shape[2])[:, :, None].repeat(
             1, 1, actions.shape[2]
         )
         early_stopping_cost = -precentage_early_stopping * self.to_cfg.state_cost_w_early_stopping
 
-        if self.to_cfg.debug:
-            self.debug_info["states_control_effort_rot"] = control_effort_rot.clone()
-            self.debug_info["states_control_effort_trans_forward"] = control_effort_trans_forward.clone()
-            self.debug_info["states_control_effort_trans_side"] = control_effort_trans_side.clone()
-            self.debug_info["states_early_goal_cost"] = early_goal_cost.clone()
-            self.debug_info["states_early_stopping_cost"] = early_stopping_cost.clone()
-            self.debug_info["velocity_tracking_cost"] = velocity_tracking_cost.clone()
-
-        return (
+        total_cost = (
             control_effort_trans_forward
             + control_effort_trans_side
             + control_effort_rot
             + early_goal_cost
             + early_stopping_cost
             + velocity_tracking_cost
+            + heading_running_cost
+            + smoothness_cost
+            + yaw_rate_change_cost
+            + near_obstacle_cost
         )
+
+
+        return total_cost
 
     def terminal_cost(self, state: torch.Tensor) -> torch.Tensor:
         """
@@ -591,7 +705,6 @@ class SimpleSE2TrajectoryOptimizer:
         """
         # compute and save position offset for visualization
         if self.to_cfg.pos_error_3d and self.terrain_analysis is not None:
-            # get index on terrain analysis height map
             goal_pos_idx = (
                 (
                     self.obs["goal"][self.env_ids, :2]
@@ -626,7 +739,6 @@ class SimpleSE2TrajectoryOptimizer:
 
             z_height_goal = self.terrain_analysis.height_grid[goal_pos_idx[:, 0], goal_pos_idx[:, 1]]
             z_height_final = self.terrain_analysis.height_grid[final_path_pos_idx[:, 0], final_path_pos_idx[:, 1]]
-            # back to original shape
             z_height_final = z_height_final.view(state.shape[0], state.shape[1])
 
             self.position_offset = torch.norm(
@@ -638,35 +750,27 @@ class SimpleSE2TrajectoryOptimizer:
         else:
             self.position_offset = torch.norm(state[:, :, :2] - self.obs["goal"][self.env_ids, None, :2], dim=2)
 
-        # heading_cossine_distance is 0 if the same
-        # heading_cossine_distance is 2 if opposite vectors
-        heading_cossine_distance = smallest_angle(
+        # Original goal yaw error
+        goal_yaw_error = smallest_angle(
             state[:, :, 2], self.obs["goal"][self.env_ids, None, 2].repeat(1, state.shape[1])
         )
-        # heading_reward -1 cost reduction if the same
-        # heading_reward 0 cost reduction if opposite
-        # heading_reward = heading_cossine_distance  # (-heading_cossine_distance / 2)-1
-        # heading_reward[m] = 0
 
-        if self.to_cfg.debug:
-            self.debug_info["terminal_cost_position_offset"] = (
-                self.position_offset.clone() * self.to_cfg.terminal_cost_w_position_error
-            )
-            self.debug_info["terminal_cost_heading_reward"] = (
-                heading_cossine_distance.clone() * self.to_cfg.terminal_cost_w_rot_error
-            )
+        # Additional "face the goal approach direction" cost
+        goal_vec = self.obs["goal"][self.env_ids, None, :2] - state[:, :, :2]
+        goal_heading = torch.atan2(goal_vec[..., 1], goal_vec[..., 0])
+        heading_to_goal_error = torch.abs(self._wrap_to_pi(goal_heading - state[:, :, 2]))
 
-        res = (
-            self.position_offset * self.to_cfg.terminal_cost_w_position_error
-            + heading_cossine_distance * self.to_cfg.terminal_cost_w_rot_error
+        w_goal_heading = getattr(self.to_cfg, "terminal_cost_w_heading_to_goal", 0.0)
+
+        heading_term = (
+            goal_yaw_error * self.to_cfg.terminal_cost_w_rot_error
+            + heading_to_goal_error * w_goal_heading
         )
+        res = self.position_offset * self.to_cfg.terminal_cost_w_position_error + heading_term
 
         if self.to_cfg.terminal_cost_use_threshold:
             m = self.position_offset < self.to_cfg.terminal_cost_distance_offset
             res[m] /= self.to_cfg.terminal_cost_close_reward
-
-            if self.to_cfg.debug:
-                self.debug_info["terminal_cost_total"] = res.clone()
 
         self.pose_cost = res.clone()
 
@@ -677,56 +781,171 @@ class SimpleSE2TrajectoryOptimizer:
         Evaluates the collision cost for a given estimated trajectory.
 
         Args:
-            states: The estimated trajectory to evaluate shape (BS, NR_TRAJ, TRAJ_LENGTH, STATE_DIM).
-            collision_traj: The collision probability to evaluate shape (BS, NR_TRAJ, TRAJ_LENGTH).
+            states: The estimated trajectory to evaluate, shape (BS, NR_TRAJ, TRAJ_LENGTH, STATE_DIM).
+            collision_traj: The collision probability to evaluate, shape (BS, NR_TRAJ, TRAJ_LENGTH).
 
         Returns:
-            torch.Tensor: The calculated collision probability cost for the given trajectory, with shape (BS, NR_TRAJ).
+            torch.Tensor: Collision cost, shape (BS, NR_TRAJ).
         """
 
-        # penalize cost
-        if self.fdm_model.cfg.unified_failure_prediction:
-            cost = collision_traj * self.to_cfg.collision_cost_traj_factor
-            cost[
-                collision_traj > (self.fdm_model.cfg.collision_threshold - self.to_cfg.collision_cost_safety_factor)
-            ] += self.to_cfg.collision_cost_high_risk_factor
-        else:
-            coll_idx = torch.any(
-                collision_traj > (self.fdm_model.cfg.collision_threshold - self.to_cfg.collision_cost_safety_factor),
-                dim=-1,
-            )
-            cost = torch.sum(collision_traj * self.to_cfg.collision_cost_traj_factor, dim=-1)
-            cost[coll_idx] += self.to_cfg.collision_cost_high_risk_factor
+        threshold = self.fdm_model.cfg.collision_threshold - self.to_cfg.collision_cost_safety_factor
 
-        # get the distance between the trajectories
+        # ------------------------------------------------------------------
+        # 1. Base collision cost: make sure final shape is (BS, NR_TRAJ)
+        # ------------------------------------------------------------------
+        if self.fdm_model.cfg.unified_failure_prediction:
+            # If collision_traj is already (BS, NR_TRAJ), keep it.
+            # If it is (BS, NR_TRAJ, T), reduce over horizon.
+            if collision_traj.ndim == 3:
+                base_prob = collision_traj.mean(dim=-1)
+                high_risk = torch.any(collision_traj > threshold, dim=-1)
+            else:
+                base_prob = collision_traj
+                high_risk = collision_traj > threshold
+
+            cost = base_prob * self.to_cfg.collision_cost_traj_factor
+            cost = cost.clone()
+            cost[high_risk] += self.to_cfg.collision_cost_high_risk_factor
+
+        else:
+            high_risk = torch.any(collision_traj > threshold, dim=-1)
+            cost = torch.sum(collision_traj * self.to_cfg.collision_cost_traj_factor, dim=-1)
+            cost = cost.clone()
+            cost[high_risk] += self.to_cfg.collision_cost_high_risk_factor
+
+        # ------------------------------------------------------------------
+        # 2. Neighbor spread cost
+        # ------------------------------------------------------------------
         num_envs, num_trajectories, T, _ = states.shape
 
+        num_neighbors_cfg = int(getattr(self.to_cfg, "num_neighbors", 0))
+        neighbor_spread_weight = float(getattr(self.to_cfg, "collision_cost_neighbor_spread_weight", 1.0))
+
+        # If neighbor spreading is disabled, directly return base cost.
+        if num_neighbors_cfg <= 0 or num_trajectories <= 1 or neighbor_spread_weight == 0.0:
+            self.collision_traj_cost = cost.clone()
+            return cost
+
         cost_pre = cost.clone()
+
         for env_id in range(num_envs):
             flattened_trajectories = states[env_id, :, :, :2].reshape(num_trajectories, -1)
 
-            distance_matrix = cdist(
-                flattened_trajectories.cpu().numpy(), flattened_trajectories.cpu().numpy(), metric="euclidean"
-            )
-            # Find the indices of the closest neighbors for each trajectory (excluding the trajectory itself)
-            neighbors = np.argsort(distance_matrix, axis=1)[
-                :, 1 : self.to_cfg.num_neighbors + 1
-            ]  # Exclude the trajectory itself
+            traj_np = flattened_trajectories.detach().cpu().numpy().astype(np.float32, copy=False)
 
-            # Get the collision cost of the closest neighbors weighted by their distance
-            distance_matrix = torch.tensor(distance_matrix, device=states.device)
-            cost[env_id] += torch.sum(
-                cost_pre[env_id][neighbors.flatten()].reshape(num_trajectories, self.to_cfg.num_neighbors)
-                / distance_matrix[
-                    torch.arange(distance_matrix.shape[0], device=states.device)[:, None].repeat(
-                        1, self.to_cfg.num_neighbors
-                    ),
-                    neighbors,
-                ],
-                dim=-1,
-            )
+            distance_matrix = cdist(traj_np, traj_np, metric="euclidean")
+            distance_matrix = distance_matrix.astype(np.float32, copy=False)
+
+            n = distance_matrix.shape[0]
+            k = min(num_neighbors_cfg, n - 1)
+
+            if k <= 0:
+                continue
+
+            # Avoid selecting itself as neighbor
+            np.fill_diagonal(distance_matrix, np.inf)
+
+            # Find only top-k nearest neighbors instead of full argsort
+            neighbors = np.argpartition(distance_matrix, kth=k - 1, axis=1)[:, :k]
+
+            # Sort the selected k neighbors by distance
+            row_idx = np.arange(n)[:, None]
+            order = np.argsort(distance_matrix[row_idx, neighbors], axis=1)
+            neighbors = neighbors[row_idx, order]
+
+            neighbors_t = torch.as_tensor(neighbors, device=states.device, dtype=torch.long)
+            distance_matrix_t = torch.as_tensor(distance_matrix, device=states.device, dtype=cost.dtype)
+
+            row_idx_t = torch.arange(n, device=states.device)[:, None].expand(n, k)
+
+            neighbor_cost = cost_pre[env_id][neighbors_t]  # (NR_TRAJ, k)
+            neighbor_dist = distance_matrix_t[row_idx_t, neighbors_t]  # (NR_TRAJ, k)
+
+            propagated = torch.sum(neighbor_cost / (neighbor_dist + 1e-2), dim=-1)
+
+            cost[env_id] += neighbor_spread_weight * propagated
 
         self.collision_traj_cost = cost.clone()
+
+        return cost
+
+    def near_obstacle_cost(self, states: torch.Tensor) -> torch.Tensor:
+        """
+        True distance-to-obstacle penalty using distance transform on local height scan.
+
+        Args:
+            states: local-frame states, shape (BS, NR_TRAJ, TRAJ_LENGTH, 3)
+
+        Returns:
+            cost: (BS, NR_TRAJ, TRAJ_LENGTH)
+        """
+        if "extero_obs" not in self.obs:
+            return torch.zeros(states.shape[:3], device=states.device, dtype=states.dtype)
+
+        if self.env_ids == slice(None):
+            env_idx = torch.arange(states.shape[0], device=states.device)
+        else:
+            env_idx = self.env_ids if isinstance(self.env_ids, torch.Tensor) else torch.tensor(
+                self.env_ids, device=states.device
+            )
+
+        # (BS, H, W)
+        height_scan = self.obs["extero_obs"][env_idx].squeeze(1).to(states.device).float()
+        BS, H, W = height_scan.shape
+
+        # local trajectory positions -> map indices
+        center = torch.tensor(
+            [[
+                H / 2 - self.height_scan_offset[1] / self.height_scan_resolution,
+                W / 2 - self.height_scan_offset[0] / self.height_scan_resolution,
+            ]],
+            device=states.device,
+            dtype=torch.float32,
+        )
+
+        path_idx = center[:, None, None, :] + (
+                states[..., [1, 0]] / self.height_scan_resolution
+        ) * torch.tensor([-1.0, 1.0], device=states.device)
+
+        path_idx = path_idx.long()
+        path_idx[..., 0] = torch.clamp(path_idx[..., 0], 0, H - 1)
+        path_idx[..., 1] = torch.clamp(path_idx[..., 1], 0, W - 1)
+
+        # obstacle map: 1 means obstacle
+        obstacle_height_th = 0.08  # 8 cm 以上视为障碍，可再调
+        obstacle_map = height_scan > obstacle_height_th  # (BS, H, W)
+
+        # distance-to-obstacle map, in meters
+        dist_maps = torch.zeros_like(height_scan)
+
+        for b in range(BS):
+            # scipy distance transform works on CPU numpy
+            # distance to nearest True in obstacle_map:
+            # compute on free cells => distance to nearest obstacle
+            free_map_np = (~obstacle_map[b]).detach().cpu().numpy()
+            dist_np = distance_transform_edt(free_map_np) * self.height_scan_resolution
+            dist_maps[b] = torch.from_numpy(dist_np).to(states.device, dtype=height_scan.dtype)
+
+        batch_idx = torch.arange(BS, device=states.device)[:, None, None].expand(
+            BS, states.shape[1], states.shape[2]
+        )
+
+        clearance = dist_maps[batch_idx, path_idx[..., 0], path_idx[..., 1]]
+
+        # 真正的“多远算近”
+        soft_dist_th = 0.3
+        hard_dist_th = 0.15
+        w_soft = 3.0
+        w_hard = 12.0
+
+        cost = torch.zeros_like(clearance)
+
+        soft_mask = clearance < soft_dist_th
+        hard_mask = clearance < hard_dist_th
+
+        cost[soft_mask] += w_soft
+        cost[hard_mask] += w_hard
+
         return cost
 
     def cost_map_cost(self, states: torch.Tensor) -> torch.Tensor:
@@ -760,78 +979,10 @@ class SimpleSE2TrajectoryOptimizer:
             num_envs, grid_size_x, grid_size_y = height_scan.shape
             # get the tragversability map
             trav_map = torch.zeros_like(height_scan)
-            trav_map[:, 3:-3, 3:-3] = self.traversability_filter(height_scan.to(torch.float32).unsqueeze(1)).squeeze(
-                1
-            )  # * 2
-            # remove height scan from memory
-            del height_scan
-
-            if False:
-                # NOTE: used to create the heuristic traversabilitty plot in the appendix of the paper
-                import matplotlib.pyplot as plt
-
-                all_idx = torch.arange(self.obs["extero_obs"].shape[0])
-                curr_height_scan = self.obs["extero_obs"][all_idx].squeeze(1).to(self.device)
-                curr_trav_map = self.traversability_filter(curr_height_scan.to(torch.float32).unsqueeze(1)).squeeze(
-                    1
-                )  # * 2
-
-                # Ensure the save directory exists
-                save_dir = os.path.join(FDM_DATA_DIR, "eval")
-                os.makedirs(save_dir, exist_ok=True)
-
-                # Number of columns per row
-                cols_per_row = 6
-                rows = math.ceil(self.obs["extero_obs"].shape[0] / cols_per_row)
-
-                fig, axs = plt.subplots(
-                    2 * rows,  # Multiply by 2 to accommodate two subplots (height scan and trav map) per column
-                    cols_per_row,
-                    figsize=(cols_per_row * 4, rows * 8),  # Adjust figsize based on cols_per_row and rows
-                    gridspec_kw={"wspace": 0.4, "hspace": 0.6},  # Increase spacing between subplots
-                )
-
-                # Flatten axs for easier indexing (since it becomes 2D when multiple rows)
-                axs = axs.reshape(2 * rows, cols_per_row)
-
-                for i in range(self.obs["extero_obs"].shape[0]):
-                    row, col = divmod(i, cols_per_row)
-                    axs[2 * row, col].imshow(curr_height_scan[i].cpu().numpy())
-                    axs[2 * row, col].axis("off")  # Optional: Hide axes for cleaner visuals
-                    axs[2 * row + 1, col].imshow(curr_trav_map[i].cpu().numpy())
-                    axs[2 * row + 1, col].axis("off")  # Optional: Hide axes for cleaner visuals
-                    axs[2 * row, col].set_title(f"Height Scan {i}")
-                    axs[2 * row + 1, col].set_title(f"Traversability Map {i}")
-
-                plt.tight_layout()
-
-                plt.savefig(os.path.join(save_dir, "trav_estimate_combined_figure.pdf"))
-                plt.close()
-
-                # Loop through each environment and create a combined figure
-                for i in range(self.obs["extero_obs"].shape[0]):
-                    fig, axes = plt.subplots(1, 2, figsize=(12, 6))  # Two subplots side by side
-
-                    # Plot Height Scan
-                    im1 = axes[0].imshow(curr_height_scan[i].cpu().numpy(), cmap="RdYlBu")
-                    axes[0].set_title("Height Scan", fontsize=16)
-                    axes[0].axis("off")
-                    plt.colorbar(im1, ax=axes[0], fraction=0.046, pad=0.04)  # Add colorbar
-
-                    # Plot Traversability Map
-                    im2 = axes[1].imshow(curr_trav_map[i].cpu().numpy(), cmap="RdYlBu")
-                    axes[1].set_title("Traversability Map", fontsize=16)
-                    axes[1].axis("off")
-                    plt.colorbar(im2, ax=axes[1], fraction=0.046, pad=0.04)  # Add colorbar
-
-                    # Save the combined figure
-                    plt.tight_layout()
-                    plt.savefig(os.path.join(save_dir, f"trav_estimate_env{i}.pdf"))
-                    plt.close(fig)
+            trav_map[:, 3:-3, 3:-3] = self.traversability_filter(height_scan.to(torch.float32).unsqueeze(1)).squeeze(1)
 
             # get the indexes of the points of the path on the height-map
             # NOTE: the height map is oriented with the robot x axis in the y direction of the height map and the robot y axis in the x direction of the height map
-            #       therefore the x and y axis are swapped
             path_idx = torch.tensor(
                 [[
                     grid_size_x / 2 - self.height_scan_offset[1] / self.height_scan_resolution,
@@ -844,7 +995,6 @@ class SimpleSE2TrajectoryOptimizer:
             )
 
             # get risky coordinates for the robot
-            # NOTE: torch.pi/2 has to be subtracted because we assume x going from left to right and y going from bottom to top and the robot shape assumes a different orientation
             alpha = states[curr_env_idx_range][:, :, :, 2, None].repeat(1, 1, 1, self.risky_xy.shape[0]) - torch.pi / 2
             cells_xy = self.risky_xy.clone()[None, None, None, :, :].repeat(len(curr_env_idx), *states.shape[1:3], 1, 1)
 
@@ -874,34 +1024,157 @@ class SimpleSE2TrajectoryOptimizer:
             filter_idx = trav_map[env_idx_tensor, coordinates[:, 0], coordinates[:, 1]] < 0.15
             path_filter = torch.any(filter_idx.reshape(num_envs, states.shape[1], -1), dim=-1)
 
-            # filter paths
             curr_cost = torch.zeros(len(curr_env_idx), states.shape[1], device=states.device)
             curr_cost[path_filter] += self.to_cfg.state_cost_w_fatal_trav
             cost[curr_env_idx_range] += curr_cost
 
-        if False:
-            import matplotlib.pyplot as plt
-
-            fig, axs = plt.subplots(1, 3, figsize=(18, 6))
-            axs[0].imshow(trav_map[0].cpu().numpy())
-            path_map = torch.zeros_like(trav_map[0])
-            coordinates_reshaped = coordinates.reshape(
-                num_envs, states.shape[1] * states.shape[2] * self.risky_xy.shape[0], 2
-            )[0]
-            path_map[coordinates_reshaped[:, 0], coordinates_reshaped[:, 1]] = 1
-            axs[1].imshow(path_map.cpu().numpy())
-            cost_map = torch.zeros_like(trav_map[0])
-            coordinates_traj = coordinates.reshape(
-                num_envs, states.shape[1], states.shape[2] * self.risky_xy.shape[0], 2
-            )[0]
-            coordinates_filtered = coordinates_traj[path_filter[0]].reshape(-1, 2)
-            cost_map[coordinates_filtered[:, 0], coordinates_filtered[:, 1]] = 1
-            axs[2].imshow(cost_map.cpu().numpy())
-
         return cost
 
     ###
-    # Helper functions
+    # Helper / additional cost terms
+    ###
+
+    def _wrap_to_pi(self, angle: torch.Tensor) -> torch.Tensor:
+        return torch.atan2(torch.sin(angle), torch.cos(angle))
+
+    def smoothness_cost(self, actions: torch.Tensor) -> torch.Tensor:
+        """
+        Penalize action changes along horizon.
+        actions: (BS, NR_TRAJ, TRAJ_LENGTH, 3)
+        returns: (BS, NR_TRAJ, TRAJ_LENGTH)
+        """
+        cost = torch.zeros(actions.shape[:3], device=actions.device, dtype=actions.dtype)
+        if actions.shape[2] <= 1:
+            return cost
+
+        diff = actions[:, :, 1:, :] - actions[:, :, :-1, :]
+
+        w_vx = getattr(self.to_cfg, "state_cost_w_smooth_vx", 0.0)
+        w_vy = getattr(self.to_cfg, "state_cost_w_smooth_vy", 0.0)
+        w_wz = getattr(self.to_cfg, "state_cost_w_smooth_wz", 0.0)
+
+        smooth = (
+            torch.abs(diff[..., 0]) * w_vx
+            + torch.abs(diff[..., 1]) * w_vy
+            + torch.abs(diff[..., 2]) * w_wz
+        )
+
+        cost[:, :, 1:] = smooth
+        cost[:, :, 0] = smooth[:, :, 0]
+        return cost
+
+    def yaw_rate_change_cost(self, actions: torch.Tensor) -> torch.Tensor:
+        """
+        Extra penalty for oscillatory yaw-rate profiles.
+        """
+        cost = torch.zeros(actions.shape[:3], device=actions.device, dtype=actions.dtype)
+        if actions.shape[2] <= 1:
+            return cost
+
+        diff_wz = torch.abs(actions[:, :, 1:, 2] - actions[:, :, :-1, 2])
+        w = getattr(self.to_cfg, "state_cost_w_yaw_rate_change", 0.0)
+
+        cost[:, :, 1:] = diff_wz * w
+        cost[:, :, 0] = diff_wz[:, :, 0] * w
+        return cost
+
+    def heading_running_cost(self, states: torch.Tensor) -> torch.Tensor:
+        """
+        Encourage trajectory heading to align with direction to goal during rollout.
+        states: (BS, NR_TRAJ, TRAJ_LENGTH, 3)
+        """
+        goal_xy = self.obs["goal"][self.env_ids, None, None, :2]
+        pos_xy = states[:, :, :, :2]
+        goal_vec = goal_xy - pos_xy
+        goal_heading = torch.atan2(goal_vec[..., 1], goal_vec[..., 0])
+
+        yaw_err = torch.abs(self._wrap_to_pi(goal_heading - states[..., 2]))
+        w = getattr(self.to_cfg, "state_cost_w_heading_running", 0.0)
+        return yaw_err * w
+
+    def _sample_height_gradient(self, local_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Sample local terrain gradient from extero_obs height scan at trajectory states in local/base frame.
+
+        local_states: (BS, NR_TRAJ, TRAJ_LENGTH, 3)
+        returns:
+            grad_x, grad_y: (BS, NR_TRAJ, TRAJ_LENGTH)
+        """
+        assert "extero_obs" in self.obs, "extero_obs required for height-gradient based cost"
+
+        if self.env_ids == slice(None):
+            env_idx = torch.arange(local_states.shape[0], device=local_states.device)
+        else:
+            env_idx = self.env_ids if isinstance(self.env_ids, torch.Tensor) else torch.tensor(
+                self.env_ids, device=local_states.device
+            )
+
+        height_scan = self.obs["extero_obs"][env_idx].squeeze(1).to(local_states.device).float()  # (BS, H, W)
+        BS, H, W = height_scan.shape
+
+        grad_x_map = torch.zeros_like(height_scan)
+        grad_y_map = torch.zeros_like(height_scan)
+
+        grad_x_map[:, 1:-1, :] = (height_scan[:, 2:, :] - height_scan[:, :-2, :]) / (2 * self.height_scan_resolution)
+        grad_y_map[:, :, 1:-1] = (height_scan[:, :, 2:] - height_scan[:, :, :-2]) / (2 * self.height_scan_resolution)
+
+        center = torch.tensor(
+            [[
+                H / 2 - self.height_scan_offset[1] / self.height_scan_resolution,
+                W / 2 - self.height_scan_offset[0] / self.height_scan_resolution,
+            ]],
+            device=local_states.device,
+        )
+
+        idx = center[:, None, None, :] + (
+            local_states[..., [1, 0]] / self.height_scan_resolution
+        ) * torch.tensor([-1.0, 1.0], device=local_states.device)
+
+        idx = idx.long()
+        idx[..., 0] = torch.clamp(idx[..., 0], 0, H - 1)
+        idx[..., 1] = torch.clamp(idx[..., 1], 0, W - 1)
+
+        batch_idx = torch.arange(BS, device=local_states.device)[:, None, None].expand(
+            BS, local_states.shape[1], local_states.shape[2]
+        )
+
+        gx = grad_x_map[batch_idx, idx[..., 0], idx[..., 1]]
+        gy = grad_y_map[batch_idx, idx[..., 0], idx[..., 1]]
+
+        return gx, gy
+
+    def stair_alignment_cost(self, local_states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        """
+        Encourage motion direction to align with terrain gradient direction in step-like regions.
+        local_states: (BS, NR_TRAJ, TRAJ_LENGTH, 3) in local/base frame
+        actions:      (BS, NR_TRAJ, TRAJ_LENGTH, 3)
+        """
+        if "extero_obs" not in self.obs:
+            return torch.zeros(actions.shape[:3], device=actions.device, dtype=actions.dtype)
+
+        gx, gy = self._sample_height_gradient(local_states)
+        grad_norm = torch.sqrt(gx**2 + gy**2 + 1e-8)
+
+        grad_thr = getattr(self.to_cfg, "state_cost_stair_grad_threshold", 1e9)
+        active = grad_norm > grad_thr
+
+        stair_heading = torch.atan2(gy, gx)
+
+        cmd_heading = torch.atan2(actions[..., 1], actions[..., 0] + 1e-8)
+        heading_err = torch.abs(self._wrap_to_pi(cmd_heading - stair_heading))
+
+        cmd_speed = torch.norm(actions[..., :2], dim=-1)
+        moving = cmd_speed > getattr(self.to_cfg, "state_cost_stair_speed_threshold", 0.05)
+
+        w = getattr(self.to_cfg, "state_cost_w_stair_alignment", 0.0)
+
+        cost = torch.zeros_like(heading_err)
+        mask = active & moving
+        cost[mask] = heading_err[mask] * w
+        return cost
+
+    ###
+    # Original helper functions
     ###
 
     def get_start_state(self, batch_size: int, nr_traj: int, env_ids: list[int] | None = None) -> torch.Tensor:
@@ -925,33 +1198,233 @@ class SimpleSE2TrajectoryOptimizer:
         b = 0
         best_traj = torch.argmin(total_cost[b])
 
-        # Print statistics
-        print("Running Cost:")
         for key in [
-            "states_trav_cost",
             "states_control_effort_rot",
             "states_control_effort_trans_side",
             "states_control_effort_trans_forward",
             "states_early_goal_cost",
+            "states_early_stopping_cost",
+            "velocity_tracking_cost",
+            "heading_running_cost",
+            "smoothness_cost",
+            "stair_alignment_cost",
+            "yaw_rate_change_cost",
             "states_running_cost",
         ]:
-            print(
-                f"{key:>30}:    - Best Mean Total:"
-                f" {round(self.debug_info[key][b, best_traj].mean().item(), 3):>10}       - Std Across Traj:"
-                f" {round(self.debug_info[key][b].mean(dim=1).std().item(), 3):>10} "
+            if key not in self.debug_info:
+                continue
+
+    def record_cvae_executed_outcomes(
+        self,
+        executed_actions: torch.Tensor,
+        env_ids: torch.Tensor | list[int],
+        outcome_success: torch.Tensor,
+    ) -> None:
+        if self.to_cfg.cvae_dataset_dump_path is None:
+            return
+
+        if not torch.is_tensor(env_ids):
+            env_ids = torch.tensor(env_ids, device=executed_actions.device, dtype=torch.long)
+        else:
+            env_ids = env_ids.to(device=executed_actions.device, dtype=torch.long)
+        if env_ids.numel() == 0:
+            return
+
+        outcome_success = outcome_success.to(device=executed_actions.device, dtype=torch.bool).reshape(-1)
+        if outcome_success.numel() == executed_actions.shape[0]:
+            outcome_success = outcome_success[env_ids]
+        if outcome_success.numel() != env_ids.numel():
+            raise ValueError(
+                f"Outcome label count {outcome_success.numel()} does not match env count {env_ids.numel()}."
             )
-        #
-        print("\nTerminal Cost:")
-        for key in ["terminal_cost_position_offset", "terminal_cost_heading_reward", "terminal_cost"]:
-            print(
-                f"{key:>30}:    - Best Final: {round(self.debug_info[key][b, best_traj].item(), 3):>10}       - Std"
-                f" Across Traj: {round(self.debug_info[key][b].std().item(), 3):>10} "
-            )
+
+        context = None
+        try:
+            context = self._build_cvae_context(env_ids)
+        except (AttributeError, KeyError, IndexError):
+            context = None
+        if self.to_cfg.cvae_require_context and context is None:
+            return
+
+        target_actions = executed_actions[env_ids].detach().clone()
+        mean_actions = self.optim.mean[env_ids].detach().clone()
+        if mean_actions.shape != target_actions.shape:
+            mean_actions = target_actions.clone()
+
+        goal_state = torch.where(
+            outcome_success,
+            torch.full_like(outcome_success, 2, dtype=torch.int64),
+            torch.full_like(outcome_success, 1, dtype=torch.int64),
+        )
+        risk_proxy = (~outcome_success).to(dtype=torch.float32)
+
+        self._cvae_mean_buffer.append(mean_actions.to("cpu"))
+        self._cvae_target_buffer.append(target_actions.to("cpu"))
+        self._cvae_goal_state_buffer.append(goal_state.to("cpu"))
+        self._cvae_outcome_success_buffer.append(outcome_success.to("cpu"))
+        self._cvae_success_mask_buffer.append(torch.ones_like(outcome_success, dtype=torch.bool).to("cpu"))
+        self._cvae_sample_weight_buffer.append(torch.ones_like(risk_proxy, dtype=torch.float32).to("cpu"))
+        self._cvae_risk_max_buffer.append(risk_proxy.to("cpu"))
+        self._cvae_risk_sum_buffer.append(risk_proxy.to("cpu"))
+        if context is not None:
+            self._cvae_context_buffer.append(context.detach().to("cpu"))
+        self._cvae_samples_since_flush += int(env_ids.numel())
+
+        self._flush_cvae_dataset()
 
     def logging_callback(self, population: torch.Tensor, values: torch.Tensor, iteration: int):
         if self.to_cfg.debug:
             min_v = values.min()
-            print(f"Iteration: {iteration}, Values: {min_v}")
+        if self.to_cfg.cvae_dataset_dump_path is None:
+            return
+        if self.to_cfg.cvae_collect_all_iterations:
+            stride = max(int(self.to_cfg.cvae_collect_iteration_stride), 1)
+            if iteration % stride != 0:
+                return
+        elif iteration != self.optim.num_iterations - 1:
+            return
+        if self.to_cfg.cvae_require_context and self._last_cvae_context is None:
+            return
+
+        # population: (N, BS, H, A), values: (N, BS)
+        pop_size, bs = population.shape[0], population.shape[1]
+        k = min(self.to_cfg.cvae_dataset_topk, pop_size)
+        high_k = max(int(round(k * self.to_cfg.cvae_bucket_ratio_high)), 1)
+        mid_k = max(int(round(k * self.to_cfg.cvae_bucket_ratio_mid)), 1)
+        low_k = max(k - high_k - mid_k, 1)
+        if high_k + mid_k + low_k > pop_size:
+            low_k = max(pop_size - high_k - mid_k, 0)
+
+        sorted_idx = torch.argsort(values, dim=0, descending=True)
+        high_idx = sorted_idx[:high_k]
+        mid_start = max((pop_size - mid_k) // 2, high_k)
+        mid_idx = sorted_idx[mid_start : mid_start + mid_k]
+        low_idx = sorted_idx[-low_k:] if low_k > 0 else sorted_idx[:0]
+        mixed_idx = torch.cat([high_idx, mid_idx, low_idx], dim=0)
+
+        batch_idx = torch.arange(bs, device=population.device).unsqueeze(0).expand(mixed_idx.shape[0], -1)
+        mixed_traj = population[mixed_idx, batch_idx]  # (k_mix, BS, H, A)
+
+        mean = self.optim.mean[self.env_ids].detach().clone()
+        keep_k = mixed_traj.shape[0]
+        mean_expand = mean.unsqueeze(0).expand(keep_k, -1, -1, -1)
+        self._cvae_mean_buffer.append(mean_expand.reshape(-1, mean.shape[1], mean.shape[2]).to("cpu"))
+        self._cvae_target_buffer.append(mixed_traj.reshape(-1, mixed_traj.shape[2], mixed_traj.shape[3]).to("cpu"))
+
+        flat_n = keep_k * bs
+        self._cvae_goal_state_buffer.append(torch.zeros(flat_n, dtype=torch.int64))
+        self._cvae_outcome_success_buffer.append(torch.zeros(flat_n, dtype=torch.bool))
+        self._cvae_success_mask_buffer.append(torch.zeros(flat_n, dtype=torch.bool))
+        self._cvae_sample_weight_buffer.append(torch.ones(flat_n, dtype=torch.float32))
+        risk_proxy = (-values[mixed_idx, batch_idx]).reshape(-1).detach().to("cpu")
+        self._cvae_risk_max_buffer.append(risk_proxy)
+        self._cvae_risk_sum_buffer.append(risk_proxy.clone())
+        if self._last_cvae_context is not None:
+            context_expand = self._last_cvae_context.unsqueeze(0).expand(keep_k, -1, -1)
+            self._cvae_context_buffer.append(context_expand.reshape(-1, context_expand.shape[-1]).to("cpu"))
+        self._cvae_samples_since_flush += int(flat_n)
+
+        if self._cvae_samples_since_flush >= self.to_cfg.cvae_flush_every_n_samples:
+            self._flush_cvae_dataset()
+
+    def _flush_cvae_dataset(self) -> None:
+        if self.to_cfg.cvae_dataset_dump_path is None:
+            return
+        mean_actions = torch.cat(self._cvae_mean_buffer, dim=0) if len(self._cvae_mean_buffer) > 0 else None
+        target_actions = torch.cat(self._cvae_target_buffer, dim=0) if len(self._cvae_target_buffer) > 0 else None
+        if mean_actions is None or target_actions is None:
+            return
+
+        goal_state = torch.cat(self._cvae_goal_state_buffer, dim=0) if len(self._cvae_goal_state_buffer) > 0 else None
+        outcome_success = (
+            torch.cat(self._cvae_outcome_success_buffer, dim=0) if len(self._cvae_outcome_success_buffer) > 0 else None
+        )
+        risk_max = torch.cat(self._cvae_risk_max_buffer, dim=0) if len(self._cvae_risk_max_buffer) > 0 else None
+        risk_sum = torch.cat(self._cvae_risk_sum_buffer, dim=0) if len(self._cvae_risk_sum_buffer) > 0 else None
+        success_mask = torch.cat(self._cvae_success_mask_buffer, dim=0) if len(self._cvae_success_mask_buffer) > 0 else None
+        sample_weight = torch.cat(self._cvae_sample_weight_buffer, dim=0) if len(self._cvae_sample_weight_buffer) > 0 else None
+
+        max_n = self.to_cfg.cvae_dataset_max_samples
+        if mean_actions.shape[0] > max_n:
+            mean_actions = mean_actions[-max_n:]
+            target_actions = target_actions[-max_n:]
+            if len(self._cvae_context_buffer) > 0:
+                context = torch.cat(self._cvae_context_buffer, dim=0)[-max_n:]
+                self._cvae_context_buffer = [context]
+            self._cvae_mean_buffer = [mean_actions]
+            self._cvae_target_buffer = [target_actions]
+            if goal_state is not None:
+                goal_state = goal_state[-max_n:]
+                self._cvae_goal_state_buffer = [goal_state]
+            if outcome_success is not None:
+                outcome_success = outcome_success[-max_n:]
+                self._cvae_outcome_success_buffer = [outcome_success]
+            if risk_max is not None:
+                risk_max = risk_max[-max_n:]
+                self._cvae_risk_max_buffer = [risk_max]
+            if risk_sum is not None:
+                risk_sum = risk_sum[-max_n:]
+                self._cvae_risk_sum_buffer = [risk_sum]
+            if success_mask is not None:
+                success_mask = success_mask[-max_n:]
+                self._cvae_success_mask_buffer = [success_mask]
+            if sample_weight is not None:
+                sample_weight = sample_weight[-max_n:]
+                self._cvae_sample_weight_buffer = [sample_weight]
+
+        if success_mask is not None:
+            labeled_ratio = success_mask.float().mean().item()
+            if labeled_ratio < self.to_cfg.cvae_labeled_ratio_min:
+                labeled_idx = torch.where(success_mask)[0]
+                unlabeled_idx = torch.where(~success_mask)[0]
+                if labeled_idx.numel() > 0:
+                    max_unlabeled = int(
+                        labeled_idx.numel() * (1 - self.to_cfg.cvae_labeled_ratio_min)
+                        / self.to_cfg.cvae_labeled_ratio_min
+                    )
+                    keep_unlabeled = unlabeled_idx[-max_unlabeled:] if max_unlabeled > 0 else unlabeled_idx[:0]
+                    keep_idx = torch.cat([labeled_idx, keep_unlabeled], dim=0)
+                    mean_actions = mean_actions[keep_idx]
+                    target_actions = target_actions[keep_idx]
+                    goal_state = goal_state[keep_idx] if goal_state is not None else None
+                    outcome_success = outcome_success[keep_idx] if outcome_success is not None else None
+                    risk_max = risk_max[keep_idx] if risk_max is not None else None
+                    risk_sum = risk_sum[keep_idx] if risk_sum is not None else None
+                    success_mask = success_mask[keep_idx]
+                    sample_weight = sample_weight[keep_idx] if sample_weight is not None else None
+                    if len(self._cvae_context_buffer) > 0:
+                        context = torch.cat(self._cvae_context_buffer, dim=0)[keep_idx]
+                        self._cvae_context_buffer = [context]
+                    self._cvae_mean_buffer = [mean_actions]
+                    self._cvae_target_buffer = [target_actions]
+                    self._cvae_goal_state_buffer = [goal_state] if goal_state is not None else []
+                    self._cvae_outcome_success_buffer = [outcome_success] if outcome_success is not None else []
+                    self._cvae_risk_max_buffer = [risk_max] if risk_max is not None else []
+                    self._cvae_risk_sum_buffer = [risk_sum] if risk_sum is not None else []
+                    self._cvae_success_mask_buffer = [success_mask]
+                    self._cvae_sample_weight_buffer = [sample_weight] if sample_weight is not None else []
+
+        payload = {"mean_actions": mean_actions, "target_actions": target_actions}
+        if len(self._cvae_context_buffer) > 0:
+            payload["context"] = torch.cat(self._cvae_context_buffer, dim=0)
+        if goal_state is not None:
+            payload["goal_state_3way"] = goal_state
+        if outcome_success is not None:
+            payload["outcome_success"] = outcome_success
+        if risk_max is not None:
+            payload["outcome_risk_max"] = risk_max
+        if risk_sum is not None:
+            payload["outcome_risk_sum"] = risk_sum
+        if success_mask is not None:
+            payload["success_supervision_mask"] = success_mask
+        if sample_weight is not None:
+            payload["sample_weight"] = sample_weight
+
+        dump_dir = os.path.dirname(self.to_cfg.cvae_dataset_dump_path)
+        if len(dump_dir) > 0:
+            os.makedirs(dump_dir, exist_ok=True)
+        torch.save(payload, self.to_cfg.cvae_dataset_dump_path)
+        self._cvae_samples_since_flush = 0
 
     def forward_dynamics(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
         """

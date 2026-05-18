@@ -8,3 +8,4 @@ from .planner_cfg import get_planner_cfg
 from .trajectory_optimizer import SimpleSE2TrajectoryOptimizer
 from .trajectory_optimizer_cfg import *  # noqa F401
 from .trajectory_optimizer_mbrl import *  # noqa F401
+from .cvae_action_sampler import ActionCVAE, CVAEActionSampler

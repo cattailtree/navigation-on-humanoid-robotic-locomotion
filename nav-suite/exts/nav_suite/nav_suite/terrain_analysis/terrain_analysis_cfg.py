@@ -33,7 +33,7 @@ class TerrainAnalysisCfg:
     If None, the max height is defined by the wall height. This flag can be useful in a map with vary different heights
     (e.g. a city map) where all the building should be filtered out."""
 
-    robot_buffer_spawn: float = 0.7
+    robot_buffer_spawn: float = 1.5
     """Robot buffer for spawn location"""
 
     sample_points: int = 1000

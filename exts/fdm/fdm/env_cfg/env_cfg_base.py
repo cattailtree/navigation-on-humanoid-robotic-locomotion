@@ -20,7 +20,6 @@ from isaaclab.sensors import ContactSensorCfg, RayCasterCfg, patterns
 from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 import isaaclab.envs.mdp as mdpp
-
 from nav_suite.terrains import NavTerrainImporterCfg
 
 import fdm.mdp as mdp
@@ -86,7 +85,7 @@ class TerrainSceneCfg(InteractiveSceneCfg):
     # 传感器：高度扫描（给 FDM / terrain analysis 用）
     height_scanner = RayCasterCfg(
         # ✅ G1 的 usd 根 prim 是 g1_29dof_rev_1_0，所以这里挂在那个 prim 上
-        prim_path="{ENV_REGEX_NS}/Robot",
+        prim_path="{ENV_REGEX_NS}/Robot/pelvis",
         offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.5)),  # 相对 G1 根往上 0.5m
         ray_alignment="yaw",
         pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=(1.6, 1.0)),
@@ -146,8 +145,8 @@ class ActionsCfg:
             use_default_offset=True,
         ),
         low_level_decimation=4,
-        # ✅ 这里换成你训练好的 G1 行走策略 .pt（现在暂时用 ANYmal 路径也行，记得之后改）
-        low_level_policy_file="/data1/home/liao_junhong/fdm/exts/fdm/data/ANYmal-D-New/policy.pt",
+        # G1 29DOF low-level walking policy.
+        low_level_policy_file="D:/fdm_data/mujoco_sim2sim/policies/g1_policy.pt",
         # NavigationSE2Action 在 apply_actions 里会用这个 group 名去取低层 obs
         low_level_obs_group="policy",
     )
@@ -262,23 +261,48 @@ class ObservationsCfg:
         #base_position = ObsTerm(func=mdp.base_position)
         base_orientation = ObsTerm(func=mdp.base_orientation_xyzw)
         base_collision = ObsTerm(
-            func=mdp.base_collision_obs,
+            func=mdp.hard_faliure_obs,
             params={
-        "threshold": 100.0,
-        "K": 3,
-        "feet_support_threshold": 5.0,
-        "sensor_cfg": SceneEntityCfg(
-            "contact_forces",
-            body_names=[".*pelvis.*"],
-        ),
-        "feet_cfg": SceneEntityCfg(
-            "contact_forces",
-            body_names=[
-                "left_ankle_roll_link",
-                "right_ankle_roll_link",
-            ],
-        ),
-    },
+                "body_force_threshold": 20.0,
+                "feet_support_threshold": 10.0,
+                "min_base_height": 0.45,
+                "max_abs_roll": 0.8,
+                "max_abs_pitch": 0.8,
+                "stuck_steps": 5,
+                "min_progress": 0.003,
+                "command_threshold": 0.15,
+                "K": 1,
+
+                # near-obstacle patch
+                "extero_key": "extero_obs",
+                "near_obstacle_height_th": 0.08,
+                "near_obstacle_front_x": 0.8,
+                "near_obstacle_half_width": 0.35,
+
+                "sensor_cfg": SceneEntityCfg(
+                    "contact_forces",
+                    body_names=[
+                        "pelvis",
+                        "waist_yaw_link",
+                        "waist_roll_link",
+                        "torso_link",
+                        "left_hip_pitch_link",
+                        "left_hip_roll_link",
+                        "left_hip_yaw_link",
+                        "right_hip_pitch_link",
+                        "right_hip_roll_link",
+                        "right_hip_yaw_link",
+                    ],
+                ),
+
+                "feet_cfg": SceneEntityCfg(
+                    "contact_forces",
+                    body_names=[
+                        "left_ankle_roll_link",
+                        "right_ankle_roll_link",
+                    ],
+                ),
+            },
         )
         hard_contact = ObsTerm(func=mdp.energy_consumption, params={"energy_scale_factor": 0.001})
         friction = ObsTerm(
@@ -322,32 +346,26 @@ class EventsCfg:
 
     # reset：根据地形分析重置 base
     reset_base = EventTerm(
-        func=mdp.TerrainAnalysisRootReset(
-            cfg=TERRAIN_ANALYSIS_CFG,
-            robot_dim=0.6,
-        ),
+        func=mdpp.reset_root_state_uniform,
         mode="reset",
         params={
-            "asset_cfg": SceneEntityCfg("robot"),
-            "yaw_range": (-3.14, 3.14),
-            "velocity_range": {
-                "x": (-0.01, 0.01),
-                "y": (-0.01, 0.01),
-                "z": (0, 0),
-                "roll": (0, 0),
-                "pitch": (0, 0),
-                "yaw": (-0.01, 0.01),
+            "pose_range": {
+                "x": (-0.1, 0.1),
+                "y": (-0.1, 0.1),
+                "z": (0.0, 0.0),
+                "roll": (0.0, 0.0),
+                "pitch": (0.0, 0.0),
+                "yaw": (-0.1, 0.1),
             },
-        },
-    )
-
-    reset_robot_joints = EventTerm(
-        func=mdp.reset_joints_by_scale,
-        mode="reset",
-        params={
+            "velocity_range": {
+                "x": (0.0, 0.0),
+                "y": (0.0, 0.0),
+                "z": (0.0, 0.0),
+                "roll": (0.0, 0.0),
+                "pitch": (0.0, 0.0),
+                "yaw": (0.0, 0.0),
+            },
             "asset_cfg": SceneEntityCfg("robot"),
-            "position_range": (0.99, 1.01),
-            "velocity_range": (0.0, 0.0),
         },
     )
 

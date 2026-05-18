@@ -59,6 +59,7 @@ from fdm.utils.args_cli_utils import (
     robot_changes,
     runner_cfg_init,
 )
+import fdm.env_cfg.terrain_cfg as fdm_terrain_cfg
 from fdm.utils.model_comp_plot import ViolinPlotter, meta_summarize, plot_metrics_with_grid
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -87,6 +88,9 @@ def load_cfg():
     # set name of the run
     if args_cli.runs is not None:
         cfg.trainer_cfg.load_run = args_cli.runs[0] if isinstance(args_cli.runs, list) else args_cli.runs
+    cfg.env_cfg.scene.terrain.terrain_type = "generator"
+    cfg.env_cfg.scene.terrain.terrain_generator =fdm_terrain_cfg.PLANNER_EVAL_CFG
+    cfg.env_cfg.scene.terrain.usd_path = None
 
     return cfg
 
@@ -367,6 +371,9 @@ def main():
 
     # setup runner
     runner = fdm_runner_cfg.FDMRunner(cfg=cfg, args_cli=args_cli, eval=True)
+    print("terrain cfg =", runner.env.cfg.scene.terrain)
+    print("test datasets =",
+          None if runner.trainer.test_datasets is None else list(runner.trainer.test_datasets.keys()))
 
     # run
     run_eval(runner, args_cli=args_cli)

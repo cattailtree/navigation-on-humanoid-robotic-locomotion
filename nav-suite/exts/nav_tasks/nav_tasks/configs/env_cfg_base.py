@@ -83,7 +83,7 @@ class NavTasksDepthNavSceneCfg(InteractiveSceneCfg):
 
     # SENSORS: Locomotion Policy
     height_scanner = RayCasterCfg(
-        prim_path="{ENV_REGEX_NS}/Robot",
+        prim_path="{ENV_REGEX_NS}/Robot/pelvis",
         offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),
         ray_alignment="yaw",
         pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=[1.6, 1.0]),
@@ -136,7 +136,7 @@ class ActionsCfg:
         low_level_action=mdp.JointPositionActionCfg(
             asset_name="robot", joint_names=[".*"], scale=1.0, use_default_offset=False
         ),
-        low_level_policy_file="/data1/home/liao_junhong/fdm/exts/fdm/data/ANYmal-D-New/policy.pt",
+        low_level_policy_file="C:/Users\Admin/fdm/exts/fdm/data/ANYmal-D-New/policy.pt",
         low_level_obs_group="locomotion_policy",
     )
 
@@ -217,7 +217,7 @@ class EventCfg:
         func=mdp.reset_robot_position,
         mode="reset",
         params={
-            "yaw_range": (-3.0, 3.0),
+            "yaw_range": (-0.0, 0.0),
         },
     )
 

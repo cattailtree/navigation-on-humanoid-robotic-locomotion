@@ -628,11 +628,12 @@ class ViolinPlotter:
                     inputs[0] = torch.zeros_like(inputs[0])
 
             outputs = model(inputs[:5])
+            collision_prob = torch.maximum(outputs[1], outputs[3]) if len(outputs) > 3 else outputs[1]
             collision_idx = torch.any(inputs[5][..., 4].to(model.device) == 1, dim=1)
             curr_position_delta_step = torch.norm(outputs[0][:, :, :2] - inputs[5][..., :2].to(model.device), dim=-1)
             curr_pv_position_delta_step = torch.norm(inputs[6][..., :2] - inputs[5][..., :2], dim=-1).to(model.device)
             correct_collision_estimation_idx = collision_idx == torch.any(
-                outputs[1] >= model.cfg.collision_threshold, dim=1
+                collision_prob >= model.cfg.collision_threshold, dim=1
             )
             non_correct_collision_estimation_count += torch.sum(~correct_collision_estimation_idx).item()
 
@@ -642,16 +643,16 @@ class ViolinPlotter:
             # -- f1: 2 * (precision * recall) / (precision + recall)
             # -- TP: True Positives, FP: False Positives, FN: False Negatives
             self.collision_metrics[model_name][dataset_name]["precision"].append(
-                self.metric_presision(outputs[1].max(dim=-1)[0], inputs[5][..., 4].to(model.device).max(dim=-1)[0])
+                self.metric_presision(collision_prob.max(dim=-1)[0], inputs[5][..., 4].to(model.device).max(dim=-1)[0])
             )
             self.collision_metrics[model_name][dataset_name]["recall"].append(
-                self.metric_recall(outputs[1].max(dim=-1)[0], inputs[5][..., 4].to(model.device).max(dim=-1)[0])
+                self.metric_recall(collision_prob.max(dim=-1)[0], inputs[5][..., 4].to(model.device).max(dim=-1)[0])
             )
             self.collision_metrics[model_name][dataset_name]["accuracy"].append(
-                self.metric_accuracy(outputs[1].max(dim=-1)[0], inputs[5][..., 4].to(model.device).max(dim=-1)[0])
+                self.metric_accuracy(collision_prob.max(dim=-1)[0], inputs[5][..., 4].to(model.device).max(dim=-1)[0])
             )
             self.collision_metrics[model_name][dataset_name]["f1score"].append(
-                self.metric_f1(outputs[1].max(dim=-1)[0], inputs[5][..., 4].to(model.device).max(dim=-1)[0])
+                self.metric_f1(collision_prob.max(dim=-1)[0], inputs[5][..., 4].to(model.device).max(dim=-1)[0])
             )
             num_collision_samples += torch.sum(collision_idx).item()
 
@@ -860,7 +861,7 @@ class ViolinPlotter:
             ax = axs[idx // 5, idx % 5]
             img = ax.imshow(height_scan[idx].squeeze(0).to("cpu"), cmap="gray")
 
-            if torch.any(outputs[1][loss_idx[idx]] >= collision_threshold):
+            if torch.any(collision_prob[loss_idx[idx]] >= collision_threshold):
                 ax.scatter(
                     pred_positions_idx[idx, :, 1].to("cpu"),
                     pred_positions_idx[idx, :, 0].to("cpu"),

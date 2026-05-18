@@ -283,7 +283,10 @@ class SimpleSE2TrajectoryOptimizer:
 
             # make prediction
             with torch.no_grad():
-                states_base, collision_prob_traj, energy_traj = self.fdm_model.forward(model_in)
+                model_out = self.fdm_model.forward(model_in)
+                states_base, collision_prob_traj, energy_traj = model_out[0], model_out[1], model_out[2]
+                if len(model_out) > 3:
+                    collision_prob_traj = torch.maximum(collision_prob_traj, model_out[3])
 
             # transform the orientation encoding to a yaw angle
             states_base[..., 2] = torch.atan2(states_base[..., 2], states_base[..., 3])
@@ -431,14 +434,6 @@ class SimpleSE2TrajectoryOptimizer:
         # heading_reward = heading_cossine_distance  # (-heading_cossine_distance / 2)-1
         # heading_reward[m] = 0
 
-        if self.to_cfg.debug:
-            self.debug_info["terminal_cost_position_offset"] = (
-                position_offset.clone() * self.to_cfg.terminal_cost_w_position_error
-            )
-            self.debug_info["terminal_cost_heading_offset"] = (
-                heading_offset.clone() * self.to_cfg.terminal_cost_w_rot_error
-            )
-
         res = (
             position_offset * self.to_cfg.terminal_cost_w_position_error
             + heading_offset * self.to_cfg.terminal_cost_w_rot_error
@@ -447,9 +442,6 @@ class SimpleSE2TrajectoryOptimizer:
         if self.to_cfg.terminal_cost_use_threshold:
             m = position_offset < self.to_cfg.terminal_cost_distance_offset
             res[m] /= self.to_cfg.terminal_cost_close_reward
-
-            if self.to_cfg.debug:
-                self.debug_info["terminal_cost_total"] = res.clone()
 
         return res
 

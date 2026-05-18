@@ -38,6 +38,7 @@ class FDMModel(Model):
         self.param_command_timestep = self.cfg.command_timestep
         self.param_unified_failure_prediction = self.cfg.unified_failure_prediction
         self.param_collision_threshold = self.cfg.collision_threshold
+        self.param_use_geometric_collision_head = self.cfg.use_geometric_collision_head
         # -- checks if recursive unit or mlp
         if isinstance(self.state_obs_proprioceptive_encoder, (nn.GRU, nn.LSTM)):
             self.state_encoder_forward = self.state_encoder_forward_rnn
@@ -83,6 +84,7 @@ class FDMModel(Model):
 
         # energy loss
         self.energy_loss = nn.MSELoss()
+        self.geometric_probability_loss = nn.BCELoss()
 
         # init metrics
         self.metric_presision = BinaryPrecision(threshold=self.cfg.collision_threshold)
@@ -119,6 +121,9 @@ class FDMModel(Model):
         self.collision_predictor = self._construct_layer(self.cfg.collision_predictor)
         self.energy_predictor = self._construct_layer(self.cfg.energy_predictor)
         self.friction_predictor = self._construct_layer(self.cfg.friction_predictor)
+        if self.cfg.use_geometric_collision_head:
+            self.geometric_collision_recurrence = self._construct_layer(self.cfg.geometric_collision_recurrence)
+            self.geometric_collision_predictor = self._construct_layer(self.cfg.geometric_collision_predictor)
         self.sigmoid = nn.Sigmoid()
 
         # init velocity and acceleration limit buffer --> filled by maximum oberserved simulation values
@@ -154,6 +159,23 @@ class FDMModel(Model):
     def set_learning_progress_step(self, learning_progress_step: float):
         """Set the learning progress step for the model. This can be used to scale the loss during training."""
         self._learning_progress_step = learning_progress_step
+
+    def _geometric_collision_forward(
+        self, encoded_obs_exteroceptive: torch.Tensor, encoded_actions: torch.Tensor
+    ) -> torch.Tensor | None:
+        if not self.param_use_geometric_collision_head:
+            return None
+
+        batch_size, traj_len, _ = encoded_actions.shape
+        extero_context = encoded_obs_exteroceptive.unsqueeze(1).repeat(1, traj_len, 1)
+        geom_in = torch.cat([encoded_actions, extero_context], dim=-1)
+        geom_features, _ = self.geometric_collision_recurrence(geom_in)
+        geom_logits = self.geometric_collision_predictor(geom_features.reshape(batch_size * traj_len, -1))
+        geom_prob = torch.sigmoid(geom_logits).view(batch_size, traj_len)
+
+        if self.param_unified_failure_prediction:
+            geom_prob = 1.0 - torch.prod(1.0 - geom_prob + 1e-6, dim=-1)
+        return geom_prob
 
     """
     Forward function of the dynamics model
@@ -219,6 +241,7 @@ class FDMModel(Model):
         # predict the probability of collision along the trajectory
         collision_logits_traj = self.collision_predictor.forward(forward_predict_state_obs).view(batch_size, traj_len)
         collision_prob_traj = torch.sigmoid(collision_logits_traj)
+        geometric_collision_prob_traj = self._geometric_collision_forward(encoded_obs_exteroceptive, encoded_actions)
 
         if self.param_unified_failure_prediction:
             # Soft "any-step collision": 1 - Π(1 - p_t)
@@ -236,6 +259,8 @@ class FDMModel(Model):
         # add relative transitions to previous ones to get absolute transitions
         state_traj = torch.cumsum(rel_state_transitions, dim=1)
 
+        if geometric_collision_prob_traj is not None:
+            return state_traj, collision_prob_traj, energy_traj, geometric_collision_prob_traj
         return state_traj, collision_prob_traj, energy_traj
 
 
@@ -278,15 +303,22 @@ class FDMModel(Model):
     ) -> tuple[torch.Tensor, dict]:
         """Network loss function as a combintation of the collision probability loss and the coordinate loss"""
         # extract predictions and targets
-        pred_state_traj, pred_collision_prob_traj, energy_traj = (
-    model_out[0], model_out[1], model_out[2]
-)
+        pred_state_traj, pred_collision_prob_traj, energy_traj = model_out[0], model_out[1], model_out[2]
+        pred_geometric_collision_prob_traj = model_out[3] if len(model_out) > 3 else None
 
         target_state_traj, target_collision_state_traj, target_energy_traj = (
             target[..., :4].to(self.device),
             target[..., 4].to(self.device),
             target[..., 5].to(self.device),
         )
+        if (
+            self.param_use_geometric_collision_head
+            and pred_geometric_collision_prob_traj is not None
+            and target.shape[-1] > 6
+        ):
+            target_geometric_collision_traj = target[..., -1].to(self.device)
+        else:
+            target_geometric_collision_traj = None
 
         # stop loss - do not move when collision has happenend
         # note: has to be called before the collision probability loss, because there can be unified
@@ -311,6 +343,15 @@ class FDMModel(Model):
 
         # Energy loss (MSE)
         energy_loss = self.energy_loss(energy_traj.squeeze(-1), target_energy_traj)
+        if target_geometric_collision_traj is not None:
+            if self.param_unified_failure_prediction:
+                target_geometric_collision_traj = torch.max(target_geometric_collision_traj, dim=-1)[0]
+            geometric_collision_loss = self.geometric_probability_loss(
+                pred_geometric_collision_prob_traj.clamp(1e-6, 1 - 1e-6),
+                target_geometric_collision_traj,
+            )
+        else:
+            geometric_collision_loss = torch.tensor(0.0, device=self.device)
 
         # scale losses
         collision_prob_loss *= self.cfg.loss_weights["collision"]
@@ -320,8 +361,11 @@ class FDMModel(Model):
         acceleration_loss *= self.cfg.loss_weights["acceleration"]
         stop_loss *= self.cfg.loss_weights["stop"]
         energy_loss *= self.cfg.loss_weights["energy"]
+        geometric_collision_loss *= self.cfg.geometric_collision_loss_weight
 
         # scale losses by learning progress if enabled
+        # --- Weighted BCE on probabilities (no shape change, no logits) ---
+         # scale losses by learning progress if enabled
         # --- Weighted BCE on probabilities (no shape change, no logits) ---
         eps = 1e-6
         p = pred_collision_prob_traj.clamp(eps, 1 - eps)
@@ -360,12 +404,14 @@ class FDMModel(Model):
             + acceleration_loss
             + stop_loss
             + energy_loss
+            + geometric_collision_loss
         )
 
         # save meta data
         meta = {
             f"{mode}{suffix} Loss [Batch]": loss.item(),
             f"{mode}{suffix} Stop Loss [Batch]": stop_loss.item(),
+            f"{mode}{suffix} Geometric Collision Loss [Batch]": geometric_collision_loss.item(),
         }
         if mode != "test":  # avoid overflow of information
             meta = meta | {
@@ -1073,6 +1119,7 @@ class FDMModelVelocityMultiStep(FDMModel):
         # predict the probability of collision along the trajectory
         collision_logits_traj = self.collision_predictor.forward(forward_predict_state_obs).view(batch_size, traj_len)
         collision_prob_traj = torch.sigmoid(collision_logits_traj)
+        geometric_collision_prob_traj = self._geometric_collision_forward(encoded_obs_exteroceptive, encoded_actions)
 
 
         # predict the state transitions between consecutive commands in robot frame
@@ -1122,6 +1169,8 @@ class FDMModelVelocityMultiStep(FDMModel):
         energy_traj = self.energy_predictor(forward_predict_state_obs)
         energy_traj = energy_traj.view(batch_size, traj_len, -1)
 
+        if geometric_collision_prob_traj is not None:
+            return state_traj, collision_prob_traj, energy_traj, geometric_collision_prob_traj
         return state_traj, collision_prob_traj, energy_traj
 
     @torch.jit.export
@@ -1225,8 +1274,8 @@ class FDMModelVelocitySingleStep(FDMModelVelocityMultiStep):
         hidden = torch.zeros(self.recurrence.num_layers, batch_size, self.recurrence.hidden_size, device=self.device)
         # init buffers for corr_vel, collision and engergy predictions
         corr_vel = torch.zeros(batch_size, traj_len, 3, device=self.device)
-        collision_logits_traj = self.collision_predictor.forward(forward_predict_state_obs).view(batch_size, traj_len)
-        collision_prob_traj = torch.sigmoid(collision_logits_traj)
+        collision_prob_traj = torch.zeros(batch_size, traj_len, device=self.device)
+        geometric_collision_prob_traj = self._geometric_collision_forward(encoded_obs_exteroceptive, encoded_actions)
 
         energy_traj = torch.zeros(batch_size, traj_len, device=self.device)
         last_corr_vel = torch.zeros(batch_size, 1, 3, device=self.device)
@@ -1297,6 +1346,8 @@ class FDMModelVelocitySingleStep(FDMModelVelocityMultiStep):
             collision_prob_traj = 1.0 - torch.prod(1.0 - collision_prob_traj + 1e-6, dim=-1)
 
 
+        if geometric_collision_prob_traj is not None:
+            return state_traj, collision_prob_traj, energy_traj, geometric_collision_prob_traj
         return state_traj, collision_prob_traj, energy_traj
 
 class FDMModelVelocitySingleStepHeightAdjust(FDMModel):
@@ -1413,6 +1464,9 @@ class FDMModelVelocitySingleStepHeightAdjust(FDMModel):
         curr_state = state[:, 0, :4]
         cummulative_yaw = torch.zeros(batch_size, device=self.device)
         state_traj = torch.zeros(batch_size, traj_len, 4, device=self.device)
+        geometric_collision_prob_traj = self._geometric_collision_forward(
+            self.obs_exteroceptive_encoder(obs_extereoceptive), encoded_actions
+        )
 
         for traj_idx in range(traj_len):
             # cut height scan
@@ -1477,6 +1531,8 @@ class FDMModelVelocitySingleStepHeightAdjust(FDMModel):
             collision_prob_traj = 1.0 - torch.prod(1.0 - collision_prob_traj + 1e-6, dim=-1)
 
 
+        if geometric_collision_prob_traj is not None:
+            return state_traj, collision_prob_traj, energy_traj, geometric_collision_prob_traj
         return state_traj, collision_prob_traj, energy_traj
 
     def height_scan_cut(self, curr_state, obs_extereoceptive: torch.Tensor, traj_idx: int) -> torch.Tensor:

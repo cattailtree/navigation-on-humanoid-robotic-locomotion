@@ -17,6 +17,7 @@ from collections.abc import Callable, Iterable, Sequence
 
 import hydra
 import omegaconf
+from .cvae_action_sampler import CVAEActionSampler
 
 
 def rfftfreq(samples: int, device: torch.device) -> torch.Tensor:
@@ -1058,6 +1059,10 @@ class BatchedMPPIOptimizer(Optimizer):
         upper_bound: Sequence[Sequence[float]],
         device: torch.device,
         batch_size: int = 1,
+        sampling_strategy: str = "gaussian",
+        cvae_checkpoint: str | None = None,
+        cvae_latent_dim: int = 16,
+        cvae_temperature: float = 1.0,
     ):
         super().__init__()
         self.planning_horizon = len(lower_bound)
@@ -1075,6 +1080,18 @@ class BatchedMPPIOptimizer(Optimizer):
         self.gamma = gamma
         self.num_iterations = num_iterations
         self.device = device
+        self.sampling_strategy = sampling_strategy
+
+        self.cvae_sampler: CVAEActionSampler | None = None
+        if self.sampling_strategy == "cvae":
+            self.cvae_sampler = CVAEActionSampler(
+                action_dim=self.action_dimension,
+                planning_horizon=self.planning_horizon,
+                latent_dim=cvae_latent_dim,
+                temperature=cvae_temperature,
+                checkpoint=cvae_checkpoint,
+                device=self.device,
+            )
 
     def reset(self, env_ids: Sequence[int]):
         # NOTE: to account for non-symmetric bounds, mean is computed as (ub - lb) / 2
@@ -1114,24 +1131,30 @@ class BatchedMPPIOptimizer(Optimizer):
 
         for k in range(self.num_iterations):
             # sample noise and update constrained variances
-            noise = torch.empty(
-                size=(
-                    self.population_size,
-                    BS,
-                    self.planning_horizon,
-                    self.action_dimension,
-                ),
-                device=self.device,
-            )
-            noise = truncated_normal_(noise)
+            cvae_context: torch.Tensor | None = kwargs.get("cvae_context", None)
 
             lb_dist = self.mean[env_ids] - self.lower_bound
             ub_dist = self.upper_bound - self.mean[env_ids]
             mv = torch.minimum(torch.square(lb_dist / 2), torch.square(ub_dist / 2))
             constrained_var = torch.minimum(mv, self.var)
-            population = noise.clone() * torch.sqrt(constrained_var)
-            # FIXME: test if better with prev code or this line
-            # population = noise.clone() * torch.sqrt(self.var)
+            if self.cvae_sampler is not None:
+                population = self.cvae_sampler.sample_population(
+                    self.mean[env_ids], self.population_size, context=cvae_context
+                )
+            else:
+                noise = torch.empty(
+                    size=(
+                        self.population_size,
+                        BS,
+                        self.planning_horizon,
+                        self.action_dimension,
+                    ),
+                    device=self.device,
+                )
+                noise = truncated_normal_(noise)
+                population = noise.clone()
+
+            population = population * torch.sqrt(constrained_var)
 
             # smoothed actions with noise
             population[:, :, 0, :] += self.beta * self.mean[env_ids, 0, :] + (1 - self.beta) * past_action

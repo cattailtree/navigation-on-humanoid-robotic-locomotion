@@ -20,7 +20,7 @@ import fdm.mdp as mdp
 if TYPE_CHECKING:
     from fdm.env_cfg.env_cfg_base import FDMCfg
 
-UNITREE_MODEL_DIR = "/data1/home/liao_junhong/fdm/unitree_model"
+UNITREE_MODEL_DIR = "C:/Users\Admin/fdm/unitree_model"
 
 @configclass
 class UnitreeArticulationCfg(ArticulationCfg):
@@ -75,7 +75,7 @@ from isaaclab.actuators import ImplicitActuatorCfg
 G1_CFG = UnitreeArticulationCfg(
     prim_path="{ENV_REGEX_NS}/Robot",
     spawn=UnitreeUsdFileCfg(
-        usd_path="/data1/home/liao_junhong/fdm/unitree_model/G1/29dof/usd/g1_29dof_rev_1_0/configuration/g1_29dof_rev_1_0_physics.usd"
+        usd_path="C:/Users\Admin/fdm/unitree_model/G1/29dof/usd/g1_29dof_rev_1_0/configuration/g1_29dof_rev_1_0_physics.usd"
     ),
     init_state=ArticulationCfg.InitialStateCfg(
         pos=(0.0, 0.0, 0.8),

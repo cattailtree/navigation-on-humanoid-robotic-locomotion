@@ -147,7 +147,7 @@ class FDMPlanner:
             device=self.device,
         )
         # -- get the feet index in the contact sensor
-        self.feet_idx, _ = self.env.scene.sensors["contact_forces"].find_bodies(".*FOOT")
+        self.feet_idx, _ = self.env.scene.sensors["contact_forces"].find_bodies("left_ankle_roll_link", "right_ankle_roll_link")
         self.feet_contact = torch.zeros(
             (self.env.num_envs, len(self.feet_idx)), dtype=torch.bool, device=self.env.device
         )
@@ -197,6 +197,22 @@ class FDMPlanner:
 
         # evaluation buffer
         goal_success = torch.zeros(goal_command.nb_generated_paths, dtype=torch.bool, device=self.env.device)
+
+        # Whether current path has ever reached the goal.
+        reached_once = torch.zeros(
+            self.env.num_envs,
+            dtype=torch.bool,
+            device=self.env.device,
+        )
+
+        # Pending metric records.
+        # Used because command/path buffers may not be updated in the same frame as termination.
+        pending_record = torch.zeros(self.env.num_envs, dtype=torch.bool, device=self.env.device)
+        pending_success = torch.zeros(self.env.num_envs, dtype=torch.bool, device=self.env.device)
+        pending_time = torch.zeros(self.env.num_envs, device=self.env.device)
+        pending_robot_length = torch.zeros(self.env.num_envs, device=self.env.device)
+        pending_rrt_length = torch.zeros(self.env.num_envs, device=self.env.device)
+
         traversed_path_length = torch.zeros(goal_command.nb_generated_paths, device=self.env.device)
         trajectory_time = torch.zeros(goal_command.nb_generated_paths, device=self.env.device)
         path_rrt_length = torch.zeros(goal_command.nb_generated_paths, device=self.env.device)
@@ -288,7 +304,6 @@ class FDMPlanner:
                 obs["planner_obs"]["states"] = self._state_history.clone()
                 obs["planner_obs"]["proprio_obs"] = self._proprio_obs_history.clone()
                 obs["planner_obs"]["extero_obs"] = obs["fdm_obs_exteroceptive"].clone()
-
                 # ablation studies
                 if self.args_cli.ablation_mode == "no_height_scan":
                     obs["planner_obs"]["extero_obs"] *= 0.0
@@ -321,44 +336,105 @@ class FDMPlanner:
             # Planner EVALUATION
             ###########################################################################################################
 
-            # make sure done and goal_reached environments are still updated
-            done_updated = dones & ~goal_command.prev_not_updated_envs
-            goal_reached_updated = goal_reached & ~goal_command.prev_not_updated_envs
-            # record evaluation metrics for done environments
-            goal_success[finished_path_counter : finished_path_counter + done_updated.sum()] = False
-            trajectory_time[finished_path_counter : finished_path_counter + done_updated.sum()] = (
-                episode_length_buf_temp[done_updated]
-            )
-            traversed_path_length[finished_path_counter : finished_path_counter + done_updated.sum()] = (
-                robot_trajectory_length[done_updated]
-            )
-            path_rrt_length[finished_path_counter : finished_path_counter + done_updated.sum()] = (
-                traversed_path_length_env_temp[done_updated]
-            )
-            finished_path_counter += int(done_updated.sum())
-            # record evaluation metrics for time-out = goal reached environments
-            goal_success[finished_path_counter : finished_path_counter + goal_reached_updated.sum()] = True
-            trajectory_time[finished_path_counter : finished_path_counter + goal_reached_updated.sum()] = (
-                episode_length_buf_temp[goal_reached_updated]
-            )
-            traversed_path_length[finished_path_counter : finished_path_counter + goal_reached_updated.sum()] = (
-                robot_trajectory_length[goal_reached_updated]
-            )
-            path_rrt_length[finished_path_counter : finished_path_counter + goal_reached_updated.sum()] = (
-                traversed_path_length_env_temp[goal_reached_updated]
-            )
-            finished_path_counter += int(goal_reached_updated.sum())
-            # update robot specific trajectory lentg buffer
+            # 1. Latch success for the current path.
+            # If the robot has ever reached the goal during this path, keep it as success,
+            # even if it later walks away, times out, or collides.
+            reached_once |= goal_reached
+
+            # 2. A path is terminal if the env reports either failure done or goal reached.
+            terminal_now = dones | goal_reached
+
+            # 3. Snapshot terminal results into pending buffers.
+            # This is important because command/path buffers can be updated/reset after termination,
+            # while prev_not_updated_envs may delay metric recording.
+            new_pending = terminal_now & ~pending_record
+
+            if torch.any(new_pending):
+                pending_record[new_pending] = True
+
+                # Success if this path has ever reached the goal before termination.
+                pending_success[new_pending] = reached_once[new_pending]
+
+                label_envs = torch.where(new_pending)[0]
+                self.planner.record_cvae_executed_outcomes(
+                    executed_actions=se2_velocity_b,
+                    env_ids=label_envs,
+                    outcome_success=pending_success[label_envs],
+                )
+
+                # Use temp buffers because env reset may overwrite episode/path values.
+                pending_time[new_pending] = episode_length_buf_temp[new_pending].to(pending_time.dtype)
+                pending_robot_length[new_pending] = robot_trajectory_length[new_pending].to(pending_robot_length.dtype)
+                pending_rrt_length[new_pending] = traversed_path_length_env_temp[new_pending].to(pending_rrt_length.dtype)
+
+                # Clear latch immediately for terminated envs.
+                # The pending buffers already saved the old path result.
+                # This prevents the next path after reset from inheriting success.
+                reached_once[new_pending] = False
+
+            # 4. Only write metric when the command generator says this env is updateable.
+            updated_mask = ~goal_command.prev_not_updated_envs
+            ready_to_record = pending_record & updated_mask
+
+            goal_reached_updated = ready_to_record & pending_success
+            done_updated = ready_to_record & ~pending_success
+
+            # Optional debug: these two must be mutually exclusive.
+            overlap = goal_reached_updated & done_updated
+            if torch.any(overlap):
+                print("[METRIC BUG] success/failure overlap:", torch.where(overlap)[0].tolist())
+
+            # 5. Record failed paths.
+            n_done = int(done_updated.sum())
+            if n_done > 0:
+                goal_success[finished_path_counter: finished_path_counter + n_done] = False
+                trajectory_time[finished_path_counter: finished_path_counter + n_done] = (
+                    pending_time[done_updated]
+                )
+                traversed_path_length[finished_path_counter: finished_path_counter + n_done] = (
+                    pending_robot_length[done_updated]
+                )
+                path_rrt_length[finished_path_counter: finished_path_counter + n_done] = (
+                    pending_rrt_length[done_updated]
+                )
+                finished_path_counter += n_done
+
+            # 6. Record successful paths.
+            n_goal = int(goal_reached_updated.sum())
+            if n_goal > 0:
+                goal_success[finished_path_counter: finished_path_counter + n_goal] = True
+                trajectory_time[finished_path_counter: finished_path_counter + n_goal] = (
+                    pending_time[goal_reached_updated]
+                )
+                traversed_path_length[finished_path_counter: finished_path_counter + n_goal] = (
+                    pending_robot_length[goal_reached_updated]
+                )
+                path_rrt_length[finished_path_counter: finished_path_counter + n_goal] = (
+                    pending_rrt_length[goal_reached_updated]
+                )
+                finished_path_counter += n_goal
+
+            # 7. Clear pending records that have been written.
+            if torch.any(ready_to_record):
+                pending_record[ready_to_record] = False
+                pending_success[ready_to_record] = False
+                pending_time[ready_to_record] = 0.0
+                pending_robot_length[ready_to_record] = 0.0
+                pending_rrt_length[ready_to_record] = 0.0
+
+            # 8. Update robot-specific trajectory length buffer.
             robot_trajectory_length += torch.norm(
                 self.env.scene.articulations["robot"].data.root_pos_w - robot_past_position, dim=-1
             )
             robot_past_position = self.env.scene.articulations["robot"].data.root_pos_w.clone()
-            robot_trajectory_length[dones] = 0
-            robot_trajectory_length[goal_reached] = 0
-            # overwrite the command trajectory length for the terminated environments
-            traversed_path_length_env_temp[dones] = goal_command.path_length_command[dones].clone()
-            traversed_path_length_env_temp[goal_reached] = goal_command.path_length_command[goal_reached].clone()
-            # store last episode_lenght
+
+            # 9. Reset trajectory length only for terminal envs.
+            robot_trajectory_length[terminal_now] = 0.0
+
+            # 10. Overwrite command trajectory length for terminated envs.
+            traversed_path_length_env_temp[terminal_now] = goal_command.path_length_command[terminal_now].clone()
+
+            # 11. Store last episode length.
             episode_length_buf_temp = self.env.episode_length_buf.clone()
 
             ###
@@ -388,6 +464,7 @@ class FDMPlanner:
                 print("[INFO] Planner Evaluation\n", table)
 
         # get final eval metrics
+        self.planner._flush_cvae_dataset()
         metrics = self._planner_eval_metrics(
             finished_path_counter, path_rrt_length, traversed_path_length, goal_success, trajectory_time
         )
@@ -395,8 +472,10 @@ class FDMPlanner:
         # print final evaluation
         self.print_metrics(metrics)
 
-        # dump results into yaml
-        dump_yaml(self.log_root_path + f"/planner_eval_metric_{applied_planner}.yaml", metrics)
+        # dump generated evaluation data to D: to avoid filling the C: workspace.
+        planner_eval_dir = os.path.abspath(os.path.join(r"D:\fdm_data", "planner_eval"))
+        os.makedirs(planner_eval_dir, exist_ok=True)
+        dump_yaml(os.path.join(planner_eval_dir, f"planner_eval_metric_{applied_planner}.yaml"), metrics)
 
         return metrics
 
@@ -425,8 +504,7 @@ class FDMPlanner:
         # extra imports when images should be recorded and define save paths
         if cameras is not None:
             # setup image save path
-            resume_path = get_checkpoint_path(self.log_root_path, self.cfg.load_run, self.cfg.load_checkpoint)
-            directory_path = os.path.dirname(resume_path)
+            directory_path = os.path.abspath(os.path.join(r"D:\fdm_data", "planning_render", self.cfg.load_run))
             if self.args_cli.mode == "plot":
                 render_path = os.path.join(directory_path, "Planning_render")
             else:
@@ -538,7 +616,21 @@ class FDMPlanner:
                 obs["planner_obs"]["states"] = self._state_history.clone()
                 obs["planner_obs"]["proprio_obs"] = self._proprio_obs_history.clone()
                 obs["planner_obs"]["extero_obs"] = obs["fdm_obs_exteroceptive"].clone()
+                sensor = self.env.scene.sensors["env_sensor"]
 
+                print("[ENV-SENSOR] pos_w[0] =", sensor.data.pos_w[0].detach().cpu().tolist(), flush=True)
+                print("[ENV-SENSOR] root_pos_w[0] =",
+                      self.env.scene.articulations["robot"].data.root_pos_w[0].detach().cpu().tolist(), flush=True)
+                print("[ENV-SENSOR] offset cfg =", sensor.cfg.offset.pos, flush=True)
+
+                z = sensor.data.ray_hits_w[..., 2]
+                print(
+                    "[ENV-SENSOR] ray_hits_z min/max/mean =",
+                    float(torch.nan_to_num(z, nan=0.0, posinf=0.0, neginf=0.0).min()),
+                    float(torch.nan_to_num(z, nan=0.0, posinf=0.0, neginf=0.0).max()),
+                    float(torch.nan_to_num(z, nan=0.0, posinf=0.0, neginf=0.0).mean()),
+                    flush=True,
+                )
                 # ablation studies
                 if self.args_cli.ablation_mode == "no_height_scan":
                     obs["planner_obs"]["extero_obs"] *= 0.0
@@ -718,46 +810,74 @@ class FDMPlanner:
         return torch.hstack((lin_vel_w[:, :2], ang_vel_w[:, 2].unsqueeze(1))).reshape(-1, TRAJ_DIM, 3)
 
     def _planner_eval_metrics(
-        self,
-        finished_path_counter: int,
-        path_rrt_length: torch.Tensor,
-        traversed_path_length: torch.Tensor,
-        goal_success: torch.Tensor,
-        trajectory_time: torch.Tensor,
+            self,
+            finished_path_counter: int,
+            path_rrt_length: torch.Tensor,
+            traversed_path_length: torch.Tensor,
+            goal_success: torch.Tensor,
+            trajectory_time: torch.Tensor,
     ) -> dict:
-        # success rate, fail rate and number of paths
+        def _safe_mean(x: torch.Tensor) -> float:
+            return x.float().mean().item() if x.numel() > 0 else float("nan")
+
+        # first slice finished samples
+        goal = goal_success[:finished_path_counter].bool()
+        rrt = path_rrt_length[:finished_path_counter].float()
+        trav = traversed_path_length[:finished_path_counter].float()
+        traj_time = trajectory_time[:finished_path_counter].float() * self.env.step_dt
+
+        print(
+            f"[METRIC-DBG] finished={finished_path_counter}, "
+            f"goal_numel={goal.numel()}, rrt_numel={rrt.numel()}, "
+            f"trav_numel={trav.numel()}, time_numel={traj_time.numel()}"
+        )
+
+        if goal.numel() == 0:
+            return {
+                "Finished Paths": {"Success": float("nan"), "Fail": float("nan"), "All": 0},
+                "SPL": {"Success": float("nan"), "Fail": float("nan"), "All": float("nan")},
+                "Mean Trajectory Time": {"Success": float("nan"), "Fail": float("nan"), "All": float("nan")},
+                "Mean Trajectory Length": {"Success": float("nan"), "Fail": float("nan"), "All": float("nan")},
+            }
+
+        success_mask = goal
+        fail_mask = ~goal
+
+        success_count = int(success_mask.sum().item())
+        fail_count = int(fail_mask.sum().item())
+
         metrics = {
             "Finished Paths": {
-                "Success": goal_success[:finished_path_counter].float().mean().item(),
-                "Fail": (~goal_success[:finished_path_counter]).float().mean().item(),
+                "Success": success_count / finished_path_counter,
+                "Fail": fail_count / finished_path_counter,
                 "All": finished_path_counter,
             }
         }
-        # SPL
-        spl = (
-            goal_success[:finished_path_counter].float()
-            * path_rrt_length[:finished_path_counter]
-            / torch.max(path_rrt_length[:finished_path_counter], traversed_path_length[:finished_path_counter])
-        )
+
+        # avoid 0/0 in SPL
+        denom = torch.maximum(rrt, trav)
+        spl = torch.zeros_like(denom)
+        valid = denom > 0
+        spl[valid] = success_mask[valid].float() * rrt[valid] / denom[valid]
+
         metrics["SPL"] = {
-            "Success": spl[goal_success[:finished_path_counter]].mean().item(),
-            "Fail": spl[~goal_success[:finished_path_counter]].mean().item(),
-            "All": spl.mean().item(),
+            "Success": _safe_mean(spl[success_mask]),
+            "Fail": _safe_mean(spl[fail_mask]),
+            "All": _safe_mean(spl),
         }
-        # mean trajectory time
-        mean_trajectory_time = trajectory_time[:finished_path_counter] * self.env.step_dt
+
         metrics["Mean Trajectory Time"] = {
-            "Success": mean_trajectory_time[goal_success[:finished_path_counter]].mean().item(),
-            "Fail": mean_trajectory_time[~goal_success[:finished_path_counter]].mean().item(),
-            "All": mean_trajectory_time.mean().item(),
+            "Success": _safe_mean(traj_time[success_mask]),
+            "Fail": _safe_mean(traj_time[fail_mask]),
+            "All": _safe_mean(traj_time),
         }
-        # mean trajectory length
-        mean_trajectory_length = traversed_path_length[:finished_path_counter]
+
         metrics["Mean Trajectory Length"] = {
-            "Success": mean_trajectory_length[goal_success[:finished_path_counter]].mean().item(),
-            "Fail": mean_trajectory_length[~goal_success[:finished_path_counter]].mean().item(),
-            "All": mean_trajectory_length.mean().item(),
+            "Success": _safe_mean(trav[success_mask]),
+            "Fail": _safe_mean(trav[fail_mask]),
+            "All": _safe_mean(trav),
         }
+
         return metrics
 
     @staticmethod

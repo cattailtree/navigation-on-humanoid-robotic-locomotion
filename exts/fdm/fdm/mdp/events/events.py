@@ -142,34 +142,70 @@ def reset_root_state_center(
 ):
     """Reset the asset root state to zero velocity, forward orientation and a linearly spaced position."""
 
-    # extract the used quantities (to enable type-hinting)
+    asset: Articulation = env.scene[asset_cfg.name]
+    root_states = asset.data.default_root_state[env_ids].clone()
+    origins = env.scene.env_origins[env_ids]
+
+    # positions: near env origin, tiny xy perturbation only
+    positions = root_states[:, :3].clone()
+    positions[:, :2] = origins[:, :2]
+    positions[:, 2] = origins[:, 2] + 0.80
+
+    # optional tiny xy noise
+    xy_noise = sample_uniform(-0.05, 0.05, (len(env_ids), 2), device=asset.device)
+    positions[:, :2] += xy_noise
+
+    # yaw: keep very small for humanoid stability
+    safe_yaw_min = -0.01
+    safe_yaw_max = 0.01
+    yaw_samples = sample_uniform(safe_yaw_min, safe_yaw_max, (len(env_ids), 1), device=asset.device)
+    orientations = quat_from_euler_xyz(
+        torch.zeros_like(yaw_samples),
+        torch.zeros_like(yaw_samples),
+        yaw_samples,
+    ).squeeze(1)
+
+    # zero root velocity
+    velocities = torch.zeros((len(env_ids), 6), device=asset.device)
+
+    # write root
+    asset.write_root_pose_to_sim(torch.cat([positions, orientations], dim=-1), env_ids=env_ids)
+    asset.write_root_velocity_to_sim(velocities, env_ids=env_ids)
+
+    # default joints, zero joint velocity
+    default_joint_pos = asset.data.default_joint_pos[env_ids].clone()
+    default_joint_vel = torch.zeros_like(asset.data.default_joint_vel[env_ids])
+    asset.write_joint_state_to_sim(default_joint_pos, default_joint_vel, env_ids=env_ids)
+
+def reset_root_state_paper_plot(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+):
+    """
+    Ultra-stable humanoid reset:
+    - keep default root orientation
+    - place robot at env origin with fixed safe z
+    - zero root velocity
+    """
+
     asset: RigidObject | Articulation = env.scene[asset_cfg.name]
-    # get default root state
     root_states = asset.data.default_root_state[env_ids].clone()
 
-    # positions (small perturbation to avoid spawning issues)
-    torch.manual_seed(0)
-    perturbation = torch.hstack([
-        sample_uniform(-0.2, 0.2, (len(env_ids), 2), device=asset.device),
-        torch.zeros((len(env_ids), 1), device=asset.device),
-    ])
-    perturbation[:, 2] = 0.1
     origins = env.scene.env_origins[env_ids]
+
+    # use default pose as much as possible
     positions = root_states[:, :3].clone()
-    # place x,y in world and set z relative to env origin
-    positions[:, :2] += origins[:, :2] + perturbation[:, :2]
+    orientations = root_states[:, 3:7].clone()
+
+    # place around env origin
+    positions[:, 0] = origins[:, 0] + root_states[:, 0]
+    positions[:, 1] = origins[:, 1] + root_states[:, 1]
     positions[:, 2] = origins[:, 2] + 0.8
-    # orientations
-    num_env_origins = torch.unique(env.scene.env_origins, dim=0).shape[0]
-    assets_per_origin = math.ceil(env.num_envs / num_env_origins)
-    yaw_orientation = torch.linspace(-torch.pi, torch.pi, assets_per_origin + 1, device=env.device)[:-1]
-    yaw_samples = yaw_orientation[env_ids % assets_per_origin]
-    orientations = quat_from_euler_xyz(torch.zeros_like(yaw_samples), torch.zeros_like(yaw_samples), yaw_samples)
 
-    # velocities
-    velocities = root_states[:, 7:13]
+    # zero root velocity
+    velocities = torch.zeros_like(root_states[:, 7:13])
 
-    # set into the physics simulation
     asset.write_root_pose_to_sim(torch.cat([positions, orientations], dim=-1), env_ids=env_ids)
     asset.write_root_velocity_to_sim(velocities, env_ids=env_ids)
 
@@ -179,78 +215,59 @@ def reset_root_state_paper_plot(
     env_ids: torch.Tensor,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ):
-    """Reset the asset root state to zero velocity, forward orientation and a linearly spaced position."""
+    """
+    Stable humanoid reset:
+    - reset root pose to safe standing pose
+    - reset root velocity to zero
+    - reset joint positions/velocities to default
+    """
 
-    # extract the used quantities (to enable type-hinting)
     asset: RigidObject | Articulation = env.scene[asset_cfg.name]
-    # get default root state
     root_states = asset.data.default_root_state[env_ids].clone()
-
-    torch.manual_seed(0)
-    # orientations
-    num_env_origins = torch.unique(env.scene.env_origins, dim=0).shape[0]
-    assets_per_origin = math.ceil(env.num_envs / num_env_origins)
-    yaw_orientation = torch.linspace(-torch.pi, torch.pi, assets_per_origin + 1, device=env.device)[:-1]
-    yaw_samples = yaw_orientation[env_ids % assets_per_origin]
-    yaw_samples = yaw_samples.view(num_env_origins, assets_per_origin).T.reshape(-1)
-    orientations = quat_from_euler_xyz(torch.zeros_like(yaw_samples), torch.zeros_like(yaw_samples), yaw_samples)
-    perturbation = quat_apply_yaw(
-        orientations, torch.tensor([[0.5, 0.0, 0.1]], device=asset.device).repeat(len(env_ids), 1)
-    )
     origins = env.scene.env_origins[env_ids]
+
+    # -----------------------------
+    # 1) reset root pose
+    # -----------------------------
     positions = root_states[:, :3].clone()
-    positions[:, :2] += origins[:, :2] + perturbation[:, :2]
+    orientations = root_states[:, 3:7].clone()
+
+    positions[:, 0] = origins[:, 0]
+    positions[:, 1] = origins[:, 1]
     positions[:, 2] = origins[:, 2] + 0.8
 
-    # velocities
-    velocities = root_states[:, 7:13]
+    velocities = torch.zeros_like(root_states[:, 7:13])
 
-    # set into the physics simulation
     asset.write_root_pose_to_sim(torch.cat([positions, orientations], dim=-1), env_ids=env_ids)
     asset.write_root_velocity_to_sim(velocities, env_ids=env_ids)
 
+    # -----------------------------
+    # 2) reset joints
+    # -----------------------------
+    if hasattr(asset.data, "default_joint_pos") and hasattr(asset.data, "default_joint_vel"):
+        joint_pos = asset.data.default_joint_pos[env_ids].clone()
+        joint_vel = torch.zeros_like(asset.data.default_joint_vel[env_ids])
 
-def reset_root_state_planner_paper_plot(
-    env: ManagerBasedEnv,
-    env_ids: torch.Tensor,
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-):
-    """Reset the asset root state to zero velocity, forward orientation and a linearly spaced position."""
+        # 1) 写实际关节状态
+        asset.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
 
-    # extract the used quantities (to enable type-hinting)
-    asset: RigidObject | Articulation = env.scene[asset_cfg.name]
-    # get default root state
-    root_states = asset.data.default_root_state[env_ids].clone()
+        # 2) 清 position / velocity / effort target
+        if hasattr(asset, "set_joint_position_target"):
+            asset.set_joint_position_target(joint_pos, env_ids=env_ids)
+        if hasattr(asset, "set_joint_velocity_target"):
+            asset.set_joint_velocity_target(joint_vel, env_ids=env_ids)
+        if hasattr(asset, "set_joint_effort_target"):
+            asset.set_joint_effort_target(torch.zeros_like(joint_pos), env_ids=env_ids)
 
-    # orientations
-    num_env_origins = torch.unique(env.scene.env_origins, dim=0).shape[0]
-    assets_per_origin = math.ceil(env.num_envs / num_env_origins)
-    if assets_per_origin == 1 and env.scene.env_origins.shape[0] == 5:
-        print("[INFO] Using fixed perturbation for single asset per origin and 5 origins.")
-        perturbatio_y = torch.tensor([1.0, 0.9, -1.5, -0.9, -1.0], device=env.device).unsqueeze(1)
-        perturbation = torch.hstack(
-            [torch.zeros_like(perturbatio_y), perturbatio_y, torch.tensor([[0.1]], device=env.device).repeat(5, 1)]
-        )
-    else:
-        perturbatio_y = torch.linspace(1.0, -1.0, assets_per_origin, device=env.device).unsqueeze(1)
-        perturbation = (
-            torch.hstack([
-                torch.zeros_like(perturbatio_y),
-                perturbatio_y,
-                torch.tensor([[0.1]], device=env.device).repeat(assets_per_origin, 1),
-            ])[None, :, :]
-            .repeat(num_env_origins, 1, 1)
-            .reshape(-1, 3)
-        )
-    # perturbation = torch.tensor([[0.0, -1.0, 0.1], [0.0, 1.0, 0.1]], device=asset.device)[None, :, :].repeat(num_env_origins, 1, 1).reshape(-1, 3)
-    origins = env.scene.env_origins[env_ids]
-    positions = root_states[:, :3].clone()
-    positions[:, :2] += origins[:, :2] + perturbation[env_ids][:, :2]
-    positions[:, 2] = origins[:, 2] + 0.8
-
-    # set into the physics simulation
-    asset.write_root_pose_to_sim(torch.cat([positions, root_states[:, 3:7]], dim=-1), env_ids=env_ids)
-    asset.write_root_velocity_to_sim(root_states[:, 7:13], env_ids=env_ids)
+        # 3) 再写一遍实际关节状态，覆盖可能的内部回写
+        asset.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
+    if hasattr(env, "action_manager") and hasattr(env.action_manager, "reset"):
+        try:
+            env.action_manager.reset(env_ids=env_ids)
+            print("[AUTO-RESET-DBG] action_manager.reset env_ids =", env_ids.detach().cpu().tolist(), flush=True)
+        except TypeError:
+            env.action_manager.reset(env_ids)
+            print("[AUTO-RESET-DBG] action_manager.reset(done_ids) =", env_ids.detach().cpu().tolist(), flush=True)
 
 
 ###
@@ -269,52 +286,83 @@ def reset_robot_position_planner(
 ):
     """Reset the asset root state to the spawn state defined by the command generator.
 
-    Args:
-        env: The environment object.
-        env_ids: The environment ids to reset.
-        asset_cfg: The asset configuration to reset. Defaults to SceneEntityCfg("robot").
+    G1-safe version:
+    - zero root velocity
+    - slightly higher root z
+    - slight crouch at reset for stability
     """
-    # extract the used quantities (to enable type-hinting)
     asset: Articulation = env.scene[asset_cfg.name]
+
     if isinstance(env.command_manager.get_term(goal_command_generator_name), GoalCommand | FixGoalCommand):
         goal_cmd_generator: GoalCommand = env.command_manager.get_term(goal_command_generator_name)  # type: ignore
     elif isinstance(env.command_manager.get_term(goal_command_generator_name), MixedCommand):
         mixed_cmd_geneator: MixedCommand = env.command_manager.get_term(goal_command_generator_name)  # type: ignore
         goal_cmd_generator: GoalCommand = mixed_cmd_geneator.get_subterm("planner")  # type: ignore
-    # elif isinstance(env.command_manager.get_term(goal_command_generator_name), FixGoalCommand):
-    #     positions = asset.data.default_root_state[env_ids, :3] + torch.randn((len(env_ids), 3), device=asset.device) * 0.1
     else:
         raise ValueError(f"Command type {type(env.command_manager._terms['command'])} not supported.")
 
-    # positions - based on given start points (command generator)
+    # ------------------------------------------------------------------
+    # 1) Root position
+    # ------------------------------------------------------------------
     positions = asset.data.default_root_state[env_ids, :3].clone()
     positions += goal_cmd_generator.pos_spawn_w[env_ids]
+
     origins = env.scene.env_origins[env_ids]
-    # place x,y in world (include env origin if spawn_in_env_frame)
     if spawn_in_env_frame:
         positions[:, :2] += origins[:, :2]
-    # enforce z relative to env origin to keep consistent height
-    positions[:, 2] = origins[:, 2] + 0.8
 
-    # yaw range
+    # More conservative z for humanoid reset
+    positions[:, 2] = origins[:, 2] + 0.85
+
+    # ------------------------------------------------------------------
+    # 2) Root orientation
+    # ------------------------------------------------------------------
     yaw_samples = sample_uniform(yaw_range[0], yaw_range[1], (len(env_ids), 1), device=asset.device)
     yaw_samples += goal_cmd_generator.heading_spawn_w[env_ids].unsqueeze(1)
     orientations = quat_from_euler_xyz(
-        torch.zeros_like(yaw_samples), torch.zeros_like(yaw_samples), yaw_samples
+        torch.zeros_like(yaw_samples),
+        torch.zeros_like(yaw_samples),
+        yaw_samples,
     ).squeeze(1)
 
-    # velocities
-    range_list = [velocity_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z", "roll", "pitch", "yaw"]]
-    ranges = torch.tensor(range_list, device=asset.device)
-    rand_samples = sample_uniform(ranges[:, 0], ranges[:, 1], (len(env_ids), 6), device=asset.device)
-    velocities = asset.data.default_root_state[env_ids, 7:13] + rand_samples
+    # ------------------------------------------------------------------
+    # 3) Root velocity: force zero for humanoid reset stability
+    # ------------------------------------------------------------------
+    velocities = torch.zeros((len(env_ids), 6), device=asset.device)
 
-    # set into the physics simulation
+    # write root state first
     asset.write_root_pose_to_sim(torch.cat([positions, orientations], dim=-1), env_ids=env_ids)
     asset.write_root_velocity_to_sim(velocities, env_ids=env_ids)
 
-    # obtain default joint positions
+    # ------------------------------------------------------------------
+    # 4) Joint state: default pose + slight crouch
+    # ------------------------------------------------------------------
     default_joint_pos = asset.data.default_joint_pos[env_ids].clone()
-    default_joint_vel = asset.data.default_joint_vel[env_ids].clone()
-    # set into the physics simulation
+    default_joint_vel = torch.zeros_like(asset.data.default_joint_vel[env_ids])
+
+    # cache joint ids
+    if not hasattr(asset, "_g1_reset_joint_ids"):
+        hip_pitch_ids, _ = asset.find_joints(["left_hip_pitch_joint", "right_hip_pitch_joint"])
+        knee_ids, _ = asset.find_joints(["left_knee_joint", "right_knee_joint"])
+        ankle_pitch_ids, _ = asset.find_joints(["left_ankle_pitch_joint", "right_ankle_pitch_joint"])
+
+        asset._g1_reset_joint_ids = {
+            "hip_pitch_ids": hip_pitch_ids,
+            "knee_ids": knee_ids,
+            "ankle_pitch_ids": ankle_pitch_ids,
+        }
+
+        print("[RESET DBG] hip_pitch_ids =", hip_pitch_ids)
+        print("[RESET DBG] knee_ids =", knee_ids)
+        print("[RESET DBG] ankle_pitch_ids =", ankle_pitch_ids)
+
+    hip_pitch_ids = asset._g1_reset_joint_ids["hip_pitch_ids"]
+    knee_ids = asset._g1_reset_joint_ids["knee_ids"]
+    ankle_pitch_ids = asset._g1_reset_joint_ids["ankle_pitch_ids"]
+
+    # slight crouch for stability
+    default_joint_pos[:, hip_pitch_ids] -= 0.15
+    default_joint_pos[:, knee_ids] += 0.30
+    default_joint_pos[:, ankle_pitch_ids] -= 0.15
+
     asset.write_joint_state_to_sim(default_joint_pos, default_joint_vel, env_ids=env_ids)

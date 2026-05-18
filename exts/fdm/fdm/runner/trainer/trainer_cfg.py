@@ -26,7 +26,7 @@ class TrainerBaseCfg:
     """Number of collection rounds for learning rate warmup. Scheduling will be applied after warmup."""
 
     # data collection and dataloader
-    num_samples: int = 80000  # Dec03 Model: 100000;  Nov19 Model: 80000
+    num_samples: int = 200000  # Dec03 Model: 100000;  Nov19 Model: 80000
     """Number of trajectories to collect per collection round."""
     num_workers: int = 4
     """Number of workers for the dataloader."""
@@ -48,7 +48,7 @@ class TrainerBaseCfg:
     """Real world datasets for training."""
     real_world_test_datasets: str | list[str] | None = None
     """Real world datasets for testing."""
-    small_motion_ratio: float | None = 0.1
+    small_motion_ratio: float | None = 0.2
     """Ratio of samples with small motion."""
     height_threshold: float | None = None
     """Filter samples based on height difference along the trajectory.
@@ -56,7 +56,7 @@ class TrainerBaseCfg:
     .. note::
         This is a special parameter for testing set generation and is not used during training.
     """
-    small_motion_threshold: float = 1.0
+    small_motion_threshold: float = 0.5
     """Threshold in meter to be considered a small motion.
 
     .. note::
@@ -72,7 +72,7 @@ class TrainerBaseCfg:
     # weight decay and learning rate
     weight_decay: float = 1e-4  # Dec03 Model: 5e-5;  Nov19 Model: 1e-4
     """Weight decay for the optimizer."""
-    learning_rate: float = 2e-3
+    learning_rate: float = 5e-3
     """Learning rate for the optimizer."""
 
     # saving and logging

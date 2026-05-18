@@ -113,6 +113,28 @@ class FDMBaseModelCfg(BaseModelCfg):
     """Whether to scale the loss with the progress of the learning."""
     unified_failure_prediction: bool = False
     """Summarize the failure predicition of each command into a unified value that is used for the cost."""
+    use_geometric_collision_head: bool = False
+    """Enable a separate geometry-driven collision head."""
+    geometric_collision_loss_weight: float = 0.0
+    """Loss weight for the geometric collision head."""
+    geometric_collision_extero_dim: int = 512
+    """Flattened encoded exteroceptive feature dimension used by the geometric collision head."""
+    geometric_collision_recurrence: BaseModelCfg.GRUConfig = BaseModelCfg.GRUConfig(
+        input_size=16 + 512, hidden_size=64, num_layers=1, dropout=0.0
+    )
+    """Recurrent layer for the geometric collision head."""
+    geometric_collision_predictor: BaseModelCfg.MLPConfig = BaseModelCfg.MLPConfig(
+        input=64, output=1, shape=[64], dropout=0.0, batchnorm=False, activation="LeakyReLU"
+    )
+    """Predictor for the per-step geometric collision probability."""
+    geometric_label_height_threshold: float = 0.25
+    """Height-scan value above which a cell is treated as a geometric obstacle for the auxiliary label."""
+    geometric_label_robot_radius: float = 0.20
+    """Approximate circular footprint radius used to build geometric collision labels from the height scan."""
+    geometric_label_scan_resolution: float = 0.1
+    """Resolution of the height scan used for geometric collision labels."""
+    geometric_label_forward_offset: float = 0.5
+    """Forward offset of the robot center in the height-scan image."""
     weight_inverse_distance: bool = False
     """Weight the position loss with the inverse distance to the goal.
 
@@ -155,6 +177,8 @@ class FDMBaseModelCfg(BaseModelCfg):
 class FDMHeightModelMultiStepCfg(FDMBaseModelCfg):
 
     class_type: type[FDMModelVelocityMultiStep] = FDMModelVelocityMultiStep
+    use_geometric_collision_head: bool = True
+    geometric_collision_loss_weight: float = 4.0
 
     obs_exteroceptive_encoder = FDMBaseModelCfg.CNNConfig(
         in_channels=1,
@@ -191,6 +215,11 @@ class FDMHeightModelMultiStepCfg(FDMBaseModelCfg):
         self.state_predictor.output = self.state_predictor.output * self.prediction_horizon
         self.collision_predictor.output = self.prediction_horizon
         self.energy_predictor.output = self.prediction_horizon
+        if self.use_geometric_collision_head:
+            self.geometric_collision_recurrence.input_size = (
+                self.action_encoder.output + self.geometric_collision_extero_dim
+            )
+            self.geometric_collision_predictor.output = 1
 
         # adjust input sizes of the predictor networks
         self.state_predictor.input = self.recurrence.hidden_size * self.prediction_horizon
@@ -266,6 +295,8 @@ class FDMModelVelocitySingleStepHeightAdjustCfg(FDMHeightModelSingleStepCfg):
             + self.collision_predictor.output
             + self.energy_predictor.output
         )
+        if self.use_geometric_collision_head:
+            self.geometric_collision_recurrence.input_size = self.action_encoder.output + 256
 
         # add height_scan_robot_center
         self.height_scan_robot_center = self.height_scan_shape[0] / 2, 0.5 / self.height_scan_res
