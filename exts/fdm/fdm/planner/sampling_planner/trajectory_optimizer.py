@@ -911,9 +911,19 @@ class SimpleSE2TrajectoryOptimizer:
         path_idx[..., 0] = torch.clamp(path_idx[..., 0], 0, H - 1)
         path_idx[..., 1] = torch.clamp(path_idx[..., 1], 0, W - 1)
 
-        # obstacle map: 1 means obstacle
-        obstacle_height_th = 0.08  # 8 cm 以上视为障碍，可再调
-        obstacle_map = height_scan > obstacle_height_th  # (BS, H, W)
+        finite_height_scan = height_scan.clone()
+        finite_height_scan[~torch.isfinite(finite_height_scan)] = torch.nan
+        ground_percentile = float(getattr(self.to_cfg, "state_cost_ground_percentile", 0.20))
+        obstacle_height_th = float(getattr(self.to_cfg, "state_cost_obstacle_height_th", 0.08))
+        ground_ref = torch.nanquantile(
+            finite_height_scan.reshape(BS, -1),
+            ground_percentile,
+            dim=1,
+        ).view(BS, 1, 1)
+        ground_ref = torch.nan_to_num(ground_ref, nan=0.0)
+
+        # height_scan is pelvis-relative in lab. Use height above local ground so lower obstacles are retained.
+        obstacle_map = (height_scan - ground_ref) > obstacle_height_th  # (BS, H, W)
 
         # distance-to-obstacle map, in meters
         dist_maps = torch.zeros_like(height_scan)
@@ -932,11 +942,10 @@ class SimpleSE2TrajectoryOptimizer:
 
         clearance = dist_maps[batch_idx, path_idx[..., 0], path_idx[..., 1]]
 
-        # 真正的“多远算近”
-        soft_dist_th = 0.3
-        hard_dist_th = 0.15
-        w_soft = 3.0
-        w_hard = 12.0
+        soft_dist_th = float(getattr(self.to_cfg, "state_cost_near_obstacle_soft_th", 0.30))
+        hard_dist_th = float(getattr(self.to_cfg, "state_cost_near_obstacle_hard_th", 0.15))
+        w_soft = float(getattr(self.to_cfg, "state_cost_w_near_obstacle_soft", 3.0))
+        w_hard = float(getattr(self.to_cfg, "state_cost_w_near_obstacle_hard", 12.0))
 
         cost = torch.zeros_like(clearance)
 

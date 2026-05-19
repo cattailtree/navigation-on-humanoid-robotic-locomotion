@@ -27,7 +27,7 @@ def modify_scene_cfg(scene_cfg: TerrainSceneCfg):
     # larger height scan
     scene_cfg.env_sensor = RayCasterCfg(
         prim_path="{ENV_REGEX_NS}/Robot/pelvis",
-        offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.5) if not LARGE_UNIFIED_HEIGHT_SCAN else (0.0, 0.0, 4.0)),
+        offset=RayCasterCfg.OffsetCfg(pos=(1.75, 0.0, 2.0) if not LARGE_UNIFIED_HEIGHT_SCAN else (0.0, 0.0, 4.0)),
         ray_alignment="yaw",
         pattern_cfg=patterns.GridPatternCfg(
             resolution=0.1, size=(4.5, 5.9) if not LARGE_UNIFIED_HEIGHT_SCAN else (7.9, 5.9)

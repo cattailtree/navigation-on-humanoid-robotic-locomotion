@@ -159,10 +159,14 @@ class TrajectoryOptimizerCfg:
     state_cost_early_goal_heading_offset: float = 0.3
 
     state_cost_w_early_stopping: float = 1.0
-    state_cost_w_near_obstacle_soft: float=8.0,
-    state_cost_w_near_obstacle_hard: float=30.0,
-    state_cost_near_obstacle_soft_th: float=0.10,
-    state_cost_near_obstacle_hard_th: float=0.20,
+    state_cost_w_near_obstacle_soft: float = 8.0
+    state_cost_w_near_obstacle_hard: float = 30.0
+    state_cost_near_obstacle_soft_th: float = 0.10
+    state_cost_near_obstacle_hard_th: float = 0.20
+    state_cost_obstacle_height_th: float = 0.08
+    """Minimum height above local ground to treat a height-scan cell as an obstacle."""
+    state_cost_ground_percentile: float = 0.20
+    """Lower height-scan percentile used as local ground reference for obstacle extraction."""
 
     # ----------------------------------------------------------------------
     # velocity tracking

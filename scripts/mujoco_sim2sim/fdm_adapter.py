@@ -244,6 +244,8 @@ class FDMPlannerAdapter(PlannerAdapter):
     scan_obstacle_weight: float = 1.0
     scan_obstacle_clearance: float = 0.30
     scan_obstacle_height_threshold: float = 0.08
+    scan_obstacle_relative_to_floor: bool = True
+    scan_floor_percentile: float = 5.0
     scan_use_footprint: bool = True
     scan_footprint_front: float = 0.45
     scan_footprint_back: float = 0.15
@@ -588,7 +590,7 @@ class FDMPlannerAdapter(PlannerAdapter):
             )
 
         height_np = np.asarray(height_scan, dtype=np.float32)
-        obstacle_np = height_np > self.scan_obstacle_height_threshold
+        obstacle_np = self._height_obstacle_mask(height_np)
         if not np.any(obstacle_np):
             return torch.full(
                 state_traj.shape[:2],
@@ -633,6 +635,15 @@ class FDMPlannerAdapter(PlannerAdapter):
         cost[footprint_clearance < self.near_obstacle_soft_distance] += self.near_obstacle_soft_weight
         cost[footprint_clearance < self.near_obstacle_hard_distance] += self.near_obstacle_hard_weight
         return cost.mean(dim=1) * self.scan_obstacle_weight
+
+    def _height_obstacle_mask(self, height_np: np.ndarray) -> np.ndarray:
+        if not self.scan_obstacle_relative_to_floor:
+            return height_np > self.scan_obstacle_height_threshold
+        finite_height = height_np[np.isfinite(height_np)]
+        if finite_height.size == 0:
+            return np.zeros_like(height_np, dtype=bool)
+        floor_height = float(np.percentile(finite_height, self.scan_floor_percentile))
+        return (height_np - floor_height) > self.scan_obstacle_height_threshold
 
     def _obstacle_speed_cost(self, footprint_clearance: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
         if self.near_obstacle_speed_weight <= 0.0:
@@ -789,7 +800,7 @@ class FDMPlannerAdapter(PlannerAdapter):
 
     def _front_obstacle_clearance(self, height_scan: np.ndarray) -> float:
         height_np = np.asarray(height_scan, dtype=np.float32)
-        obstacle_np = height_np > self.scan_obstacle_height_threshold
+        obstacle_np = self._height_obstacle_mask(height_np)
         if not np.any(obstacle_np):
             return float("inf")
 

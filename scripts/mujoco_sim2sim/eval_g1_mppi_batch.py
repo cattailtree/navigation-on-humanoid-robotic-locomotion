@@ -33,6 +33,7 @@ class EpisodeResult:
     final_y: float
     final_yaw: float
     goal_distance: float
+    goal_x_error: float
     yaw_error: float
     path_length: float
     min_height: float
@@ -40,6 +41,13 @@ class EpisodeResult:
     max_pitch: float
     max_ctrl_abs: float
     max_obstacle_pixels: int
+    max_height_fdm_hit_count: int
+    max_height_fdm_geom_count: int
+    height_fdm_x_min: float
+    height_fdm_x_max: float
+    height_fdm_y_min: float
+    height_fdm_y_max: float
+    height_top_geoms_at_max_fdm_hits: str
     max_fdm_risk: float
     max_fdm_scan_cost: float
     illegal_contact_steps: int
@@ -80,11 +88,12 @@ def parse_args() -> argparse.Namespace:
         default="planner_eval",
     )
     parser.add_argument("--height-scan", choices=("flat", "raycast"), default="raycast")
-    parser.add_argument("--height-scan-z-start", type=float, default=0.5)
+    parser.add_argument("--height-scan-z-start", type=float, default=2.0)
     parser.add_argument("--height-scan-offset-x", type=float, default=0.0)
     parser.add_argument("--height-scan-offset-y", type=float, default=0.0)
     parser.add_argument("--goal", type=float, nargs=3, metavar=("X", "Y", "YAW"), default=Sim2SimConfig.goal_xy_yaw)
-    parser.add_argument("--success-distance", type=float, default=0.5)
+    parser.add_argument("--success-distance", type=float, default=0.7)
+    parser.add_argument("--success-x-distance", type=float, default=0.4)
     parser.add_argument("--success-yaw", type=float, default=math.pi)
     parser.add_argument("--fall-height", type=float, default=0.35)
     parser.add_argument("--fall-roll-pitch", type=float, default=1.0)
@@ -172,6 +181,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fdm-scan-obstacle-weight", type=float, default=1.0)
     parser.add_argument("--fdm-scan-obstacle-clearance", type=float, default=0.30)
     parser.add_argument("--fdm-scan-obstacle-height-threshold", type=float, default=0.08)
+    parser.add_argument("--fdm-scan-obstacle-relative-to-floor", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--fdm-scan-floor-percentile", type=float, default=5.0)
     parser.add_argument("--fdm-scan-use-footprint", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--fdm-scan-footprint-front", type=float, default=0.45)
     parser.add_argument("--fdm-scan-footprint-back", type=float, default=0.15)
@@ -261,6 +272,13 @@ def run_episode(
     max_pitch = 0.0
     max_ctrl_abs = 0.0
     max_obstacle_pixels = 0
+    max_height_fdm_hit_count = 0
+    max_height_fdm_geom_count = 0
+    height_fdm_x_min = float("nan")
+    height_fdm_x_max = float("nan")
+    height_fdm_y_min = float("nan")
+    height_fdm_y_max = float("nan")
+    height_top_geoms_at_max_fdm_hits = ""
     max_fdm_risk = 0.0
     max_fdm_scan_cost = 0.0
     illegal_contact_steps = 0
@@ -296,8 +314,25 @@ def run_episode(
         max_roll = max(max_roll, roll)
         max_pitch = max(max_pitch, pitch)
         max_ctrl_abs = max(max_ctrl_abs, float(np.max(np.abs(env.data.ctrl))) if env.model.nu else 0.0)
-        obstacle_pixels = int(np.count_nonzero(height_scan_obs > args.fdm_scan_obstacle_height_threshold))
+        obstacle_pixels = _count_obstacle_pixels(
+            height_scan_obs,
+            threshold=args.fdm_scan_obstacle_height_threshold,
+            relative_to_floor=args.fdm_scan_obstacle_relative_to_floor,
+            floor_percentile=args.fdm_scan_floor_percentile,
+        )
         max_obstacle_pixels = max(max_obstacle_pixels, obstacle_pixels)
+        scan_debug = env.height_scan.debug_info() if hasattr(env.height_scan, "debug_info") else {}
+        fdm_hit_count = int(scan_debug.get("height_fdm_hit_count", 0) or 0)
+        fdm_geom_count = int(scan_debug.get("height_fdm_geom_count", 0) or 0)
+        if fdm_hit_count > max_height_fdm_hit_count:
+            max_height_fdm_hit_count = fdm_hit_count
+            height_top_geoms_at_max_fdm_hits = str(scan_debug.get("height_top_geoms", ""))
+        max_height_fdm_geom_count = max(max_height_fdm_geom_count, fdm_geom_count)
+        if fdm_hit_count > 0:
+            height_fdm_x_min = _nanmin(height_fdm_x_min, float(scan_debug.get("height_fdm_x_min", float("nan"))))
+            height_fdm_x_max = _nanmax(height_fdm_x_max, float(scan_debug.get("height_fdm_x_max", float("nan"))))
+            height_fdm_y_min = _nanmin(height_fdm_y_min, float(scan_debug.get("height_fdm_y_min", float("nan"))))
+            height_fdm_y_max = _nanmax(height_fdm_y_max, float(scan_debug.get("height_fdm_y_max", float("nan"))))
         debug = planner.debug_info()
         risk = float(debug.get("fdm_best_risk_max", 0.0))
         scan_cost = float(debug.get("fdm_cost_scan_obstacle", 0.0))
@@ -313,8 +348,12 @@ def run_episode(
             illegal_contact_streak = 0
         max_illegal_contact_streak = max(max_illegal_contact_streak, illegal_contact_streak)
 
-        distance, yaw_error = _goal_error(pose, goal)
-        goal_reached = distance <= args.success_distance and yaw_error <= args.success_yaw
+        distance, x_error, yaw_error = _goal_error(pose, goal)
+        goal_reached = (
+            distance <= args.success_distance
+            and x_error <= args.success_x_distance
+            and yaw_error <= args.success_yaw
+        )
         if goal_reached and not reached_once:
             reached_once = True
             reached_step = step_idx
@@ -330,7 +369,7 @@ def run_episode(
             break
     else:
         pose = env.base_xyz_rpy()
-        distance, yaw_error = _goal_error(pose, goal)
+        distance, x_error, yaw_error = _goal_error(pose, goal)
 
     if status != "success" and reached_once:
         status = "success"
@@ -338,7 +377,7 @@ def run_episode(
     wall_time = time.perf_counter() - wall_start
     sim_time = (step_idx + 1) * args.control_decimation * float(args.physics_dt)
     pose = env.base_xyz_rpy()
-    distance, yaw_error = _goal_error(pose, goal)
+    distance, x_error, yaw_error = _goal_error(pose, goal)
     return EpisodeResult(
         episode=episode,
         seed=seed,
@@ -351,6 +390,7 @@ def run_episode(
         final_y=float(pose[1]),
         final_yaw=float(pose[5]),
         goal_distance=distance,
+        goal_x_error=x_error,
         yaw_error=yaw_error,
         path_length=path_length,
         min_height=min_height,
@@ -358,6 +398,13 @@ def run_episode(
         max_pitch=max_pitch,
         max_ctrl_abs=max_ctrl_abs,
         max_obstacle_pixels=max_obstacle_pixels,
+        max_height_fdm_hit_count=max_height_fdm_hit_count,
+        max_height_fdm_geom_count=max_height_fdm_geom_count,
+        height_fdm_x_min=height_fdm_x_min,
+        height_fdm_x_max=height_fdm_x_max,
+        height_fdm_y_min=height_fdm_y_min,
+        height_fdm_y_max=height_fdm_y_max,
+        height_top_geoms_at_max_fdm_hits=height_top_geoms_at_max_fdm_hits,
         max_fdm_risk=max_fdm_risk,
         max_fdm_scan_cost=max_fdm_scan_cost,
         illegal_contact_steps=illegal_contact_steps,
@@ -450,6 +497,8 @@ def _make_planner(args: argparse.Namespace):
         scan_obstacle_weight=args.fdm_scan_obstacle_weight,
         scan_obstacle_clearance=args.fdm_scan_obstacle_clearance,
         scan_obstacle_height_threshold=args.fdm_scan_obstacle_height_threshold,
+        scan_obstacle_relative_to_floor=args.fdm_scan_obstacle_relative_to_floor,
+        scan_floor_percentile=args.fdm_scan_floor_percentile,
         scan_use_footprint=args.fdm_scan_use_footprint,
         scan_footprint_front=args.fdm_scan_footprint_front,
         scan_footprint_back=args.fdm_scan_footprint_back,
@@ -481,10 +530,44 @@ def _make_height_scan(args: argparse.Namespace):
     return FlatHeightScan(shape=Sim2SimConfig.height_scan_shape, resolution=Sim2SimConfig.height_scan_resolution)
 
 
-def _goal_error(pose: np.ndarray, goal: np.ndarray) -> tuple[float, float]:
+def _goal_error(pose: np.ndarray, goal: np.ndarray) -> tuple[float, float, float]:
     distance = float(np.linalg.norm(pose[:2].astype(np.float64) - goal[:2].astype(np.float64)))
+    x_error = float(abs(float(goal[0]) - float(pose[0])))
     yaw_error = float(abs(math.atan2(math.sin(float(goal[2] - pose[5])), math.cos(float(goal[2] - pose[5])))))
-    return distance, yaw_error
+    return distance, x_error, yaw_error
+
+
+def _count_obstacle_pixels(
+    height_scan: np.ndarray,
+    *,
+    threshold: float,
+    relative_to_floor: bool,
+    floor_percentile: float,
+) -> int:
+    height = np.asarray(height_scan, dtype=np.float32)
+    if not relative_to_floor:
+        return int(np.count_nonzero(height > threshold))
+    finite_height = height[np.isfinite(height)]
+    if finite_height.size == 0:
+        return 0
+    floor_height = float(np.percentile(finite_height, floor_percentile))
+    return int(np.count_nonzero((height - floor_height) > threshold))
+
+
+def _nanmin(current: float, value: float) -> float:
+    if math.isnan(current):
+        return value
+    if math.isnan(value):
+        return current
+    return min(current, value)
+
+
+def _nanmax(current: float, value: float) -> float:
+    if math.isnan(current):
+        return value
+    if math.isnan(value):
+        return current
+    return max(current, value)
 
 
 def _write_summary(path: Path, rows: list[EpisodeResult]) -> None:

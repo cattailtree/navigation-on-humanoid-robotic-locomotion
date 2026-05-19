@@ -128,6 +128,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fdm-scan-obstacle-weight", type=float, default=1.0)
     parser.add_argument("--fdm-scan-obstacle-clearance", type=float, default=0.30)
     parser.add_argument("--fdm-scan-obstacle-height-threshold", type=float, default=0.08)
+    parser.add_argument("--fdm-scan-obstacle-relative-to-floor", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--fdm-scan-floor-percentile", type=float, default=5.0)
     parser.add_argument("--fdm-scan-use-footprint", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--fdm-scan-footprint-front", type=float, default=0.45)
     parser.add_argument("--fdm-scan-footprint-back", type=float, default=0.15)
@@ -140,7 +142,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fdm-front-obstacle-min-vx", type=float, default=0.30)
     parser.add_argument("--height-scan-offset-x", type=float, default=0.0)
     parser.add_argument("--height-scan-offset-y", type=float, default=0.0)
-    parser.add_argument("--height-scan-z-start", type=float, default=0.5)
+    parser.add_argument("--height-scan-z-start", type=float, default=2.0)
     parser.add_argument("--fdm-stabilize-command", action="store_true")
     parser.add_argument("--fdm-yaw-command-limit", type=float, default=0.45)
     parser.add_argument("--fdm-lateral-command-limit", type=float, default=0.04)
@@ -374,6 +376,8 @@ def main() -> None:
             scan_obstacle_weight=args.fdm_scan_obstacle_weight,
             scan_obstacle_clearance=args.fdm_scan_obstacle_clearance,
             scan_obstacle_height_threshold=args.fdm_scan_obstacle_height_threshold,
+            scan_obstacle_relative_to_floor=args.fdm_scan_obstacle_relative_to_floor,
+            scan_floor_percentile=args.fdm_scan_floor_percentile,
             scan_use_footprint=args.fdm_scan_use_footprint,
             scan_footprint_front=args.fdm_scan_footprint_front,
             scan_footprint_back=args.fdm_scan_footprint_back,
@@ -454,6 +458,13 @@ def main() -> None:
                 "height_mean",
                 "height_std",
                 "height_obstacle_pixels",
+                "height_fdm_hit_count",
+                "height_fdm_geom_count",
+                "height_fdm_x_min",
+                "height_fdm_x_max",
+                "height_fdm_y_min",
+                "height_fdm_y_max",
+                "height_top_geoms",
                 *debug_columns,
             ]
         )
@@ -482,6 +493,13 @@ def main() -> None:
                 "height_mean",
                 "height_std",
                 "height_obstacle_pixels",
+                "height_fdm_hit_count",
+                "height_fdm_geom_count",
+                "height_fdm_x_min",
+                "height_fdm_x_max",
+                "height_fdm_y_min",
+                "height_fdm_y_max",
+                "height_top_geoms",
                 *debug_columns,
             ]
         )
@@ -505,7 +523,13 @@ def main() -> None:
         height_max = float(np.max(height_scan_obs))
         height_mean = float(np.mean(height_scan_obs))
         height_std = float(np.std(height_scan_obs))
-        height_obstacle_pixels = int(np.count_nonzero(height_scan_obs > args.fdm_scan_obstacle_height_threshold))
+        height_obstacle_pixels = _count_obstacle_pixels(
+            height_scan_obs,
+            threshold=args.fdm_scan_obstacle_height_threshold,
+            relative_to_floor=args.fdm_scan_obstacle_relative_to_floor,
+            floor_percentile=args.fdm_scan_floor_percentile,
+        )
+        scan_debug = env.height_scan.debug_info() if hasattr(env.height_scan, "debug_info") else {}
         debug_info = planner.debug_info()
         if csv_writer is not None:
             csv_writer.writerow(
@@ -521,6 +545,13 @@ def main() -> None:
                     height_mean,
                     height_std,
                     height_obstacle_pixels,
+                    scan_debug.get("height_fdm_hit_count", 0),
+                    scan_debug.get("height_fdm_geom_count", 0),
+                    scan_debug.get("height_fdm_x_min", np.nan),
+                    scan_debug.get("height_fdm_x_max", np.nan),
+                    scan_debug.get("height_fdm_y_min", np.nan),
+                    scan_debug.get("height_fdm_y_max", np.nan),
+                    scan_debug.get("height_top_geoms", ""),
                     *[debug_info.get(column, np.nan) for column in debug_columns],
                 ]
             )
@@ -531,13 +562,31 @@ def main() -> None:
                 f"[SIM2SIM] step={step_idx} xyz_rpy={pose.round(3).tolist()} "
                 f"cmd={[round(command.vx, 3), round(command.vy, 3), round(command.wz, 3)]} "
                 f"ctrl_abs_max={ctrl_abs_max:.3f} "
-                f"height=[{height_min:.3f},{height_max:.3f},{height_mean:.3f},{height_std:.3f};obs={height_obstacle_pixels}]"
+                f"height=[{height_min:.3f},{height_max:.3f},{height_mean:.3f},{height_std:.3f};"
+                f"obs={height_obstacle_pixels};fdm_hits={scan_debug.get('height_fdm_hit_count', 0)}]"
             )
 
     if csv_file is not None:
         csv_file.close()
 
     print("[SIM2SIM] Smoke test completed.")
+
+
+def _count_obstacle_pixels(
+    height_scan: np.ndarray,
+    *,
+    threshold: float,
+    relative_to_floor: bool,
+    floor_percentile: float,
+) -> int:
+    height = np.asarray(height_scan, dtype=np.float32)
+    if not relative_to_floor:
+        return int(np.count_nonzero(height > threshold))
+    finite_height = height[np.isfinite(height)]
+    if finite_height.size == 0:
+        return 0
+    floor_height = float(np.percentile(finite_height, floor_percentile))
+    return int(np.count_nonzero((height - floor_height) > threshold))
 
 
 if __name__ == "__main__":

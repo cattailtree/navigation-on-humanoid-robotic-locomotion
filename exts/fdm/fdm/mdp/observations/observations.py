@@ -572,143 +572,6 @@ def base_collision_obs(
     )
     return collision.unsqueeze(-1)   # (N, 1)
 
-def hard_faliure(
-    env: ManagerBasedRLEnv,
-    body_force_threshold: float = 40.0,
-    feet_support_threshold: float = 10.0,
-    min_base_height: float = 0.45,
-    max_abs_roll: float = 0.8,
-    max_abs_pitch: float = 0.8,
-    stuck_steps: int = 50,
-    min_progress: float = 0.003,
-    command_threshold: float = 0.15,
-    sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_forces"),
-    feet_cfg: SceneEntityCfg | None = None,
-    K: int = 2,
-) -> torch.Tensor:
-    """
-    Humanoid-friendly hard failure signal.
-
-    Covers:
-      1) bad body contact (wall, torso/thigh hit, etc.)
-      2) fallen / bad attitude / low base height
-      3) stuck with non-trivial command
-
-    Returns a one-step pulse:
-      True only when the debounce counter first reaches K.
-    """
-    device = env.device
-    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
-    net_contact_forces = contact_sensor.data.net_forces_w_history  # (N, T, B, 3)
-
-    robot = env.scene.articulations["robot"]
-
-    # --------------------------------------------------
-    # 1) Bad body contact
-    # --------------------------------------------------
-    body_force = torch.norm(net_contact_forces[:, :, sensor_cfg.body_ids], dim=-1)  # (N,T,B)
-    body_force_last = body_force[:, -1, :]                                          # (N,B)
-    body_force_peak = torch.max(body_force_last, dim=1)[0]                          # (N,)
-    bad_contact = body_force_peak > body_force_threshold
-
-    # --------------------------------------------------
-    # 2) Feet support
-    # --------------------------------------------------
-    if feet_cfg is not None:
-        feet_force = torch.norm(net_contact_forces[:, :, feet_cfg.body_ids], dim=-1)  # (N, T, nfeet)
-        feet_last = feet_force[:, -1, :]  # use latest frame, not max over history
-        support_sum = torch.sum(feet_last, dim=-1)
-        low_support = support_sum < feet_support_threshold
-    else:
-        low_support = torch.zeros(env.num_envs, device=device, dtype=torch.bool)
-
-    # --------------------------------------------------
-    # 3) Fallen / unstable
-    # --------------------------------------------------
-    root_pos = robot.data.root_pos_w  # (N, 3)
-    root_quat = robot.data.root_quat_w  # IsaacLab usually wxyz
-    roll, pitch, yaw = math_utils.euler_xyz_from_quat(root_quat)
-
-    low_height = root_pos[:, 2] < min_base_height
-    bad_attitude = (torch.abs(roll) > max_abs_roll) | (torch.abs(pitch) > max_abs_pitch)
-
-    fallen = low_height | (bad_attitude & low_support)
-
-    # --------------------------------------------------
-    # 4) Stuck
-    # --------------------------------------------------
-    if hasattr(env, "_last_applied_action"):
-        cmd = env._last_applied_action
-    else:
-        cmd = torch.zeros(env.num_envs, 3, device=device)
-
-    cmd_mag = torch.norm(cmd[:, :2], dim=-1) + 0.5 * torch.abs(cmd[:, 2])
-    trying_to_move = cmd_mag > command_threshold
-
-    if not hasattr(env, "_stuck_counter"):
-        env._stuck_counter = torch.zeros(env.num_envs, device=device, dtype=torch.long)
-    if not hasattr(env, "_stuck_prev_pos"):
-        env._stuck_prev_pos = root_pos[:, :2].clone()
-
-    progress = torch.norm(root_pos[:, :2] - env._stuck_prev_pos, dim=-1)
-    env._stuck_prev_pos = root_pos[:, :2].clone()
-
-    stuck_now = trying_to_move & (progress < min_progress)
-    env._stuck_counter[stuck_now] += 1
-    env._stuck_counter[~stuck_now] = 0
-
-    stuck = env._stuck_counter >= stuck_steps-45
-
-    # --------------------------------------------------
-    # 5) Aggregate
-    # --------------------------------------------------
-    hard_now = bad_contact | fallen | stuck
-
-    # --------------------------------------------------
-    # 6) Debounce with one-shot pulse
-    # --------------------------------------------------
-    if not hasattr(env, "_hard_failure_counter"):
-        env._hard_failure_counter = torch.zeros(env.num_envs, device=device, dtype=torch.long)
-
-    env._hard_failure_counter[hard_now] += 1
-    env._hard_failure_counter[~hard_now] = 0
-
-    hard_trigger = env._hard_failure_counter >= K-1
-
-    # reset counter after firing once
-    env._hard_failure_counter[hard_trigger] = 0
-
-    return hard_trigger
-def hard_faliure_obs(
-    env: ManagerBasedRLEnv,
-    body_force_threshold: float = 40.0,
-    feet_support_threshold: float = 10.0,
-    min_base_height: float = 0.45,
-    max_abs_roll: float = 0.8,
-    max_abs_pitch: float = 0.8,
-    stuck_steps: int = 50,
-    min_progress: float = 0.003,
-    command_threshold: float = 0.15,
-    sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_forces"),
-    feet_cfg: SceneEntityCfg | None = None,
-    K: int = 2,
-) -> torch.Tensor:
-    collision=hard_faliure(
-        env=env,
-
-        body_force_threshold=body_force_threshold,
-        feet_support_threshold=feet_support_threshold,
-        min_base_height=min_base_height,
-        max_abs_roll=max_abs_roll,
-        max_abs_pitch=max_abs_pitch,
-        stuck_steps=stuck_steps,
-        min_progress=min_progress,
-        command_threshold=command_threshold,
-        sensor_cfg=sensor_cfg,
-        feet_cfg=feet_cfg,
-        K=K,
-    )
-    return collision.unsqueeze(-1)
 """
 Actions.
 """
@@ -852,6 +715,32 @@ def hard_faliure(
     env._stuck_counter[~stuck_now] = 0
 
     stuck = env._stuck_counter >= stuck_steps
+
+    slow_cmd_active = cmd_mag > 0.08
+    slow_stuck_steps = 80
+    slow_stuck_min_distance = 0.08
+
+    if not hasattr(env, "_slow_stuck_counter"):
+        env._slow_stuck_counter = torch.zeros(env.num_envs, device=device, dtype=torch.long)
+    if not hasattr(env, "_slow_stuck_start_pos"):
+        env._slow_stuck_start_pos = root_pos[:, :2].clone()
+
+    reset_slow_window = ~slow_cmd_active
+    env._slow_stuck_counter[reset_slow_window] = 0
+    env._slow_stuck_start_pos[reset_slow_window] = root_pos[reset_slow_window, :2].clone()
+
+    start_slow_window = slow_cmd_active & (env._slow_stuck_counter == 0)
+    env._slow_stuck_start_pos[start_slow_window] = root_pos[start_slow_window, :2].clone()
+    env._slow_stuck_counter[slow_cmd_active] += 1
+
+    slow_window_distance = torch.norm(root_pos[:, :2] - env._slow_stuck_start_pos, dim=-1)
+    slow_stuck = (
+        slow_cmd_active
+        & (env._slow_stuck_counter >= slow_stuck_steps)
+        & (slow_window_distance < slow_stuck_min_distance)
+    )
+
+    stuck |= slow_stuck
 
     # --------------------------------------------------
     # 5) Near obstacle in front (cheap patch)

@@ -496,11 +496,25 @@ class ReplayBuffer:
         )
         sampling_mask |= first_valid
 
-        # ==================================================
-        # HARD RULE:
-        # never write a sample whose CURRENT frame is already collision.
-        # This is the only reliable way to kill "initial collision" at buffer level.
-        # ==================================================
+        terminal_mask = (
+            colliding_envs
+            & self._collector_armed
+            & self._has_touched_ground
+            & (arm_steps > 0)
+            & ~self.env_buffer_filled
+        )
+
+        terminal_idxs = self._ALL_INDICES[terminal_mask]
+        if len(terminal_idxs) > 0:
+            self._write_terminal_and_fill(
+                terminal_idxs,
+                obersevations_exteroceptive,
+                actions,
+                add_observation_exteroceptive,
+            )
+            self.reset_local_history(terminal_idxs)
+
+        sampling_mask &= ~terminal_mask
         sampling_mask &= ~colliding_envs
 
         # quadruped-style protection can stay, but is now mostly redundant
@@ -546,3 +560,54 @@ class ReplayBuffer:
             )
 
         self.fill_idx[updatable_idxs] += 1
+
+    def _write_terminal_and_fill(
+        self,
+        env_ids: torch.Tensor,
+        obersevations_exteroceptive: torch.Tensor | None,
+        actions: torch.Tensor,
+        add_observation_exteroceptive: torch.Tensor | None,
+    ):
+        """Write the terminal frame and make the remaining fixed buffer an absorbing terminal state."""
+        env_ids = env_ids.to(self.device, dtype=torch.long)
+        write_idx = self.fill_idx[env_ids]
+
+        self.states[env_ids, write_idx] = self.local_state_history[env_ids].clone()
+        self.observations_proprioceptive[env_ids, write_idx] = (
+            self.local_proprioceptive_observation_history[env_ids].clone()
+        )
+        self.actions[env_ids, write_idx] = actions[env_ids].to(self.device)
+
+        if self._has_exteroceptive_observation:
+            self.observations_exteroceptive[env_ids, write_idx] = (
+                obersevations_exteroceptive[env_ids]
+                .to(self.device)
+                .type(getattr(torch, self.cfg.exteroceptive_obs_precision))
+            )
+
+        if self._has_add_exteroceptive_observation:
+            self.add_observations_exteroceptive[env_ids, write_idx] = (
+                add_observation_exteroceptive[env_ids]
+                .to(self.device)
+                .type(getattr(torch, self.cfg.exteroceptive_obs_precision))
+            )
+
+        for env_id, terminal_idx in zip(env_ids.tolist(), write_idx.tolist()):
+            terminal_idx = int(terminal_idx)
+            if terminal_idx + 1 >= self.cfg.trajectory_length:
+                continue
+            self.states[env_id, terminal_idx + 1 :] = self.states[env_id, terminal_idx].unsqueeze(0)
+            self.observations_proprioceptive[env_id, terminal_idx + 1 :] = (
+                self.observations_proprioceptive[env_id, terminal_idx].unsqueeze(0)
+            )
+            self.actions[env_id, terminal_idx + 1 :] = self.actions[env_id, terminal_idx].unsqueeze(0)
+            if self._has_exteroceptive_observation:
+                self.observations_exteroceptive[env_id, terminal_idx + 1 :] = (
+                    self.observations_exteroceptive[env_id, terminal_idx].unsqueeze(0)
+                )
+            if self._has_add_exteroceptive_observation:
+                self.add_observations_exteroceptive[env_id, terminal_idx + 1 :] = (
+                    self.add_observations_exteroceptive[env_id, terminal_idx].unsqueeze(0)
+                )
+
+        self.fill_idx[env_ids] = self.cfg.trajectory_length

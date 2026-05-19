@@ -299,7 +299,7 @@ def main():
     elif args_cli.env == "height":
         # Elevate height scan to make sure all obstacles are captured
         pos_offset = list(cfg.env_cfg.scene.env_sensor.offset.pos)
-        pos_offset[2] = 0.5
+        pos_offset[2] = 2.0
         cfg.env_cfg.scene.env_sensor.offset.pos = tuple(pos_offset)
         sampling_planner_cfg_dict["to_cfg"]["num_neighbors"] = 2
 

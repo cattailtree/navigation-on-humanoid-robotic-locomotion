@@ -19,13 +19,43 @@ def _flat_reference(proportion: float = 0.10):
     )
 
 
-def _rough_floor(proportion: float = 0.10, noise_range: tuple[float, float] = (-0.035, 0.045)):
+def _rough_floor(proportion: float = 0.10, noise_range: tuple[float, float] = (-0.020, 0.030)):
     return terrain_gen.HfRandomUniformTerrainCfg(
         proportion=proportion,
         noise_range=noise_range,
-        noise_step=0.012,
+        noise_step=0.015,
         border_width=0.25,
         vertical_scale=0.004,
+    )
+
+
+def _grass_floor(proportion: float):
+    return terrain_gen.HfRandomUniformTerrainCfg(
+        proportion=proportion,
+        noise_range=(-0.012, 0.020),
+        noise_step=0.008,
+        border_width=0.25,
+        vertical_scale=0.003,
+    )
+
+
+def _snow_floor(proportion: float):
+    return terrain_gen.HfRandomUniformTerrainCfg(
+        proportion=proportion,
+        noise_range=(-0.025, 0.040),
+        noise_step=0.035,
+        border_width=0.25,
+        vertical_scale=0.005,
+    )
+
+
+def _mud_floor(proportion: float):
+    return terrain_gen.HfRandomUniformTerrainCfg(
+        proportion=proportion,
+        noise_range=(-0.035, 0.030),
+        noise_step=0.022,
+        border_width=0.25,
+        vertical_scale=0.006,
     )
 
 
@@ -34,15 +64,16 @@ def _offset_pillar_field(
     box_count: tuple[int, int],
     cylinder_count: tuple[int, int],
     rough: bool = True,
+    platform_width: float = 1.8,
 ):
     return fdm_terrain_gen.MeshPillarTerrainCfg(
         proportion=proportion,
-        platform_width=1.15,
-        max_height_noise=0.12,
+        platform_width=platform_width,
+        max_height_noise=0.08,
         rough_terrain=(
             terrain_gen.HfRandomUniformTerrainCfg(
-                noise_range=(-0.025, 0.040),
-                noise_step=0.010,
+                noise_range=(-0.015, 0.025),
+                noise_step=0.015,
                 border_width=0.25,
                 vertical_scale=0.004,
             )
@@ -50,66 +81,18 @@ def _offset_pillar_field(
             else None
         ),
         box_objects=fdm_terrain_gen.MeshPillarTerrainCfg.BoxCfg(
-            width=(0.22, 0.42),
-            length=(0.55, 0.95),
-            max_yx_angle=(0, 10),
+            width=(0.18, 0.34),
+            length=(0.42, 0.78),
+            max_yx_angle=(0, 6),
             height=(1.6, 2.4),
             num_objects=box_count,
         ),
         cylinder_cfg=fdm_terrain_gen.MeshPillarTerrainCfg.CylinderCfg(
-            radius=(0.12, 0.22),
-            max_yx_angle=(0, 5),
+            radius=(0.10, 0.18),
+            max_yx_angle=(0, 3),
             height=(1.6, 2.4),
             num_objects=cylinder_count,
         ),
-    )
-
-
-def _ramp_gate(proportion: float, slope_range: tuple[float, float], wall_probability: float):
-    return fdm_terrain_gen.StairsRampEvalTerrainCfg(
-        proportion=proportion,
-        modify_ramp_slope=True,
-        ramp_slope_range=slope_range,
-        step_width=0.30,
-        platform_width=1.05,
-        center_platform_width=1.05,
-        border_width=0.25,
-        width_randomization=0.35,
-        random_stairs_ramp_position_flipping=True,
-        free_space_front=True,
-        no_free_space_front=False,
-        random_wall_probability=wall_probability,
-        all_wall=False,
-        max_height=0.45,
-    )
-
-
-def _stairs_gate(proportion: float, step_height_range: tuple[float, float], wall_probability: float):
-    return fdm_terrain_gen.StairsRampEvalTerrainCfg(
-        proportion=proportion,
-        modify_step_height=True,
-        step_height_range=step_height_range,
-        step_width=0.30,
-        platform_width=1.00,
-        center_platform_width=1.00,
-        border_width=0.25,
-        width_randomization=0.30,
-        random_stairs_ramp_position_flipping=True,
-        free_space_front=True,
-        no_free_space_front=False,
-        random_wall_probability=wall_probability,
-        all_wall=False,
-        max_height=0.35,
-    )
-
-
-def _wall_gate(proportion: float, dim_range: list[float], width: float = 0.12):
-    return fdm_terrain_gen.SingleObjectTerrainCfg(
-        proportion=proportion,
-        object_type="wall",
-        dim_range=dim_range,
-        height_range=[1.4, 2.2],
-        wall_width=width,
     )
 
 
@@ -141,70 +124,53 @@ def _cross_gate(proportion: float, dim_range: list[float]):
     )
 
 
-def _maze_with_steps(proportion: float, resolution: float = 1.55, wall_width: float = 0.16, num_stairs: int = 1):
-    return fdm_terrain_gen.RandomMazeTerrainCfg(
-        proportion=proportion,
-        resolution=resolution,
-        maze_height=1.8,
-        wall_width=wall_width,
-        max_increase=0.12,
-        max_decrease=0.10,
-        width_range=(0.85, 1.15),
-        length_range=(0.85, 1.20),
-        height_range=(0.8, 1.3),
-        num_stairs=num_stairs,
-        step_height_range=(0.06, 0.11) if num_stairs > 0 else None,
-        step_width_range=(0.30, 0.42) if num_stairs > 0 else None,
-        stairs_platform_width=0.85,
-    )
-
-
 def _advantage_sub_terrains(profile: str = "train"):
     """Terrains where geometry and terrain-induced execution error both matter."""
     if profile == "2d":
         return {
-            "flat_reference": _flat_reference(0.08),
-            "offset_pillar_slalom": _offset_pillar_field(0.30, (2, 4), (2, 4), rough=False),
-            "thin_wall_gate": _wall_gate(0.18, [0.9, 1.5], width=0.12),
-            "single_box_choke": _box_gate(0.12, [0.55, 0.95]),
-            "single_cylinder_choke": _cylinder_gate(0.10, [0.18, 0.34]),
-            "cross_box_offset_gate": _cross_gate(0.12, [0.38, 0.70]),
-            "wide_maze": _maze_with_steps(0.10, resolution=1.75, wall_width=0.14, num_stairs=0),
+            "flat_reference": _flat_reference(0.35),
+            "grass_mild_reference": _grass_floor(0.25),
+            "snow_mild_reference": _snow_floor(0.15),
+            "offset_pillar_sparse": _offset_pillar_field(0.12, (1, 2), (1, 2), rough=False, platform_width=2.2),
+            "single_box_easy": _box_gate(0.06, [0.32, 0.58]),
+            "single_cylinder_easy": _cylinder_gate(0.04, [0.10, 0.20]),
+            "cross_box_easy": _cross_gate(0.03, [0.24, 0.44]),
         }
 
     if profile == "eval":
         return {
-            "flat_reference": _flat_reference(0.05),
-            "rough_offset_pillar_slalom": _offset_pillar_field(0.24, (3, 5), (3, 5), rough=True),
-            "ramp_offset_gate": _ramp_gate(0.17, (9, 17), wall_probability=0.35),
-            "stairs_offset_gate": _stairs_gate(0.17, (0.07, 0.12), wall_probability=0.30),
-            "thin_wall_gate": _wall_gate(0.10, [1.05, 1.70], width=0.12),
-            "cross_box_offset_gate": _cross_gate(0.10, [0.42, 0.75]),
-            "maze_with_low_steps": _maze_with_steps(0.10, resolution=1.50, wall_width=0.16, num_stairs=1),
-            "rough_floor_reference": _rough_floor(0.07, (-0.04, 0.055)),
+            "flat_reference": _flat_reference(0.12),
+            "grass_reference": _grass_floor(0.18),
+            "snow_reference": _snow_floor(0.14),
+            "mud_reference": _mud_floor(0.12),
+            "rough_offset_pillar_slalom": _offset_pillar_field(0.18, (1, 3), (1, 3), rough=True, platform_width=2.0),
+            "rough_dense_pillar_gate": _offset_pillar_field(0.08, (2, 4), (2, 4), rough=True, platform_width=1.8),
+            "single_box_choke": _box_gate(0.08, [0.38, 0.68]),
+            "single_cylinder_choke": _cylinder_gate(0.06, [0.12, 0.24]),
+            "cross_box_offset_gate": _cross_gate(0.04, [0.28, 0.52]),
         }
 
     if profile == "rough":
         return {
-            "rough_floor_reference": _rough_floor(0.16, (-0.045, 0.060)),
-            "rough_offset_pillar_slalom": _offset_pillar_field(0.28, (2, 4), (2, 4), rough=True),
-            "rough_dense_pillar_gate": _offset_pillar_field(0.20, (4, 6), (3, 5), rough=True),
-            "ramp_offset_gate": _ramp_gate(0.14, (10, 18), wall_probability=0.30),
-            "stairs_offset_gate": _stairs_gate(0.14, (0.07, 0.12), wall_probability=0.25),
-            "cross_box_offset_gate": _cross_gate(0.08, [0.42, 0.80]),
+            "grass_reference": _grass_floor(0.22),
+            "snow_reference": _snow_floor(0.18),
+            "mud_reference": _mud_floor(0.16),
+            "rough_floor_reference": _rough_floor(0.20, (-0.030, 0.045)),
+            "rough_offset_pillar_slalom": _offset_pillar_field(0.16, (1, 3), (1, 3), rough=True, platform_width=2.0),
+            "rough_dense_pillar_gate": _offset_pillar_field(0.06, (2, 4), (2, 4), rough=True, platform_width=1.8),
+            "cross_box_offset_gate": _cross_gate(0.02, [0.30, 0.56]),
         }
 
     return {
-        "flat_reference": _flat_reference(0.07),
-        "rough_floor_reference": _rough_floor(0.09, (-0.025, 0.040)),
-        "rough_offset_pillar_slalom": _offset_pillar_field(0.22, (2, 4), (2, 4), rough=True),
-        "ramp_offset_gate": _ramp_gate(0.14, (8, 16), wall_probability=0.25),
-        "stairs_offset_gate": _stairs_gate(0.14, (0.06, 0.11), wall_probability=0.25),
-        "thin_wall_gate": _wall_gate(0.09, [0.85, 1.45], width=0.12),
-        "single_box_choke": _box_gate(0.06, [0.50, 0.90]),
-        "single_cylinder_choke": _cylinder_gate(0.05, [0.16, 0.30]),
-        "cross_box_offset_gate": _cross_gate(0.07, [0.36, 0.70]),
-        "maze_with_low_steps": _maze_with_steps(0.07, resolution=1.60, wall_width=0.15, num_stairs=1),
+        "flat_reference": _flat_reference(0.25),
+        "grass_reference": _grass_floor(0.20),
+        "snow_reference": _snow_floor(0.14),
+        "mud_reference": _mud_floor(0.10),
+        "rough_floor_reference": _rough_floor(0.11, (-0.020, 0.030)),
+        "rough_offset_pillar_sparse": _offset_pillar_field(0.10, (1, 2), (1, 2), rough=True, platform_width=2.2),
+        "single_box_easy": _box_gate(0.04, [0.32, 0.58]),
+        "single_cylinder_easy": _cylinder_gate(0.03, [0.10, 0.20]),
+        "cross_box_easy": _cross_gate(0.03, [0.24, 0.44]),
     }
 
 
