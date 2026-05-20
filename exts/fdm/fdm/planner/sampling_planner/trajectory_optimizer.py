@@ -12,6 +12,7 @@ import os
 import pickle
 import subprocess
 import torch
+import torch.nn.functional as F
 from scipy.spatial.distance import cdist
 from typing import TYPE_CHECKING
 
@@ -21,7 +22,6 @@ from nav_suite.terrain_analysis import TerrainAnalysis
 
 from fdm import FDM_DATA_DIR
 from fdm.env_cfg import TERRAIN_ANALYSIS_CFG
-from scipy.ndimage import distance_transform_edt
 from .robot_shape import get_robot_shape
 from .trajectory_optimizer_cfg import ActionCfg, RobotCfg, TrajectoryOptimizerCfg
 from .trajectory_optimizer_mbrl import BatchedICEMOptimizer, BatchedMPPIOptimizer
@@ -113,8 +113,16 @@ class SimpleSE2TrajectoryOptimizer:
 
     def _build_cvae_context(self, env_ids: torch.Tensor | list[int] | slice | None = None) -> torch.Tensor | None:
         """Build flattened conditioning context for the CVAE sampler from planner observations."""
+        def select_context_tensor(tensor: torch.Tensor) -> torch.Tensor:
+            if env_ids is None or isinstance(env_ids, slice):
+                return tensor
+            env_count = len(env_ids)
+            if tensor.shape[0] == env_count:
+                return tensor
+            return tensor[env_ids]
+
         if "cvae_context" in self.obs and torch.is_tensor(self.obs["cvae_context"]):
-            context = self.obs["cvae_context"]
+            context = select_context_tensor(self.obs["cvae_context"])
         else:
             context_keys = [
                 "goal",
@@ -132,14 +140,30 @@ class SimpleSE2TrajectoryOptimizer:
                 tensor = self.obs[key]
                 if tensor.dtype not in (torch.float16, torch.float32, torch.float64):
                     tensor = tensor.float()
+                tensor = select_context_tensor(tensor)
                 context_parts.append(tensor.reshape(tensor.shape[0], -1))
             if len(context_parts) == 0:
                 return None
             context = torch.cat(context_parts, dim=-1)
 
-        if env_ids is not None and env_ids != slice(None):
-            context = context[env_ids]
         return context.to(self.device)
+
+    def _select_planner_batch_tensor(
+        self,
+        tensor: torch.Tensor,
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Select planner observations whether they are stored as full-env or local-batch tensors."""
+        if tensor.shape[0] == batch_size:
+            return tensor.to(device)
+        if self.env_ids is None or isinstance(self.env_ids, slice):
+            return tensor[:batch_size].to(device)
+        if isinstance(self.env_ids, torch.Tensor):
+            env_idx = self.env_ids.to(device=tensor.device, dtype=torch.long)
+        else:
+            env_idx = torch.tensor(self.env_ids, device=tensor.device, dtype=torch.long)
+        return tensor[env_idx].to(device)
 
     def set_fdm_classes(self, fdm_model: FDMModel, env: ManagerBasedRLEnv):
         self.fdm_model = fdm_model
@@ -315,7 +339,7 @@ class SimpleSE2TrajectoryOptimizer:
             #    print(f"[SAMPLE-DBG] first-step action quantiles(1,10,50,90,99%)=\n{q.cpu()}", flush=True)
 
             # get initial states
-            if self.env_ids == slice(None):
+            if isinstance(self.env_ids, slice):
                 env_idx = torch.arange(BS)
             elif isinstance(self.env_ids, torch.Tensor):
                 env_idx = torch.arange(self.env_ids.shape[0])
@@ -334,6 +358,19 @@ class SimpleSE2TrajectoryOptimizer:
             else:
                 collision_prob_traj = torch.zeros((num_envs, NR_TRAJ, TRAJ_LENGTH), device=self.fdm_model.device)
 
+            planner_states = self._select_planner_batch_tensor(self.obs["states"], num_envs, self.device)
+            planner_proprio = self._select_planner_batch_tensor(self.obs["proprio_obs"], num_envs, self.device)
+            planner_extero = (
+                self._select_planner_batch_tensor(self.obs["extero_obs"], num_envs, self.device)
+                if "extero_obs" in self.obs
+                else None
+            )
+            planner_add_extero = (
+                self._select_planner_batch_tensor(self.obs["add_extero_obs"], num_envs, self.device)
+                if "add_extero_obs" in self.obs
+                else None
+            )
+
             # process in mini-batches due to high memory requirements
             num_env_per_batch = math.ceil(max(self.to_cfg.batch_size / NR_TRAJ, 1))
             for mini_batch_idx in range(math.ceil(num_envs / num_env_per_batch)):
@@ -346,7 +383,7 @@ class SimpleSE2TrajectoryOptimizer:
 
                 # get state history transformed into local frame
                 state_history = state_history_transformer(
-                    self.obs["states"],
+                    planner_states,
                     curr_env_idx,
                     self.fdm_model.cfg.history_length,
                     self.fdm_model.cfg.exclude_state_idx_from_input,
@@ -361,31 +398,31 @@ class SimpleSE2TrajectoryOptimizer:
                     .repeat(1, NR_TRAJ, 1, 1)
                     .view(curr_batch_size * NR_TRAJ, state_history.shape[1], state_history.shape[2]),
                     (
-                        self.obs["proprio_obs"][curr_env_idx]
+                        planner_proprio[curr_env_idx]
                         .to(self.device)
                         .unsqueeze(1)
                         .repeat(1, NR_TRAJ, 1, 1)
-                        .view(curr_batch_size * NR_TRAJ, *(self.obs["proprio_obs"].shape[1:]))
+                        .view(curr_batch_size * NR_TRAJ, *(planner_proprio.shape[1:]))
                     ),
                     (
-                        self.obs["extero_obs"][curr_env_idx]
+                        planner_extero[curr_env_idx]
                         .type(torch.float32)
                         .to(self.device)
                         .unsqueeze(1)
-                        .repeat(1, NR_TRAJ, *([1] * (self.obs["extero_obs"].dim() - 1)))
-                        .view(curr_batch_size * NR_TRAJ, *(self.obs["extero_obs"].shape[1:]))
-                        if "extero_obs" in self.obs
+                        .repeat(1, NR_TRAJ, *([1] * (planner_extero.dim() - 1)))
+                        .view(curr_batch_size * NR_TRAJ, *(planner_extero.shape[1:]))
+                        if planner_extero is not None
                         else torch.zeros(1)
                     ),
                     population[curr_idx_range[0] : curr_idx_range[1]].view(curr_batch_size * NR_TRAJ, TRAJ_LENGTH, -1),
                     (
-                        self.obs["add_extero_obs"][curr_env_idx]
+                        planner_add_extero[curr_env_idx]
                         .type(torch.float32)
                         .to(self.device)
                         .unsqueeze(1)
-                        .repeat(1, NR_TRAJ, *([1] * (self.obs["add_extero_obs"].dim() - 1)))
-                        .view(curr_batch_size * NR_TRAJ, *(self.obs["add_extero_obs"].shape[1:]))
-                        if "add_extero_obs" in self.obs
+                        .repeat(1, NR_TRAJ, *([1] * (planner_add_extero.dim() - 1)))
+                        .view(curr_batch_size * NR_TRAJ, *(planner_add_extero.shape[1:]))
+                        if planner_add_extero is not None
                         else torch.zeros(1)
                     ),
                 )
@@ -642,7 +679,11 @@ class SimpleSE2TrajectoryOptimizer:
         # ------------------------------------------------------------------
         yaw_rate_change_cost = self.yaw_rate_change_cost(actions)
         near_obstacle_cost = torch.zeros_like(control_effort_trans_forward)
-        if self.latest_local_states is not None and "extero_obs" in self.obs:
+        near_obstacle_enabled = (
+            float(getattr(self.to_cfg, "state_cost_w_near_obstacle_soft", 0.0)) > 0.0
+            or float(getattr(self.to_cfg, "state_cost_w_near_obstacle_hard", 0.0)) > 0.0
+        )
+        if near_obstacle_enabled and self.latest_local_states is not None and "extero_obs" in self.obs:
             if (
                     self.latest_local_states.shape[0] == states.shape[0]
                     and self.latest_local_states.shape[1] == states.shape[1]
@@ -871,7 +912,7 @@ class SimpleSE2TrajectoryOptimizer:
 
     def near_obstacle_cost(self, states: torch.Tensor) -> torch.Tensor:
         """
-        True distance-to-obstacle penalty using distance transform on local height scan.
+        Near-obstacle penalty from local height scan, computed on GPU by dilating the obstacle map.
 
         Args:
             states: local-frame states, shape (BS, NR_TRAJ, TRAJ_LENGTH, 3)
@@ -882,15 +923,12 @@ class SimpleSE2TrajectoryOptimizer:
         if "extero_obs" not in self.obs:
             return torch.zeros(states.shape[:3], device=states.device, dtype=states.dtype)
 
-        if self.env_ids == slice(None):
-            env_idx = torch.arange(states.shape[0], device=states.device)
-        else:
-            env_idx = self.env_ids if isinstance(self.env_ids, torch.Tensor) else torch.tensor(
-                self.env_ids, device=states.device
-            )
-
         # (BS, H, W)
-        height_scan = self.obs["extero_obs"][env_idx].squeeze(1).to(states.device).float()
+        height_scan = self._select_planner_batch_tensor(
+            self.obs["extero_obs"],
+            states.shape[0],
+            states.device,
+        ).squeeze(1).float()
         BS, H, W = height_scan.shape
 
         # local trajectory positions -> map indices
@@ -925,32 +963,26 @@ class SimpleSE2TrajectoryOptimizer:
         # height_scan is pelvis-relative in lab. Use height above local ground so lower obstacles are retained.
         obstacle_map = (height_scan - ground_ref) > obstacle_height_th  # (BS, H, W)
 
-        # distance-to-obstacle map, in meters
-        dist_maps = torch.zeros_like(height_scan)
-
-        for b in range(BS):
-            # scipy distance transform works on CPU numpy
-            # distance to nearest True in obstacle_map:
-            # compute on free cells => distance to nearest obstacle
-            free_map_np = (~obstacle_map[b]).detach().cpu().numpy()
-            dist_np = distance_transform_edt(free_map_np) * self.height_scan_resolution
-            dist_maps[b] = torch.from_numpy(dist_np).to(states.device, dtype=height_scan.dtype)
-
         batch_idx = torch.arange(BS, device=states.device)[:, None, None].expand(
             BS, states.shape[1], states.shape[2]
         )
-
-        clearance = dist_maps[batch_idx, path_idx[..., 0], path_idx[..., 1]]
 
         soft_dist_th = float(getattr(self.to_cfg, "state_cost_near_obstacle_soft_th", 0.30))
         hard_dist_th = float(getattr(self.to_cfg, "state_cost_near_obstacle_hard_th", 0.15))
         w_soft = float(getattr(self.to_cfg, "state_cost_w_near_obstacle_soft", 3.0))
         w_hard = float(getattr(self.to_cfg, "state_cost_w_near_obstacle_hard", 12.0))
 
-        cost = torch.zeros_like(clearance)
+        obstacle = obstacle_map.to(dtype=height_scan.dtype).unsqueeze(1)
+        soft_radius = max(int(math.ceil(soft_dist_th / self.height_scan_resolution)), 0)
+        hard_radius = max(int(math.ceil(hard_dist_th / self.height_scan_resolution)), 0)
 
-        soft_mask = clearance < soft_dist_th
-        hard_mask = clearance < hard_dist_th
+        soft_map = F.max_pool2d(obstacle, kernel_size=2 * soft_radius + 1, stride=1, padding=soft_radius).squeeze(1)
+        hard_map = F.max_pool2d(obstacle, kernel_size=2 * hard_radius + 1, stride=1, padding=hard_radius).squeeze(1)
+
+        soft_mask = soft_map[batch_idx, path_idx[..., 0], path_idx[..., 1]].to(torch.bool)
+        hard_mask = hard_map[batch_idx, path_idx[..., 0], path_idx[..., 1]].to(torch.bool)
+
+        cost = torch.zeros(states.shape[:3], device=states.device, dtype=states.dtype)
 
         cost[soft_mask] += w_soft
         cost[hard_mask] += w_hard
@@ -966,25 +998,27 @@ class SimpleSE2TrajectoryOptimizer:
         Returns
             cost: Cost of the applied filters for every path
         """
-        if self.env_ids == slice(None):
-            env_idx = torch.arange(states.shape[0])
-        else:
-            env_idx = self.env_ids if isinstance(self.env_ids, torch.Tensor) else torch.tensor(self.env_ids)
+        all_height_scan = self._select_planner_batch_tensor(
+            self.obs["extero_obs"],
+            states.shape[0],
+            states.device,
+        ).squeeze(1)
 
         # handle the whole code batched due to memory limitations
         num_envs_per_batch = 20
-        num_batches = math.ceil(len(env_idx) / num_envs_per_batch)
+        num_batches = math.ceil(states.shape[0] / num_envs_per_batch)
 
         cost = torch.zeros(states.shape[0], states.shape[1], device=states.device)
 
         for batch_idx in range(num_batches):
             curr_env_idx_range = torch.arange(
-                num_envs_per_batch * batch_idx, min(num_envs_per_batch * (batch_idx + 1), len(env_idx))
+                num_envs_per_batch * batch_idx,
+                min(num_envs_per_batch * (batch_idx + 1), states.shape[0]),
+                device=states.device,
             )
-            curr_env_idx = env_idx[curr_env_idx_range]
 
             # get height-scan
-            height_scan = self.obs["extero_obs"][curr_env_idx].squeeze(1).to(self.device)
+            height_scan = all_height_scan[curr_env_idx_range].to(self.device)
             num_envs, grid_size_x, grid_size_y = height_scan.shape
             # get the tragversability map
             trav_map = torch.zeros_like(height_scan)
@@ -1005,10 +1039,10 @@ class SimpleSE2TrajectoryOptimizer:
 
             # get risky coordinates for the robot
             alpha = states[curr_env_idx_range][:, :, :, 2, None].repeat(1, 1, 1, self.risky_xy.shape[0]) - torch.pi / 2
-            cells_xy = self.risky_xy.clone()[None, None, None, :, :].repeat(len(curr_env_idx), *states.shape[1:3], 1, 1)
+            cells_xy = self.risky_xy.clone()[None, None, None, :, :].repeat(num_envs, *states.shape[1:3], 1, 1)
 
             so2 = torch.zeros(
-                (len(curr_env_idx), *states.shape[1:3], self.risky_xy.shape[0], 2, 2), device=path_idx.device
+                (num_envs, *states.shape[1:3], self.risky_xy.shape[0], 2, 2), device=path_idx.device
             )
             so2[:, :, :, :, 0, 0] = torch.cos(alpha)
             so2[:, :, :, :, 1, 0] = torch.sin(alpha)
@@ -1026,14 +1060,14 @@ class SimpleSE2TrajectoryOptimizer:
 
             # Check all points of the robot shape
             env_idx_tensor = (
-                torch.arange(len(curr_env_idx))[:, None]
+                torch.arange(num_envs, device=states.device)[:, None]
                 .repeat(1, states.shape[1] * states.shape[2] * self.risky_xy.shape[0])
                 .reshape(-1)
             )
             filter_idx = trav_map[env_idx_tensor, coordinates[:, 0], coordinates[:, 1]] < 0.15
             path_filter = torch.any(filter_idx.reshape(num_envs, states.shape[1], -1), dim=-1)
 
-            curr_cost = torch.zeros(len(curr_env_idx), states.shape[1], device=states.device)
+            curr_cost = torch.zeros(num_envs, states.shape[1], device=states.device)
             curr_cost[path_filter] += self.to_cfg.state_cost_w_fatal_trav
             cost[curr_env_idx_range] += curr_cost
 
@@ -1111,14 +1145,11 @@ class SimpleSE2TrajectoryOptimizer:
         """
         assert "extero_obs" in self.obs, "extero_obs required for height-gradient based cost"
 
-        if self.env_ids == slice(None):
-            env_idx = torch.arange(local_states.shape[0], device=local_states.device)
-        else:
-            env_idx = self.env_ids if isinstance(self.env_ids, torch.Tensor) else torch.tensor(
-                self.env_ids, device=local_states.device
-            )
-
-        height_scan = self.obs["extero_obs"][env_idx].squeeze(1).to(local_states.device).float()  # (BS, H, W)
+        height_scan = self._select_planner_batch_tensor(
+            self.obs["extero_obs"],
+            local_states.shape[0],
+            local_states.device,
+        ).squeeze(1).float()  # (BS, H, W)
         BS, H, W = height_scan.shape
 
         grad_x_map = torch.zeros_like(height_scan)

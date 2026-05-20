@@ -381,19 +381,19 @@ class TerminationsCfg:
 
     # 2) 根节点高度太低 -> 视为摔倒
     fallen_height = DoneTerm(
-        func=mdp.root_height_below_minimum,
+        func=mdp.delayed_root_height_below_minimum,
         # 这个阈值可以调：
         #   G1 正常站立大概 0.78 左右，你可以先设 0.35~0.4
-        params={"minimum_height": 0.35},
+        params={"minimum_height": 0.35, "hold_steps": 15},
     )
 
     # 3) 姿态倾斜太大 -> 视为摔倒
     bad_orientation = DoneTerm(
-        func=mdp.bad_orientation,
+        func=mdp.delayed_bad_orientation,
         # limit_angle 是 “躺倒多少算摔”，单位弧度
         # 四足一般用 ~0.8（大约 45 度），人形可以宽松或更严一点：
         #   0.8 ~ 1.0 都可以先试试
-        params={"limit_angle": 1.0},
+        params={"limit_angle": 1.0, "hold_steps": 15},
     )
 ##
 # Environment configuration

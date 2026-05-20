@@ -91,6 +91,7 @@ class TrajectoryDataset(Dataset):
             start_idx: The start indexes for the different environments where the samples should be taken from.
         """
         # get start and end indexes for the different environments
+        num_trajectories = replay_buffer.states.shape[0]
         if regular_slicing and start_idx is None:
             trajectory_idx = torch.arange(
                 0,
@@ -98,30 +99,57 @@ class TrajectoryDataset(Dataset):
                 device=self.replay_buffer_cfg.buffer_device,
             )[1 :: self.model_cfg.prediction_horizon]
             start_idx = torch.vstack((
-                torch.arange(0, replay_buffer.env.num_envs, device=self.replay_buffer_cfg.buffer_device)[:, None]
+                torch.arange(0, num_trajectories, device=self.replay_buffer_cfg.buffer_device)[:, None]
                 .repeat(1, len(trajectory_idx))
                 .flatten(),
-                trajectory_idx.repeat(replay_buffer.env.num_envs),
+                trajectory_idx.repeat(num_trajectories),
             )).T
+            terminal_idx = getattr(
+                replay_buffer,
+                "terminal_idx",
+                torch.full(
+                    (num_trajectories,),
+                    self.replay_buffer_cfg.trajectory_length,
+                    device=self.replay_buffer_cfg.buffer_device,
+                ),
+            )
+            valid_idx = getattr(
+                replay_buffer,
+                "valid_idx",
+                torch.full(
+                    (num_trajectories,),
+                    self.replay_buffer_cfg.trajectory_length,
+                    device=self.replay_buffer_cfg.buffer_device,
+                ),
+            )
+            valid_start = start_idx[:, 1] + self.model_cfg.prediction_horizon < valid_idx[start_idx[:, 0]]
+            valid_start &= start_idx[:, 1] + self.model_cfg.prediction_horizon < terminal_idx[start_idx[:, 0]]
+            start_idx = start_idx[valid_start]
         elif start_idx is None:
             traj_start_idx = self._sample_random_traj_idx(replay_buffer)
             coll_start_idx = self._sample_collision_traj(replay_buffer)
 
             # balance the data
             if self.cfg.collision_rate is not None:
+                num_regular = int(self.cfg.num_samples * (1 - self.cfg.collision_rate))
+                num_collision = self.cfg.num_samples - num_regular
+                if coll_start_idx.shape[0] == 0:
+                    num_regular = self.cfg.num_samples
+                    num_collision = 0
+                assert traj_start_idx.shape[0] > 0, "No valid regular samples found in replay buffer!"
                 assert (
-                    int(self.cfg.num_samples * (1 - self.cfg.collision_rate)) <= traj_start_idx.shape[0]
+                    num_regular <= traj_start_idx.shape[0]
                 ), "Not enough regular samples to balance data!"
                 perm = torch.randperm(traj_start_idx.shape[0], device=self.replay_buffer_cfg.buffer_device)
-                traj_start_idx = traj_start_idx[perm[: int(self.cfg.num_samples * (1 - self.cfg.collision_rate))]]
-                if int(self.cfg.num_samples * self.cfg.collision_rate) <= coll_start_idx.shape[0]:
+                traj_start_idx = traj_start_idx[perm[:num_regular]]
+                if num_collision <= coll_start_idx.shape[0]:
                     perm = torch.randperm(coll_start_idx.shape[0], device=self.replay_buffer_cfg.buffer_device)
-                    coll_start_idx = coll_start_idx[perm[: int(self.cfg.num_samples * self.cfg.collision_rate)]]
+                    coll_start_idx = coll_start_idx[perm[:num_collision]]
                 else:
                     coll_start_idx = coll_start_idx.repeat(
-                        int(self.cfg.num_samples * self.cfg.collision_rate) // coll_start_idx.shape[0] + 1, 1
+                        num_collision // coll_start_idx.shape[0] + 1, 1
                     )
-                    coll_start_idx = coll_start_idx[: int(self.cfg.num_samples * self.cfg.collision_rate)]
+                    coll_start_idx = coll_start_idx[:num_collision]
                 start_idx = torch.vstack([traj_start_idx, coll_start_idx])
             else:
                 start_idx = torch.vstack([traj_start_idx, coll_start_idx])
@@ -811,33 +839,90 @@ class TrajectoryDataset(Dataset):
     """
 
     def _sample_random_traj_idx(self, replay_buffer: ReplayBuffer):
-        # sample random start indexes
-        # collision not correctly captured at the last entry of the trajectory, exclude it from trajectories
-        start_idx = torch.randint(
-            1,
-            self.replay_buffer_cfg.trajectory_length - self.model_cfg.prediction_horizon - 1,
-            (self.cfg.num_samples,),
-            device=self.replay_buffer_cfg.buffer_device,
+        device = self.replay_buffer_cfg.buffer_device
+        horizon = self.model_cfg.prediction_horizon
+        max_start = self.replay_buffer_cfg.trajectory_length - horizon - 1
+        candidate_starts = torch.arange(1, max_start, device=device)
+        num_trajectories = replay_buffer.states.shape[0]
+        traj_idx = torch.arange(num_trajectories, device=device)
+        traj_grid, start_grid = torch.meshgrid(traj_idx, candidate_starts, indexing="ij")
+
+        terminal_idx = getattr(
+            replay_buffer,
+            "terminal_idx",
+            torch.full((num_trajectories,), self.replay_buffer_cfg.trajectory_length, device=device),
         )
-        env_idx = torch.randint(
-            0, replay_buffer.env.num_envs, (self.cfg.num_samples,), device=self.replay_buffer_cfg.buffer_device
+        valid_idx = getattr(
+            replay_buffer,
+            "valid_idx",
+            torch.full((num_trajectories,), self.replay_buffer_cfg.trajectory_length, device=device),
         )
-        return torch.vstack([env_idx, start_idx]).T
+        valid_mask = start_grid + horizon < valid_idx[:, None]
+        valid_mask &= start_grid + horizon < terminal_idx[:, None]
+        valid_mask &= ~replay_buffer.states[traj_grid, start_grid, 0, 7].to(torch.bool)
+
+        valid_pairs = torch.vstack([traj_grid[valid_mask], start_grid[valid_mask]]).T
+        if valid_pairs.shape[0] == 0:
+            return valid_pairs
+
+        if valid_pairs.shape[0] >= self.cfg.num_samples:
+            perm = torch.randperm(valid_pairs.shape[0], device=device)[: self.cfg.num_samples]
+            return valid_pairs[perm]
+
+        repeat_times = self.cfg.num_samples // valid_pairs.shape[0] + 1
+        perm = torch.randperm(valid_pairs.shape[0], device=device)
+        return valid_pairs[perm].repeat(repeat_times, 1)[: self.cfg.num_samples]
 
     def _sample_collision_traj(self, replay_buffer: ReplayBuffer):
-        # identify collision samples (at least self.model_cfg.prediction_horizon-2 steps before the end to sample commands)
-        collision_samples = torch.where(replay_buffer.states[:, 1 : -self.model_cfg.prediction_horizon + 2, :, 7])
-        # sample start position before the collision, should be at least two steps before the collision
-        collision_start_idx = torch.randint(
-            2,
-            self.model_cfg.prediction_horizon,
-            (collision_samples[0].shape[0],),
-            device=self.replay_buffer_cfg.buffer_device,
-        )
-        # clip start position
-        collision_start_idx = torch.clip(collision_samples[1] - collision_start_idx, 0)
-        # get trajectory start indexes
-        return torch.vstack([collision_samples[0], collision_start_idx]).T
+        device = self.replay_buffer_cfg.buffer_device
+        horizon = self.model_cfg.prediction_horizon
+        terminal_idx = getattr(replay_buffer, "terminal_idx", None)
+        valid_idx = getattr(replay_buffer, "valid_idx", None)
+
+        if terminal_idx is None:
+            collision_samples = torch.where(replay_buffer.states[:, 1 : -horizon + 2, 0, 7])
+            collision_start_idx = torch.randint(
+                2,
+                horizon,
+                (collision_samples[0].shape[0],),
+                device=device,
+            )
+            collision_start_idx = torch.clip(collision_samples[1] - collision_start_idx, 0)
+            return torch.vstack([collision_samples[0], collision_start_idx]).T
+
+        if valid_idx is None:
+            num_trajectories = replay_buffer.states.shape[0]
+            valid_idx = torch.full(
+                (num_trajectories,),
+                self.replay_buffer_cfg.trajectory_length,
+                device=device,
+                dtype=torch.long,
+            )
+
+        valid_terminal_envs = torch.where((terminal_idx > 1) & (terminal_idx < valid_idx))[0]
+        if valid_terminal_envs.shape[0] == 0:
+            return torch.empty((0, 2), device=device, dtype=torch.long)
+
+        terminal_steps = terminal_idx[valid_terminal_envs]
+        valid_steps = valid_idx[valid_terminal_envs]
+        start_min = torch.clamp(terminal_steps - horizon, min=1)
+        start_max = torch.minimum(terminal_steps - 1, valid_steps - horizon - 1)
+        valid_terminal_envs = valid_terminal_envs[start_max >= start_min]
+        terminal_steps = terminal_idx[valid_terminal_envs]
+        valid_steps = valid_idx[valid_terminal_envs]
+        start_min = torch.clamp(terminal_steps - horizon, min=1)
+        start_max = torch.minimum(terminal_steps - 1, valid_steps - horizon - 1)
+
+        if valid_terminal_envs.shape[0] == 0:
+            return torch.empty((0, 2), device=device, dtype=torch.long)
+
+        rand = torch.rand(valid_terminal_envs.shape[0], device=device)
+        start_idx = start_min + torch.floor(rand * (start_max - start_min + 1).float()).long()
+        non_initial_collision = ~replay_buffer.states[valid_terminal_envs, start_idx, 0, 7].to(torch.bool)
+        valid_terminal_envs = valid_terminal_envs[non_initial_collision]
+        start_idx = start_idx[non_initial_collision]
+
+        return torch.vstack([valid_terminal_envs, start_idx]).T
 
     def _filter_idx(self, keep_idx: torch.Tensor):
         """Filter data and only keep the given indexes. After filtering, update the number of samples"""

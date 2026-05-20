@@ -35,7 +35,11 @@ class EpisodeResult:
     goal_distance: float
     goal_x_error: float
     yaw_error: float
+    reference_path_length: float
     path_length: float
+    spl: float
+    reference_time: float
+    spt: float
     min_height: float
     max_roll: float
     max_pitch: float
@@ -80,6 +84,7 @@ def parse_args() -> argparse.Namespace:
         choices=(
             "planner_eval",
             "planner_eval_2d",
+            "planner_eval_calib",
             "planner_eval_humanoid",
             "paper_figure",
             "sparse_boxes",
@@ -95,6 +100,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--success-distance", type=float, default=0.7)
     parser.add_argument("--success-x-distance", type=float, default=0.4)
     parser.add_argument("--success-yaw", type=float, default=math.pi)
+    parser.add_argument(
+        "--spt-reference-speed",
+        type=float,
+        default=1.0,
+        help="Reference speed used for SPT = success * shortest_time / max(shortest_time, episode_time).",
+    )
     parser.add_argument("--fall-height", type=float, default=0.35)
     parser.add_argument("--fall-roll-pitch", type=float, default=1.0)
     parser.add_argument("--ignore-orientation-fall", action="store_true")
@@ -108,6 +119,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--print-every-episode", type=int, default=10)
+    parser.add_argument(
+        "--exclude-timeout-from-metrics",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Exclude timeout episodes from success-rate/SPL/SPT denominators while still logging them.",
+    )
     parser.add_argument("--summary-csv", type=Path, default=None)
     parser.add_argument("--generated-scene-dir", type=Path, default=None)
     parser.add_argument("--keep-scenes", action="store_true")
@@ -224,14 +241,14 @@ def main() -> None:
         if args.print_every_episode > 0 and (
             episode == 0 or (episode + 1) % args.print_every_episode == 0 or episode + 1 == args.episodes
         ):
-            print(_format_progress(rows, episode + 1, args.episodes, start_wall))
+            print(_format_progress(rows, episode + 1, args.episodes, start_wall, args.exclude_timeout_from_metrics))
         if args.max_failures > 0 and sum(not row.success for row in rows) >= args.max_failures:
             print(f"[SIM2SIM_BATCH] early stop: failures reached {args.max_failures}")
             break
 
     _write_summary(summary_csv, rows)
     elapsed = time.perf_counter() - start_wall
-    print(_format_final(rows, elapsed))
+    print(_format_final(rows, elapsed, args.exclude_timeout_from_metrics))
     print(f"[SIM2SIM_BATCH] wrote summary: {summary_csv}")
     if not args.keep_scenes:
         _cleanup_scenes(scene_dir)
@@ -265,7 +282,10 @@ def run_episode(
     planner.reset()
     goal = np.asarray(args.goal, dtype=np.float32)
     last_command = LowLevelCommand.zeros()
-    prev_xy = env.base_xy_yaw()[:2].astype(np.float64)
+    start_xy = env.base_xy_yaw()[:2].astype(np.float64)
+    prev_xy = start_xy.copy()
+    reference_path_length = float(np.linalg.norm(goal[:2].astype(np.float64) - start_xy))
+    reference_time = reference_path_length / max(float(args.spt_reference_speed), 1e-6)
     path_length = 0.0
     min_height = float("inf")
     max_roll = 0.0
@@ -287,6 +307,7 @@ def run_episode(
     last_illegal_contact_pair = ""
     reached_once = False
     reached_step = -1
+    reached_path_length = 0.0
     status = "timeout"
     wall_start = time.perf_counter()
     step_idx = 0
@@ -357,6 +378,7 @@ def run_episode(
         if goal_reached and not reached_once:
             reached_once = True
             reached_step = step_idx
+            reached_path_length = path_length
         orientation_fall = (roll >= args.fall_roll_pitch or pitch >= args.fall_roll_pitch) and not args.ignore_orientation_fall
         if pose[2] <= args.fall_height or orientation_fall:
             status = "fall"
@@ -374,10 +396,13 @@ def run_episode(
     if status != "success" and reached_once:
         status = "success"
         step_idx = reached_step
+        path_length = reached_path_length
     wall_time = time.perf_counter() - wall_start
     sim_time = (step_idx + 1) * args.control_decimation * float(args.physics_dt)
     pose = env.base_xyz_rpy()
     distance, x_error, yaw_error = _goal_error(pose, goal)
+    spl = _success_weighted_ratio(status == "success", reference_path_length, path_length)
+    spt = _success_weighted_ratio(status == "success", reference_time, sim_time)
     return EpisodeResult(
         episode=episode,
         seed=seed,
@@ -392,7 +417,11 @@ def run_episode(
         goal_distance=distance,
         goal_x_error=x_error,
         yaw_error=yaw_error,
+        reference_path_length=reference_path_length,
         path_length=path_length,
+        spl=spl,
+        reference_time=reference_time,
+        spt=spt,
         min_height=min_height,
         max_roll=max_roll,
         max_pitch=max_pitch,
@@ -570,6 +599,12 @@ def _nanmax(current: float, value: float) -> float:
     return max(current, value)
 
 
+def _success_weighted_ratio(success: bool, reference: float, actual: float) -> float:
+    if not success or reference <= 0.0 or actual <= 0.0:
+        return 0.0
+    return float(reference / max(reference, actual))
+
+
 def _write_summary(path: Path, rows: list[EpisodeResult]) -> None:
     with path.open("w", newline="", encoding="utf-8") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=list(EpisodeResult.__dataclass_fields__.keys()))
@@ -578,29 +613,54 @@ def _write_summary(path: Path, rows: list[EpisodeResult]) -> None:
             writer.writerow(row.__dict__)
 
 
-def _format_progress(rows: list[EpisodeResult], done: int, total: int, start_wall: float) -> str:
-    success = sum(row.success for row in rows)
+def _metric_rows(rows: list[EpisodeResult], exclude_timeout: bool) -> list[EpisodeResult]:
+    if not exclude_timeout:
+        return rows
+    return [row for row in rows if row.status != "timeout"]
+
+
+def _format_progress(
+    rows: list[EpisodeResult],
+    done: int,
+    total: int,
+    start_wall: float,
+    exclude_timeout: bool,
+) -> str:
+    metric_rows = _metric_rows(rows, exclude_timeout)
+    success = sum(row.success for row in metric_rows)
     status_counts = _status_counts(rows)
-    mean_dist = float(np.mean([row.goal_distance for row in rows])) if rows else float("nan")
+    mean_dist = float(np.mean([row.goal_distance for row in metric_rows])) if metric_rows else float("nan")
     elapsed = time.perf_counter() - start_wall
     eta = elapsed / max(done, 1) * max(total - done, 0)
+    denom = len(metric_rows)
     return (
-        f"[SIM2SIM_BATCH] {done}/{total} success={success}/{len(rows)} "
-        f"rate={success / max(len(rows), 1):.3f} mean_dist={mean_dist:.3f} "
+        f"[SIM2SIM_BATCH] {done}/{total} success={success}/{denom} "
+        f"rate={success / max(denom, 1):.3f} mean_dist={mean_dist:.3f} "
         f"elapsed={elapsed / 60.0:.1f}min eta={eta / 60.0:.1f}min status={status_counts}"
     )
 
 
-def _format_final(rows: list[EpisodeResult], elapsed: float) -> str:
-    success = sum(row.success for row in rows)
-    mean_time = float(np.mean([row.sim_time for row in rows])) if rows else float("nan")
-    mean_path = float(np.mean([row.path_length for row in rows])) if rows else float("nan")
-    mean_dist = float(np.mean([row.goal_distance for row in rows])) if rows else float("nan")
+def _format_final(rows: list[EpisodeResult], elapsed: float, exclude_timeout: bool) -> str:
+    metric_rows = _metric_rows(rows, exclude_timeout)
+    success = sum(row.success for row in metric_rows)
+    success_rows = [row for row in metric_rows if row.success]
+    mean_time = float(np.mean([row.sim_time for row in metric_rows])) if metric_rows else float("nan")
+    mean_path = float(np.mean([row.path_length for row in metric_rows])) if metric_rows else float("nan")
+    mean_dist = float(np.mean([row.goal_distance for row in metric_rows])) if metric_rows else float("nan")
+    mean_spl = float(np.mean([row.spl for row in metric_rows])) if metric_rows else float("nan")
+    mean_spt = float(np.mean([row.spt for row in metric_rows])) if metric_rows else float("nan")
+    success_spl = float(np.mean([row.spl for row in success_rows])) if success_rows else float("nan")
+    success_spt = float(np.mean([row.spt for row in success_rows])) if success_rows else float("nan")
+    denom = len(metric_rows)
+    timeout_note = "timeouts_excluded" if exclude_timeout else "timeouts_included"
     return (
         "[SIM2SIM_BATCH] completed "
-        f"episodes={len(rows)} success_rate={success / max(len(rows), 1):.3f} "
-        f"status={_status_counts(rows)} mean_sim_time={mean_time:.2f}s "
-        f"mean_path={mean_path:.2f}m mean_goal_distance={mean_dist:.3f}m wall_time={elapsed:.1f}s"
+        f"episodes={len(rows)} metric_episodes={denom} {timeout_note} "
+        f"success_rate={success / max(denom, 1):.3f} status={_status_counts(rows)} "
+        f"mean_sim_time={mean_time:.2f}s "
+        f"mean_path={mean_path:.2f}m mean_goal_distance={mean_dist:.3f}m "
+        f"SPL_all={mean_spl:.3f} SPL_success={success_spl:.3f} "
+        f"SPT_all={mean_spt:.3f} SPT_success={success_spt:.3f} wall_time={elapsed:.1f}s"
     )
 
 

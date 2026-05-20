@@ -129,6 +129,7 @@ def generate_fdm_terrain_obstacles(preset: str = "planner_eval", seed: int = 0) 
     if normalized not in {
         "planner_eval",
         "planner_eval_2d",
+        "planner_eval_calib",
         "planner_eval_humanoid",
         "paper_figure",
         "sparse_boxes",
@@ -184,7 +185,11 @@ def generate_fdm_terrain_obstacles(preset: str = "planner_eval", seed: int = 0) 
                 height=1.20,
             ),
         ]
-    obstacles = _generate_planner_eval_tile(rng, humanoid_feasible=normalized == "planner_eval_humanoid")
+    obstacles = _generate_planner_eval_tile(
+        rng,
+        humanoid_feasible=normalized in {"planner_eval_humanoid", "planner_eval_calib"},
+        calibrated=normalized == "planner_eval_calib",
+    )
     if normalized == "paper_figure":
         return _generate_planner_eval_outdoor(rng, difficulty=0.65)
     if normalized == "planner_eval_2d":
@@ -197,20 +202,23 @@ def generate_fdm_terrain_obstacles(preset: str = "planner_eval", seed: int = 0) 
 def _generate_planner_eval_tile(
     rng: np.random.Generator,
     humanoid_feasible: bool = False,
+    calibrated: bool = False,
 ) -> list[BoxObstacle]:
     subterrain = _sample_planner_eval_subterrain(rng)
     difficulty = float(rng.random())
     if humanoid_feasible:
         difficulty = min(difficulty, 0.45)
     if subterrain == "outdoor":
-        return _generate_planner_eval_outdoor(rng, difficulty)
+        return _generate_planner_eval_outdoor(rng, difficulty, calibrated=calibrated)
     if subterrain == "single_box":
-        dim = _lerp(1.0, 1.8, difficulty)
-        height = float(rng.uniform(0.5, 1.5))
+        dim_low, dim_high = (0.65, 1.05) if calibrated else (1.0, 1.8)
+        dim = _lerp(dim_low, dim_high, difficulty)
+        height = float(rng.uniform(0.8, 1.3) if calibrated else rng.uniform(0.5, 1.5))
         return [BoxObstacle("fdm_planner_eval_single_box", 2.5, 0.0, dim, dim, height)]
     if subterrain == "single_cylinder":
-        radius = _lerp(0.5, 0.9, difficulty)
-        height = float(rng.uniform(0.5, 1.5))
+        radius_low, radius_high = (0.32, 0.50) if calibrated else (0.5, 0.9)
+        radius = _lerp(radius_low, radius_high, difficulty)
+        height = float(rng.uniform(0.8, 1.3) if calibrated else rng.uniform(0.5, 1.5))
         diameter = 2.0 * radius
         return [
             BoxObstacle(
@@ -225,8 +233,9 @@ def _generate_planner_eval_tile(
             )
         ]
     if subterrain == "single_wall":
-        wall_length = _lerp(1.0, 1.6, difficulty)
-        height = float(rng.uniform(0.5, 1.5))
+        wall_low, wall_high = (0.70, 1.10) if calibrated else (1.0, 1.6)
+        wall_length = _lerp(wall_low, wall_high, difficulty)
+        height = float(rng.uniform(0.8, 1.3) if calibrated else rng.uniform(0.5, 1.5))
         return [
             BoxObstacle(
                 "fdm_planner_eval_single_wall",
@@ -239,9 +248,13 @@ def _generate_planner_eval_tile(
             )
         ]
     if subterrain == "box_cross_pattern":
-        dim = _lerp(0.5, 0.9, difficulty)
-        height = float(rng.uniform(0.5, 1.5))
-        centers = [(2.5, 0.0), (4.5, 2.0), (0.5, 2.0), (4.5, -2.0), (0.5, -2.0)]
+        dim_low, dim_high = (0.40, 0.62) if calibrated else (0.5, 0.9)
+        dim = _lerp(dim_low, dim_high, difficulty)
+        height = float(rng.uniform(0.8, 1.3) if calibrated else rng.uniform(0.5, 1.5))
+        if calibrated:
+            centers = [(2.5, 0.0), (4.6, 1.8), (4.6, -1.8)]
+        else:
+            centers = [(2.5, 0.0), (4.5, 2.0), (0.5, 2.0), (4.5, -2.0), (0.5, -2.0)]
         return [
             BoxObstacle(f"fdm_planner_eval_cross_box_{index}", x, y, dim, dim, height)
             for index, (x, y) in enumerate(centers)
@@ -263,7 +276,11 @@ def _sample_planner_eval_subterrain(rng: np.random.Generator) -> str:
     return str(rng.choice(names, p=weights))
 
 
-def _generate_planner_eval_outdoor(rng: np.random.Generator, difficulty: float) -> list[BoxObstacle]:
+def _generate_planner_eval_outdoor(
+    rng: np.random.Generator,
+    difficulty: float,
+    calibrated: bool = False,
+) -> list[BoxObstacle]:
     origin = np.asarray([5.0, 5.0], dtype=np.float64)
     platform_width = 1.0
     platform_clearance = 0.1
@@ -273,9 +290,9 @@ def _generate_planner_eval_outdoor(rng: np.random.Generator, difficulty: float) 
     platform_max *= 1.0 + platform_clearance
 
     obstacles: list[BoxObstacle] = []
-    num_boxes = int(rng.integers(2, 4))
-    box_x = _lerp(0.35, 0.9, difficulty)
-    box_y = _lerp(0.2, 0.45, difficulty)
+    num_boxes = 1 if calibrated else int(rng.integers(2, 4))
+    box_x = _lerp(0.35, 0.65 if calibrated else 0.9, difficulty)
+    box_y = _lerp(0.2, 0.35 if calibrated else 0.45, difficulty)
     for index, center in enumerate(_sample_centers_outside_platform(rng, num_boxes, platform_min, platform_max)):
         yaw = float(rng.uniform(-np.deg2rad(10.0), np.deg2rad(10.0)))
         obstacles.append(
@@ -290,8 +307,8 @@ def _generate_planner_eval_outdoor(rng: np.random.Generator, difficulty: float) 
             )
         )
 
-    num_cylinders = int(rng.integers(2, 4))
-    radius = _lerp(0.25, 0.45, difficulty)
+    num_cylinders = 1 if calibrated else int(rng.integers(2, 4))
+    radius = _lerp(0.22, 0.35 if calibrated else 0.45, difficulty)
     for index, center in enumerate(_sample_centers_outside_platform(rng, num_cylinders, platform_min, platform_max)):
         obstacles.append(
             BoxObstacle(

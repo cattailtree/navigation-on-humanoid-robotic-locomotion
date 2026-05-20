@@ -1237,9 +1237,7 @@ class FDMRunner:
             ###
             # Note: only start recording and changing actions when all feet have touched the ground
             feet_all_contact, dones, obs_new = self._feet_contact_handler(dones)
-            done_env_ids = torch.where(dones.to(torch.bool))[0]
-            if done_env_ids.numel() > 0:
-                self.replay_buffer.reset_local_history(done_env_ids)
+            buffer_dones = dones.to(torch.bool).clone()
             obs = obs_new if obs_new is not None else obs
 
             ###
@@ -1260,7 +1258,7 @@ class FDMRunner:
                     self.agent.update_ratios(self.env.curriculum_manager._term_cfgs[0].func.ratios)
 
             # get actions
-            actions = self.agent.act(obs, dones.to(torch.bool).clone(), feet_contact=feet_all_contact)
+            actions = self.agent.act(obs, buffer_dones.clone(), feet_contact=feet_all_contact)
 
             # debug viz
             self.agent.debug_viz()
@@ -1278,7 +1276,7 @@ class FDMRunner:
                     obs["fdm_obs_exteroceptive"].clone() if "fdm_obs_exteroceptive" in obs else None
                 ),
                 actions=actions.clone(),
-                dones=dones.to(torch.bool).clone(),
+                dones=buffer_dones.to(self.replay_buffer.device),
                 feet_contact=self.feet_contact,
                 add_observation_exteroceptive=(
                     obs["fdm_add_obs_exteroceptive"] if "fdm_add_obs_exteroceptive" in obs else None

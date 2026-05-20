@@ -14,6 +14,8 @@ class ReplayBufferCfg:
     # replay buffer
     trajectory_length: int = 150
     """How many commands steps are stored for each environment."""
+    slot_multiplier: int = 2
+    """Number of trajectory slots per simulated environment."""
     buffer_device: str = "cpu"
     """Device for the buffer.
 

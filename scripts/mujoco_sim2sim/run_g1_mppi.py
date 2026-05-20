@@ -154,6 +154,7 @@ def parse_args() -> argparse.Namespace:
             "none",
             "planner_eval",
             "planner_eval_2d",
+            "planner_eval_calib",
             "planner_eval_humanoid",
             "paper_figure",
             "sparse_boxes",
