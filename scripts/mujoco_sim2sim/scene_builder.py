@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import copy
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -77,6 +78,8 @@ def generate_scene_with_obstacles(base_xml: Path, obstacles: list[BoxObstacle], 
     output_xml.parent.mkdir(parents=True, exist_ok=True)
     tree = ET.parse(base_xml)
     root = tree.getroot()
+    _expand_relative_includes(root, base_xml.parent)
+    _relocate_relative_compiler_meshdir(root, base_xml.parent, output_xml.parent.resolve())
     _relocate_relative_includes(root, base_xml.parent, output_xml.parent.resolve())
     worldbody = root.find("worldbody")
     if worldbody is None:
@@ -121,6 +124,50 @@ def _relocate_relative_includes(root: ET.Element, base_dir: Path, output_dir: Pa
             include.attrib["file"] = Path(os.path.relpath(resolved, output_dir)).as_posix()
         except ValueError:
             include.attrib["file"] = resolved.as_posix()
+
+
+def _expand_relative_includes(root: ET.Element, base_dir: Path) -> None:
+    for include in list(root.findall("include")):
+        file_attr = include.attrib.get("file")
+        if not file_attr:
+            continue
+        include_path = Path(file_attr)
+        if include_path.is_absolute():
+            continue
+        resolved_include = include_path if include_path.is_absolute() else (base_dir / include_path).resolve()
+        if not resolved_include.exists():
+            continue
+        try:
+            include_root = ET.parse(resolved_include).getroot()
+        except ET.ParseError:
+            continue
+        _relocate_relative_compiler_meshdir(include_root, resolved_include.parent, base_dir)
+        insert_at = list(root).index(include)
+        root.remove(include)
+        for child in list(include_root):
+            root.insert(insert_at, copy.deepcopy(child))
+            insert_at += 1
+
+
+def _relocate_relative_compiler_meshdir(root: ET.Element, base_dir: Path, output_dir: Path) -> None:
+    compiler = root.find("compiler")
+    if compiler is None:
+        return
+    meshdir = compiler.attrib.get("meshdir")
+    if not meshdir:
+        return
+    compiler.attrib["meshdir"] = _relocated_path(meshdir, base_dir, output_dir)
+
+
+def _relocated_path(path_text: str, base_dir: Path, output_dir: Path) -> str:
+    path = Path(path_text)
+    if path.is_absolute():
+        return path.as_posix()
+    resolved = (base_dir / path).resolve()
+    try:
+        return Path(os.path.relpath(resolved, output_dir)).as_posix()
+    except ValueError:
+        return resolved.as_posix()
 
 
 def generate_fdm_terrain_obstacles(preset: str = "planner_eval", seed: int = 0) -> list[BoxObstacle]:

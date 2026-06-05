@@ -92,6 +92,15 @@ Run the Isaac-free FDM/MPPI bridge:
 C:\Users\Admin\IsaacLab\isaaclab.bat -p scripts/mujoco_sim2sim/run_g1_mppi.py --planner fdm --goal 5 0 0 --steps 1500 --policy-device cpu --height-scan raycast --fdm-population-size 128 --fdm-mppi-iterations 8
 ```
 
+Run the lightweight MPPI-only ablation batch:
+
+```powershell
+C:\Users\Admin\IsaacLab\isaaclab.bat -p scripts/mujoco_sim2sim/eval_g1_mppi_batch.py --planner mppi_only --eval-preset light_ablation --height-scan raycast
+```
+
+`light_ablation` uses 300 episodes, MPPI population 128, and excludes timeout
+episodes from aggregate metrics while still logging them in the summary CSV.
+
 This bridge keeps the saved May12 FDM model in the loop, feeds MuJoCo
 state/proprioception/history into it, and uses a local batched MPPI loop to
 warm-start, sample, score, and update command sequences. It mirrors the

@@ -1,0 +1,24 @@
+{
+  "apexnav_repo": "D:/ApexNav",
+  "groundingdino": {
+    "weights": "D:/groundingdino_swint_ogc.pth",
+    "default_endpoint": "http://127.0.0.1:12181/gdino",
+    "default_prompt": "elevator door . elevator sign . lift . doorway . corridor ."
+  },
+  "yolov7": {
+    "weights": "D:/yolov7-e6e.pt",
+    "default_endpoint": "http://127.0.0.1:12184/yolov7"
+  },
+  "llm": {
+    "task_parser_endpoint": "http://127.0.0.1:12182/parse_task",
+    "openai_compatible_endpoint": "http://127.0.0.1:8000/v1/chat/completions",
+    "default_model_env": "SEMANTIC_NAV_LLM_MODEL",
+    "api_key_env": "SEMANTIC_NAV_LLM_API_KEY"
+  },
+  "notes": [
+    "Keep ApexNav and VLM dependencies outside the fdm-mppi environment.",
+    "ApexNav's current server code expects weights under ApexNav/data/.",
+    "Use GroundingDINO first for elevator semantics because YOLOv7-e6e is a COCO detector unless fine-tuned.",
+    "Keep LLM task parsing out-of-process too; the navigation code consumes only a small JSON contract."
+  ]
+}

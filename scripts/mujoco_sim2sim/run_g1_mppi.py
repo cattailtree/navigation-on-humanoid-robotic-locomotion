@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import struct
+import zlib
 from datetime import datetime
 from pathlib import Path
 from xml.etree import ElementTree as ET
@@ -74,7 +76,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--check-only", action="store_true")
     parser.add_argument("--zero-controller", action="store_true", help="Use zero ctrl instead of requiring gait policy.")
     parser.add_argument("--zero-planner", action="store_true", help="Use zero high-level command for smoke tests.")
-    parser.add_argument("--planner", choices=("zero", "constant", "goal", "fdm"), default="zero")
+    parser.add_argument("--planner", choices=("zero", "constant", "goal", "fdm", "mppi_only"), default="zero")
     parser.add_argument("--test-command", type=float, nargs=3, metavar=("VX", "VY", "WZ"), default=None)
     parser.add_argument("--goal", type=float, nargs=3, metavar=("X", "Y", "YAW"), default=Sim2SimConfig.goal_xy_yaw)
     parser.add_argument("--max-vx", type=float, default=1.0)
@@ -85,6 +87,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fdm-mppi-gamma", type=float, default=1.0)
     parser.add_argument("--fdm-mppi-sigma", type=float, default=0.8)
     parser.add_argument("--fdm-mppi-beta", type=float, default=0.6)
+    parser.add_argument("--mppi-only-dt", type=float, default=0.5, help="SE(2) rollout timestep for --planner mppi_only.")
+    parser.add_argument(
+        "--mppi-only-collision-prob",
+        type=float,
+        default=0.0,
+        help="Constant synthetic collision probability for --planner mppi_only; scan costs still use MuJoCo height scans.",
+    )
     parser.add_argument("--fdm-action-min-vx", type=float, default=-0.10)
     parser.add_argument("--fdm-action-max-vx", type=float, default=1.50)
     parser.add_argument("--fdm-action-max-vy", type=float, default=0.10)
@@ -177,8 +186,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--generated-scene-path", type=Path, default=None)
     parser.add_argument("--log-csv", type=Path, default=None)
     parser.add_argument("--print-every", type=int, default=100)
+    parser.add_argument("--screenshot-dir", type=Path, default=None)
+    parser.add_argument(
+        "--screenshot-steps",
+        type=int,
+        nargs="*",
+        default=[],
+        help="Outer control steps to save as PNG screenshots, for example: --screenshot-steps 0 150 300.",
+    )
+    parser.add_argument(
+        "--screenshot-every",
+        type=int,
+        default=0,
+        help="Also save a screenshot every N outer control steps. 0 disables periodic screenshots.",
+    )
+    parser.add_argument("--screenshot-width", type=int, default=640)
+    parser.add_argument("--screenshot-height", type=int, default=480)
+    parser.add_argument("--screenshot-distance", type=float, default=6.0)
+    parser.add_argument("--screenshot-azimuth", type=float, default=135.0)
+    parser.add_argument("--screenshot-elevation", type=float, default=-45.0)
     parser.add_argument("--policy-device", type=str, default="cpu")
-    parser.add_argument("--policy-obs-dim", type=int, default=480)
+    parser.add_argument("--policy-obs-dim", type=int, default=495)
     parser.add_argument("--policy-action-dim", type=int, default=29)
     parser.add_argument("--policy-history", type=int, default=5)
     parser.add_argument(
@@ -192,7 +220,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--g1-obs-layout",
         choices=("auto", "g1_nav_96", "g1_policy_99"),
-        default="g1_nav_96",
+        default="g1_policy_99",
         help="G1 low-level policy observation layout. Lab NavigationSE2Action uses g1_nav_96: 96 x history 5 = 480.",
     )
     parser.add_argument(
@@ -258,9 +286,9 @@ def report_missing(args: argparse.Namespace) -> list[str]:
             missing.append(f"G1 mesh STL files referenced by XML: {preview}{suffix}")
     if args.low_level_policy is not None and not args.low_level_policy.exists():
         missing.append(f"G1 low-level policy file: {args.low_level_policy}")
-    if args.fdm_run is None and args.fdm_checkpoint is None:
+    if args.planner == "fdm" and args.fdm_run is None and args.fdm_checkpoint is None:
         missing.append("FDM run/checkpoint for MPPI model predictions")
-    elif args.fdm_checkpoint is not None and not args.fdm_checkpoint.exists():
+    elif args.planner == "fdm" and args.fdm_checkpoint is not None and not args.fdm_checkpoint.exists():
         missing.append(f"FDM checkpoint: {args.fdm_checkpoint}")
     return missing
 
@@ -396,6 +424,83 @@ def main() -> None:
             lateral_command_limit=args.fdm_lateral_command_limit,
             yaw_drift_limit=args.fdm_yaw_drift_limit,
         )
+    elif args.planner == "mppi_only":
+        planner = FDMPlannerAdapter(
+            checkpoint=args.fdm_checkpoint,
+            run_dir=args.fdm_run_dir,
+            device=args.fdm_device or args.policy_device,
+            population_size=args.fdm_population_size,
+            mppi_iterations=args.fdm_mppi_iterations,
+            mppi_gamma=args.fdm_mppi_gamma,
+            mppi_sigma=args.fdm_mppi_sigma,
+            mppi_beta=args.fdm_mppi_beta,
+            seed=args.fdm_seed,
+            replan_interval=args.fdm_replan_interval,
+            max_vx=args.max_vx,
+            max_vy=args.max_vy,
+            max_wz=args.max_wz,
+            action_min_vx=args.fdm_action_min_vx,
+            action_max_vx=args.fdm_action_max_vx,
+            action_max_vy=args.fdm_action_max_vy,
+            action_max_wz=args.fdm_action_max_wz,
+            gait_min_vx=args.fdm_gait_min_vx,
+            gait_max_vx=args.fdm_gait_max_vx,
+            gait_max_vy=args.fdm_gait_max_vy,
+            gait_max_wz=args.fdm_gait_max_wz,
+            tracking_prior_weight=args.fdm_tracking_prior_weight,
+            command_progress_weight=args.fdm_command_progress_weight,
+            terminal_progress_weight=args.fdm_terminal_progress_weight,
+            lateral_command_weight=args.fdm_lateral_command_weight,
+            goal_tolerance=args.fdm_goal_tolerance,
+            progress_guard_ratio=args.fdm_progress_guard_ratio,
+            progress_guard_max_risk=args.fdm_progress_guard_max_risk,
+            progress_guard_max_scan_cost=args.fdm_progress_guard_max_scan_cost,
+            terminal_position_weight=args.fdm_terminal_position_weight,
+            terminal_rot_weight=args.fdm_terminal_rot_weight,
+            terminal_heading_to_goal_weight=args.fdm_terminal_heading_to_goal_weight,
+            collision_traj_factor=args.fdm_collision_traj_factor,
+            collision_high_risk_factor=args.fdm_collision_high_risk_factor,
+            collision_threshold=args.fdm_collision_threshold,
+            collision_safety_factor=args.fdm_collision_safety_factor,
+            collision_num_neighbors=args.fdm_collision_num_neighbors,
+            collision_neighbor_spread_weight=args.fdm_collision_neighbor_spread_weight,
+            velocity_tracking_weight=args.fdm_velocity_tracking_weight,
+            desired_velocity=args.fdm_desired_velocity,
+            action_cost_dt=args.fdm_action_cost_dt,
+            heading_running_weight=args.fdm_heading_running_weight,
+            smooth_vx_weight=args.fdm_smooth_vx_weight,
+            smooth_vy_weight=args.fdm_smooth_vy_weight,
+            smooth_wz_weight=args.fdm_smooth_wz_weight,
+            yaw_rate_change_weight=args.fdm_yaw_rate_change_weight,
+            near_obstacle_soft_weight=args.fdm_near_obstacle_soft_weight,
+            near_obstacle_hard_weight=args.fdm_near_obstacle_hard_weight,
+            near_obstacle_soft_distance=args.fdm_near_obstacle_soft_distance,
+            near_obstacle_hard_distance=args.fdm_near_obstacle_hard_distance,
+            scan_obstacle_weight=args.fdm_scan_obstacle_weight,
+            scan_obstacle_clearance=args.fdm_scan_obstacle_clearance,
+            scan_obstacle_height_threshold=args.fdm_scan_obstacle_height_threshold,
+            scan_obstacle_relative_to_floor=args.fdm_scan_obstacle_relative_to_floor,
+            scan_floor_percentile=args.fdm_scan_floor_percentile,
+            scan_use_footprint=args.fdm_scan_use_footprint,
+            scan_footprint_front=args.fdm_scan_footprint_front,
+            scan_footprint_back=args.fdm_scan_footprint_back,
+            scan_footprint_half_width=args.fdm_scan_footprint_half_width,
+            near_obstacle_speed_weight=args.fdm_near_obstacle_speed_weight,
+            near_obstacle_slow_distance=args.fdm_near_obstacle_slow_distance,
+            near_obstacle_stop_distance=args.fdm_near_obstacle_stop_distance,
+            front_obstacle_width=args.fdm_front_obstacle_width,
+            front_obstacle_lookahead=args.fdm_front_obstacle_lookahead,
+            front_obstacle_min_vx=args.fdm_front_obstacle_min_vx,
+            height_scan_offset_x=args.height_scan_offset_x,
+            height_scan_offset_y=args.height_scan_offset_y,
+            stabilize_command=args.fdm_stabilize_command,
+            yaw_command_limit=args.fdm_yaw_command_limit,
+            lateral_command_limit=args.fdm_lateral_command_limit,
+            yaw_drift_limit=args.fdm_yaw_drift_limit,
+            use_fdm_model=False,
+            kinematic_dt=args.mppi_only_dt,
+            kinematic_collision_prob=args.mppi_only_collision_prob,
+        )
     else:
         planner = ZeroPlannerAdapter()
     if args.zero_planner:
@@ -431,10 +536,14 @@ def main() -> None:
     print(f"[SIM2SIM] Loaded {args.g1_xml}")
     print(f"[SIM2SIM] nq={env.model.nq} nv={env.model.nv} nu={env.model.nu} dt={env.physics_dt}")
     print(f"[SIM2SIM] height_scan={args.height_scan} shape={height_scan.shape} resolution={height_scan.resolution}")
+    screenshot_steps = set(int(step) for step in args.screenshot_steps if step >= 0)
+    if args.screenshot_dir is not None:
+        args.screenshot_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[SIM2SIM] screenshots -> {args.screenshot_dir}")
 
     goal = tuple(args.goal)
     last_command = LowLevelCommand.zeros()
-    debug_columns = FDM_DEBUG_COLUMNS if args.planner == "fdm" and not args.zero_planner else []
+    debug_columns = FDM_DEBUG_COLUMNS if args.planner in ("fdm", "mppi_only") and not args.zero_planner else []
     csv_file = None
     csv_writer = None
     if args.log_csv is not None:
@@ -506,6 +615,7 @@ def main() -> None:
         )
         print(f"[SIM2SIM] Logging CSV to {default_log}")
 
+    renderer = None
     for step_idx in range(args.steps):
         height_scan_obs = env.observe_height_scan()
         obs = PlannerObservation(
@@ -566,9 +676,23 @@ def main() -> None:
                 f"height=[{height_min:.3f},{height_max:.3f},{height_mean:.3f},{height_std:.3f};"
                 f"obs={height_obstacle_pixels};fdm_hits={scan_debug.get('height_fdm_hit_count', 0)}]"
             )
+        if _should_save_screenshot(step_idx, screenshot_steps, args.screenshot_every):
+            renderer = _save_screenshot(
+                env,
+                renderer,
+                args.screenshot_dir,
+                step_idx,
+                width=args.screenshot_width,
+                height=args.screenshot_height,
+                distance=args.screenshot_distance,
+                azimuth=args.screenshot_azimuth,
+                elevation=args.screenshot_elevation,
+            )
 
     if csv_file is not None:
         csv_file.close()
+    if renderer is not None and hasattr(renderer, "close"):
+        renderer.close()
 
     print("[SIM2SIM] Smoke test completed.")
 
@@ -588,6 +712,72 @@ def _count_obstacle_pixels(
         return 0
     floor_height = float(np.percentile(finite_height, floor_percentile))
     return int(np.count_nonzero((height - floor_height) > threshold))
+
+
+def _should_save_screenshot(step_idx: int, screenshot_steps: set[int], screenshot_every: int) -> bool:
+    if step_idx in screenshot_steps:
+        return True
+    return screenshot_every > 0 and step_idx % screenshot_every == 0
+
+
+def _save_screenshot(
+    env: MujocoG1Env,
+    renderer,
+    screenshot_dir: Path | None,
+    step_idx: int,
+    *,
+    width: int,
+    height: int,
+    distance: float,
+    azimuth: float,
+    elevation: float,
+):
+    if screenshot_dir is None:
+        return renderer
+    mujoco = env.mujoco
+    if renderer is None:
+        width = min(int(width), int(env.model.vis.global_.offwidth))
+        height = min(int(height), int(env.model.vis.global_.offheight))
+        renderer = mujoco.Renderer(env.model, height=height, width=width)
+
+    camera = mujoco.MjvCamera()
+    pose = env.base_xyz_rpy()
+    camera.lookat[:] = [float(pose[0]), float(pose[1]), 0.6]
+    camera.distance = float(distance)
+    camera.azimuth = float(azimuth)
+    camera.elevation = float(elevation)
+    renderer.update_scene(env.data, camera=camera)
+    rgb = renderer.render()
+    out_path = screenshot_dir / f"sim2sim_step_{step_idx:06d}.png"
+    _write_png_rgb(out_path, rgb)
+    print(f"[SIM2SIM] screenshot saved: {out_path}")
+    return renderer
+
+
+def _write_png_rgb(path: Path, rgb: np.ndarray) -> None:
+    image = np.asarray(rgb, dtype=np.uint8)
+    if image.ndim != 3 or image.shape[2] not in (3, 4):
+        raise ValueError(f"Expected RGB/RGBA image, got shape {image.shape}.")
+    if image.shape[2] == 4:
+        image = image[:, :, :3]
+    height, width, _channels = image.shape
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + tag
+            + data
+            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        )
+
+    raw_rows = b"".join(b"\x00" + image[row].tobytes() for row in range(height))
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(raw_rows, level=6))
+        + chunk(b"IEND", b"")
+    )
+    path.write_bytes(png)
 
 
 if __name__ == "__main__":

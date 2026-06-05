@@ -224,6 +224,8 @@ class TrajectoryOptimizerCfg:
     collision_cost_traj_factor: float = 0.5
     collision_cost_high_risk_factor: float = 100.0
     collision_cost_safety_factor: float = 1.0
+    collision_cost_disable_goal_radius: float = 0.0
+    mppi_risk_cost_disable_goal_radius: float = 0.0
 
     # sum the cost of neighbors to suppress isolated wrong collision predictions
     num_neighbors: int = 2

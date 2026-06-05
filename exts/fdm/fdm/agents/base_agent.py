@@ -97,6 +97,9 @@ class Agent(ABC):
         # 2) After warmup: normal logic
         # --------------------------------------------------
         active_envs = ~still_warmup
+        if hasattr(self._runner, "replay_buffer"):
+            collect_active_envs = ~self._runner.replay_buffer.env_buffer_filled.to(self.device)
+            active_envs &= collect_active_envs
 
         # collision-triggered reset only after warmup
         coll_reset_mask = colliding_envs & active_envs
@@ -146,6 +149,8 @@ class Agent(ABC):
 
         # freeze warmup envs with zero action
         actions[still_warmup] = 0.0
+        if hasattr(self._runner, "replay_buffer"):
+            actions[~collect_active_envs] = 0.0
 
         return actions
 

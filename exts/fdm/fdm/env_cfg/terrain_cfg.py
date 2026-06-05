@@ -13,7 +13,7 @@ def _flat_reference(proportion: float = 0.10):
     return terrain_gen.HfRandomUniformTerrainCfg(
         proportion=proportion,
         noise_range=(0.0, 0.004),
-        noise_step=0.004,
+        noise_step=0.005,
         border_width=0.25,
         vertical_scale=0.001,
     )
@@ -33,7 +33,7 @@ def _grass_floor(proportion: float):
     return terrain_gen.HfRandomUniformTerrainCfg(
         proportion=proportion,
         noise_range=(-0.012, 0.020),
-        noise_step=0.008,
+        noise_step=0.005,
         border_width=0.25,
         vertical_scale=0.003,
     )
@@ -53,7 +53,7 @@ def _mud_floor(proportion: float):
     return terrain_gen.HfRandomUniformTerrainCfg(
         proportion=proportion,
         noise_range=(-0.035, 0.030),
-        noise_step=0.022,
+        noise_step=0.025,
         border_width=0.25,
         vertical_scale=0.006,
     )

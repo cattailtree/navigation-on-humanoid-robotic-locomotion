@@ -133,24 +133,46 @@ class TrajectoryDataset(Dataset):
             if self.cfg.collision_rate is not None:
                 num_regular = int(self.cfg.num_samples * (1 - self.cfg.collision_rate))
                 num_collision = self.cfg.num_samples - num_regular
+                available_regular = traj_start_idx.shape[0]
+                available_collision = coll_start_idx.shape[0]
                 if coll_start_idx.shape[0] == 0:
                     num_regular = self.cfg.num_samples
                     num_collision = 0
                 assert traj_start_idx.shape[0] > 0, "No valid regular samples found in replay buffer!"
-                assert (
-                    num_regular <= traj_start_idx.shape[0]
-                ), "Not enough regular samples to balance data!"
-                perm = torch.randperm(traj_start_idx.shape[0], device=self.replay_buffer_cfg.buffer_device)
-                traj_start_idx = traj_start_idx[perm[:num_regular]]
+                if num_regular <= traj_start_idx.shape[0]:
+                    perm = torch.randperm(traj_start_idx.shape[0], device=self.replay_buffer_cfg.buffer_device)
+                    traj_start_idx = traj_start_idx[perm[:num_regular]]
+                else:
+                    print(
+                        "[WARNING] Repeating regular samples:"
+                        f" requested={num_regular}, available={available_regular},"
+                        f" repeat_factor={num_regular / max(available_regular, 1):.2f}"
+                    )
+                    traj_start_idx = traj_start_idx.repeat(
+                        num_regular // traj_start_idx.shape[0] + 1, 1
+                    )
+                    traj_start_idx = traj_start_idx[:num_regular]
                 if num_collision <= coll_start_idx.shape[0]:
                     perm = torch.randperm(coll_start_idx.shape[0], device=self.replay_buffer_cfg.buffer_device)
                     coll_start_idx = coll_start_idx[perm[:num_collision]]
                 else:
+                    print(
+                        "[WARNING] Repeating collision samples:"
+                        f" requested={num_collision}, available={available_collision},"
+                        f" repeat_factor={num_collision / max(available_collision, 1):.2f}"
+                    )
                     coll_start_idx = coll_start_idx.repeat(
                         num_collision // coll_start_idx.shape[0] + 1, 1
                     )
                     coll_start_idx = coll_start_idx[:num_collision]
                 start_idx = torch.vstack([traj_start_idx, coll_start_idx])
+                regular_slots = torch.unique(traj_start_idx[:, 0]).numel()
+                collision_slots = torch.unique(coll_start_idx[:, 0]).numel() if num_collision > 0 else 0
+                print(
+                    "[INFO] Dataset sampling candidates:"
+                    f" regular={available_regular} windows/{regular_slots} slots,"
+                    f" collision={available_collision} windows/{collision_slots} slots"
+                )
             else:
                 start_idx = torch.vstack([traj_start_idx, coll_start_idx])
 
@@ -869,9 +891,8 @@ class TrajectoryDataset(Dataset):
             perm = torch.randperm(valid_pairs.shape[0], device=device)[: self.cfg.num_samples]
             return valid_pairs[perm]
 
-        repeat_times = self.cfg.num_samples // valid_pairs.shape[0] + 1
         perm = torch.randperm(valid_pairs.shape[0], device=device)
-        return valid_pairs[perm].repeat(repeat_times, 1)[: self.cfg.num_samples]
+        return valid_pairs[perm]
 
     def _sample_collision_traj(self, replay_buffer: ReplayBuffer):
         device = self.replay_buffer_cfg.buffer_device
@@ -916,8 +937,13 @@ class TrajectoryDataset(Dataset):
         if valid_terminal_envs.shape[0] == 0:
             return torch.empty((0, 2), device=device, dtype=torch.long)
 
-        rand = torch.rand(valid_terminal_envs.shape[0], device=device)
-        start_idx = start_min + torch.floor(rand * (start_max - start_min + 1).float()).long()
+        start_counts = start_max - start_min + 1
+        total_starts = int(start_counts.sum().item())
+        terminal_offsets = torch.cumsum(start_counts, dim=0) - start_counts
+        valid_terminal_envs = torch.repeat_interleave(valid_terminal_envs, start_counts)
+        start_idx = torch.arange(total_starts, device=device)
+        start_idx = start_idx - torch.repeat_interleave(terminal_offsets, start_counts)
+        start_idx = start_idx + torch.repeat_interleave(start_min, start_counts)
         non_initial_collision = ~replay_buffer.states[valid_terminal_envs, start_idx, 0, 7].to(torch.bool)
         valid_terminal_envs = valid_terminal_envs[non_initial_collision]
         start_idx = start_idx[non_initial_collision]

@@ -10,7 +10,6 @@ import math
 import numpy as np
 import os
 import pickle
-import subprocess
 import torch
 import torch.nn.functional as F
 from scipy.spatial.distance import cdist
@@ -58,12 +57,7 @@ class SimpleSE2TrajectoryOptimizer:
             device (torch.device): The device (CPU/GPU) on which to perform the computations.
         """
 
-        self.action_cfg  = ActionCfg(
-        action_dim=3,
-        traj_dim=10,   # 按你的 horizon 改
-        lower_bound=[-0.1, -0.1, -1.0],
-        upper_bound=[1.5,  0.1,  1.0],
-        )
+        self.action_cfg = action_cfg
         self.to_cfg = to_cfg
         self.device = device
         self.frame_id = "odom"
@@ -80,9 +74,7 @@ class SimpleSE2TrajectoryOptimizer:
         )
 
         if self.to_cfg.states_cost_w_cost_map:
-            weight_file = subprocess.getoutput(
-                'echo "' + os.path.join(FDM_DATA_DIR, "Traversability-Model", "weights.dat") + '"'
-            )
+            weight_file = os.path.join(FDM_DATA_DIR, "Traversability-Model", "weights.dat")
             with open(weight_file, "rb") as file:
                 weights = pickle.load(file)
             self.traversability_filter = TraversabilityFilter(
@@ -261,7 +253,13 @@ class SimpleSE2TrajectoryOptimizer:
         if control_mode is None:
             control_mode = self.to_cfg.control
 
-        if control_mode == "velocity_control":
+        if control_mode == "direct_command":
+            population = population.permute(1, 0, 2, 3).contiguous()
+            actions = population
+            states = start_state[:, :, None, :].repeat(1, 1, TRAJ_LENGTH, 1)
+            self.latest_local_states = None
+
+        elif control_mode == "velocity_control":
             # Each population / action is given in the base frame of the robot
             population = population.permute(1, 0, 2, 3).contiguous()  # BS, NR_TRAJ, TRAJ_LENGTH, CONTROL_DIM
 
@@ -509,6 +507,13 @@ class SimpleSE2TrajectoryOptimizer:
         if only_rollout:
             return states
 
+        if control_mode == "direct_command":
+            total_cost = self.direct_command_cost(actions)
+            self.states = states
+            self.total_cost = total_cost
+            self.population = population.permute(1, 0, 2, 3)
+            return -total_cost.T
+
         # calculate the running cost
         running_cost = self.states_cost(states.clone(), actions)
         if self.to_cfg.debug:
@@ -521,6 +526,9 @@ class SimpleSE2TrajectoryOptimizer:
 
         if self.to_cfg.control == "fdm" or self.to_cfg.control == "fdm_baseline":
             collision_cost = self.collision_cost(states, collision_prob_traj)
+            near_goal = self._near_goal_mask(float(getattr(self.to_cfg, "collision_cost_disable_goal_radius", 0.0)))
+            if near_goal is not None:
+                collision_cost = collision_cost * (~near_goal)[:, None]
             self.debug_info["collision_cost"] = collision_cost.clone()
 
             total_cost += collision_cost
@@ -528,6 +536,9 @@ class SimpleSE2TrajectoryOptimizer:
         elif self.to_cfg.states_cost_w_cost_map:
             assert self.to_cfg.control != "fdm_baseline", "The height scan is not available for the baseline model"
             self.curr_cost_map_cost = self.cost_map_cost(local_states)
+            near_goal = self._near_goal_mask(float(getattr(self.to_cfg, "mppi_risk_cost_disable_goal_radius", 0.0)))
+            if near_goal is not None:
+                self.curr_cost_map_cost = self.curr_cost_map_cost * (~near_goal)[:, None]
             self.debug_info["cost_map_cost"] = self.curr_cost_map_cost.clone()
 
             total_cost += self.curr_cost_map_cost
@@ -690,6 +701,12 @@ class SimpleSE2TrajectoryOptimizer:
                     and self.latest_local_states.shape[2] == states.shape[2]
             ):
                 near_obstacle_cost = self.near_obstacle_cost(self.latest_local_states)
+        risk_disable_mask = self._near_goal_mask(
+            float(getattr(self.to_cfg, "mppi_risk_cost_disable_goal_radius", 0.0))
+        )
+        if risk_disable_mask is not None:
+            near_obstacle_cost = near_obstacle_cost * (~risk_disable_mask)[:, None, None]
+            stair_alignment_cost = stair_alignment_cost * (~risk_disable_mask)[:, None, None]
 
         # ------------------------------------------------------------------
         # zero action-related costs if goal already reached
@@ -733,6 +750,15 @@ class SimpleSE2TrajectoryOptimizer:
 
 
         return total_cost
+
+    def _near_goal_mask(self, radius: float) -> torch.Tensor | None:
+        if radius <= 0.0:
+            return None
+        start_to_goal = torch.norm(
+            self.obs["start"][self.env_ids, :2] - self.obs["goal"][self.env_ids, :2],
+            dim=-1,
+        )
+        return start_to_goal < radius
 
     def terminal_cost(self, state: torch.Tensor) -> torch.Tensor:
         """
@@ -1120,6 +1146,45 @@ class SimpleSE2TrajectoryOptimizer:
         cost[:, :, 1:] = diff_wz * w
         cost[:, :, 0] = diff_wz[:, :, 0] * w
         return cost
+
+    def direct_command_cost(self, actions: torch.Tensor) -> torch.Tensor:
+        """
+        Command-only MPPI objective.
+
+        This deliberately does not predict candidate future poses. It scores
+        sampled command sequences by whether their immediate command direction
+        points toward the current goal, while keeping commands smooth and
+        forward-moving. It is a light baseline, not a dynamics model.
+        """
+        goal_vec_w = self.obs["goal"][self.env_ids, :2] - self.obs["start"][self.env_ids, :2]
+        goal_heading_w = torch.atan2(goal_vec_w[:, 1], goal_vec_w[:, 0])
+        start_yaw = self.obs["start"][self.env_ids, 2]
+        goal_heading_b = self._wrap_to_pi(goal_heading_w - start_yaw)
+
+        cmd_heading_b = torch.atan2(actions[..., 1], actions[..., 0] + 1e-6)
+        heading_err = torch.abs(self._wrap_to_pi(cmd_heading_b - goal_heading_b[:, None, None]))
+        cmd_speed = torch.norm(actions[..., :2], dim=-1)
+        forward_deficit = torch.relu(float(getattr(self.to_cfg, "state_cost_desired_velocity", 0.35)) - actions[..., 0])
+
+        yaw_cmd_target = torch.clamp(goal_heading_b, min=-1.0, max=1.0)
+        yaw_err = torch.abs(actions[..., 2] - yaw_cmd_target[:, None, None])
+
+        side_cost = torch.abs(actions[..., 1]) * getattr(self.to_cfg, "state_cost_w_action_trans_side_biped", 1.0)
+        smooth_cost = self.smoothness_cost(actions)
+        yaw_smooth_cost = self.yaw_rate_change_cost(actions)
+
+        running_cost = (
+            heading_err * max(float(getattr(self.to_cfg, "state_cost_w_heading_running", 0.0)), 1.0)
+            + yaw_err * max(float(getattr(self.to_cfg, "terminal_cost_w_rot_error", 0.0)), 1.0)
+            + forward_deficit * max(float(getattr(self.to_cfg, "state_cost_velocity_tracking", 0.0)), 0.5)
+            + side_cost
+            + smooth_cost
+            + yaw_smooth_cost
+        )
+
+        backward_penalty = torch.relu(-actions[..., 0]) * 10.0
+        running_cost = running_cost + backward_penalty
+        return running_cost.mean(dim=2)
 
     def heading_running_cost(self, states: torch.Tensor) -> torch.Tensor:
         """

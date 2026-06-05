@@ -273,7 +273,14 @@ class ReplayBuffer:
         if not torch.any(open_slots):
             return
 
-        self.valid_idx[open_slots] = self.slot_fill_idx[open_slots]
+        min_valid_length = self.model_cfg.prediction_horizon + 2
+        valid_open_slots = open_slots & (self.slot_fill_idx >= min_valid_length)
+        invalid_open_slots = open_slots & ~valid_open_slots
+
+        self.valid_idx[valid_open_slots] = self.slot_fill_idx[valid_open_slots]
+        self.valid_idx[invalid_open_slots] = 0
+        self.terminal_idx[invalid_open_slots] = 0
+        self.slot_fill_idx[invalid_open_slots] = 0
         self.slot_closed[open_slots] = True
         self.env_slot_idx[:] = -1
 
@@ -552,13 +559,30 @@ class ReplayBuffer:
             first_collision_slots = self.env_slot_idx[first_collision_idxs]
             self.terminal_idx[first_collision_slots] = self.slot_fill_idx[first_collision_slots]
 
-        close_done_mask = dones & active_envs & (self.slot_fill_idx[active_slots] > 0)
+        min_valid_length = self.model_cfg.prediction_horizon + 2
+        close_done_mask = dones & active_envs & (self.slot_fill_idx[active_slots] >= min_valid_length)
         close_done_idxs = self._ALL_INDICES[close_done_mask]
         if len(close_done_idxs) > 0:
             close_slots = self.env_slot_idx[close_done_idxs]
             self.valid_idx[close_slots] = self.slot_fill_idx[close_slots]
             self.slot_closed[close_slots] = True
             self.env_slot_idx[close_done_idxs] = -1
+
+        discard_done_mask = dones & active_envs & (self.slot_fill_idx[active_slots] < min_valid_length)
+        discard_done_idxs = self._ALL_INDICES[discard_done_mask]
+        if len(discard_done_idxs) > 0:
+            discard_slots = self.env_slot_idx[discard_done_idxs]
+            self.slot_fill_idx[discard_slots] = 0
+            self.terminal_idx[discard_slots] = self.cfg.trajectory_length
+            self.valid_idx[discard_slots] = self.cfg.trajectory_length
+            self.slot_closed[discard_slots] = False
+            self.states[discard_slots] = 0
+            self.observations_proprioceptive[discard_slots] = 0
+            self.actions[discard_slots] = 0
+            if self._has_add_exteroceptive_observation:
+                self.add_observations_exteroceptive[discard_slots] = 0
+            if self._has_exteroceptive_observation:
+                self.observations_exteroceptive[discard_slots] = 0
 
         # -------- write --------
         updatable_idxs = self._ALL_INDICES[sampling_mask]

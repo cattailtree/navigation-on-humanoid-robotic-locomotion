@@ -30,7 +30,7 @@ class NavigationSE2Action(ActionTerm):
         # load policies（这里就是你的 G1 行走 .pt）
         file_bytes = read_file(self.cfg.low_level_policy_file)
         self.low_level_policy = torch.jit.load(file_bytes, map_location=self.device)
-        self.low_level_policy = torch.jit.freeze(self.low_level_policy.eval())
+        self.low_level_policy = self.low_level_policy.eval()
 
         # prepare joint position actions
         if not isinstance(self.cfg.low_level_action, list):
@@ -193,7 +193,22 @@ class NavigationSE2Action(ActionTerm):
             )
             # 这里的 low_level_obs 里已经包含了 velocity_commands 这一项
             # 我们刚刚通过 env.navigation_commands 把它改成了导航 SE2 命令
-            self._low_level_actions[:] = self.low_level_policy(low_level_obs)
+            if self.cfg.low_level_policy_mode == "dwaq":
+                if self.cfg.low_level_obs_dim is None:
+                    raise ValueError("low_level_obs_dim must be set for DWAQ policies")
+                obs_dim = int(self.cfg.low_level_obs_dim)
+                if low_level_obs.shape[1] % obs_dim != 0:
+                    raise ValueError(
+                        f"DWAQ observation width {low_level_obs.shape[1]} is not divisible by obs_dim={obs_dim}"
+                    )
+                history_obs = self._frame_major_history(low_level_obs, obs_dim)
+                current_obs = history_obs[:, -obs_dim:]
+                with torch.no_grad():
+                    policy_actions = self.low_level_policy(current_obs, history_obs)
+            else:
+                with torch.no_grad():
+                    policy_actions = self.low_level_policy(low_level_obs)
+            self._low_level_actions.copy_(policy_actions.detach().clone())
 
             # reorder joints
             if self.cfg.reorder_joint_list is not None:
@@ -202,7 +217,7 @@ class NavigationSE2Action(ActionTerm):
             # split the actions and apply to each tensor
             idx = 0
             for term in self.low_level_action_terms:
-                term_actions = self._low_level_actions[:, idx: idx + term.action_dim]
+                term_actions = self._low_level_actions[:, idx: idx + term.action_dim].detach().clone()
                 term.process_actions(term_actions)
                 idx += term.action_dim
 
@@ -233,6 +248,28 @@ class NavigationSE2Action(ActionTerm):
 
         # 🔥 新增：SE2 命令 buffer（例如 [vx, vy, yaw_rate]）
         self._se2_commands = torch.zeros(self.num_envs, self.cfg.action_dim, device=self.device)
+
+    def _frame_major_history(self, obs: torch.Tensor, obs_dim: int) -> torch.Tensor:
+        if not self.cfg.low_level_obs_term_dims:
+            return obs
+        history = int(self.cfg.low_level_obs_history)
+        term_dims = list(self.cfg.low_level_obs_term_dims)
+        expected = history * sum(term_dims)
+        if obs.shape[1] != expected or sum(term_dims) != obs_dim:
+            raise ValueError(
+                "DWAQ observation layout mismatch: "
+                f"got width={obs.shape[1]}, expected={expected}, obs_dim={obs_dim}, term_dims={term_dims}"
+            )
+        frames = []
+        start = 0
+        term_chunks = []
+        for dim in term_dims:
+            width = dim * history
+            term_chunks.append(obs[:, start:start + width].reshape(self.num_envs, history, dim))
+            start += width
+        for frame_idx in range(history):
+            frames.append(torch.cat([chunk[:, frame_idx, :] for chunk in term_chunks], dim=-1))
+        return torch.cat(frames, dim=-1)
 
     def reset(self, env_ids: torch.Tensor | None = None):
         if env_ids is None:

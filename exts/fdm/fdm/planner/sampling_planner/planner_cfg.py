@@ -21,8 +21,8 @@ def get_planner_cfg(
             "traj_dim": traj_dim,
 
             # 避障任务：允许一定 lateral，但不要过大，否则容易绕圈
-            "lower_bound": [-0.1, -0.1, -1.0],
-            "upper_bound": [1.5,  0.1, 1.0],
+            "lower_bound": [VEL_RANGE_X[0], VEL_RANGE_Y[0], VEL_RANGE_YAW[0]],
+            "upper_bound": [VEL_RANGE_X[1], VEL_RANGE_Y[1], VEL_RANGE_YAW[1]],
         },
         "to_cfg": {
             "_target_": "fdm.planner.TrajectoryOptimizerCfg",

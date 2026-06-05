@@ -31,6 +31,22 @@ class NavigationSE2ActionCfg(ActionTermCfg):
     low_level_obs_group: str = "low_level_policy"
     """Observation group of the low level policy."""
 
+    low_level_policy_mode: Literal["single", "dwaq"] = "single"
+    """How to call the low-level policy.
+
+    ``single`` calls ``policy(obs)``. ``dwaq`` expects the observation group to
+    concatenate history and calls ``policy(current_obs, history_obs)``.
+    """
+
+    low_level_obs_dim: int | None = None
+    """Single-frame observation dimension for multi-input low-level policies."""
+
+    low_level_obs_history: int = 1
+    """History length encoded in the low-level observation group."""
+
+    low_level_obs_term_dims: list[int] | None = None
+    """Per-term single-frame dimensions used to convert term-major history to frame-major history."""
+
     reorder_joint_list: list[str] | None = None
     """Reorder the joint actions. Default is None.
 

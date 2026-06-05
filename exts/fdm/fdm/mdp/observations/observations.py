@@ -876,3 +876,32 @@ def gait_phase(env: ManagerBasedRLEnv, period: float) -> torch.Tensor:
     phase[:, 0] = torch.sin(global_phase * torch.pi * 2.0)
     phase[:, 1] = torch.cos(global_phase * torch.pi * 2.0)
     return phase
+
+
+def dwaq_gait_phase(env: ManagerBasedRLEnv, period: float, offset: float = 0.5, layout: str = "deploy") -> torch.Tensor:
+    """Four-dimensional gait phase used by the DWAQ G1 policy.
+
+    ``deploy`` follows LeggedLabDeploy's SDK script: sin_L, cos_L, sin_R, cos_R.
+    ``train`` follows the training env concatenation: sin_L, sin_R, cos_L, cos_R.
+    """
+    if not hasattr(env, "episode_length_buf"):
+        env.episode_length_buf = torch.zeros(env.num_envs, device=env.device, dtype=torch.long)
+    global_phase = (env.episode_length_buf * env.step_dt) % period / period
+    right_phase = torch.remainder(global_phase + offset, 1.0)
+    sin_left = torch.sin(global_phase * torch.pi * 2.0)
+    cos_left = torch.cos(global_phase * torch.pi * 2.0)
+    sin_right = torch.sin(right_phase * torch.pi * 2.0)
+    cos_right = torch.cos(right_phase * torch.pi * 2.0)
+    if layout == "train":
+        return torch.stack((sin_left, sin_right, cos_left, cos_right), dim=-1)
+    if layout != "deploy":
+        raise ValueError(f"Unsupported DWAQ gait phase layout: {layout}")
+    return torch.stack(
+        (
+            sin_left,
+            cos_left,
+            sin_right,
+            cos_right,
+        ),
+        dim=-1,
+    )

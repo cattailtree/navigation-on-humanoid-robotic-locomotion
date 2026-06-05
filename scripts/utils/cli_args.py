@@ -41,7 +41,7 @@ def add_fdm_args(parser: argparse.ArgumentParser, default_num_envs: int = 2048):
         "--ablation_mode",
         type=str,
         default=None,
-        choices=["no_state_obs", "no_proprio_obs", "no_height_scan"],
+        choices=["no_state_obs", "no_proprio_obs", "no_height_scan", "no_height", "no_risk"],
         help="Ablation mode to use.",
     )
     parser.add_argument("--timestamp", type=float, default=None, help="Command timestep of the model.")

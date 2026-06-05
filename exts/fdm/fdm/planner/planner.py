@@ -10,6 +10,7 @@ import math
 import os
 import prettytable
 import torch
+from pathlib import Path
 
 import cv2
 import hydra
@@ -86,13 +87,18 @@ class FDMPlanner:
         # setup
         self.setup()
 
-        # resume model and set into eval mode
+        # resume model and set into eval mode only when the optimizer actually uses FDM predictions.
         self.log_root_path = os.path.join("logs", "fdm", self.cfg.experiment_name)
         self.log_root_path = os.path.abspath(self.log_root_path)
-        resume_path = get_checkpoint_path(self.log_root_path, self.cfg.load_run, self.cfg.load_checkpoint)
-        self.model.load(resume_path)
-        self.model.eval()
-        print(f"[INFO]: Loaded model checkpoint from: {resume_path}")
+        self.uses_fdm_model = self.planner_cfg["to_cfg"].get("control") in ["fdm", "fdm_baseline"]
+        if self.uses_fdm_model:
+            resume_path = get_checkpoint_path(self.log_root_path, self.cfg.load_run, self.cfg.load_checkpoint)
+            self.model.load(resume_path)
+            self.model.eval()
+            print(f"[INFO]: Loaded model checkpoint from: {resume_path}")
+        else:
+            self.model.eval()
+            print("[INFO]: MPPI velocity_control mode: skipping FDM checkpoint load.")
 
     """
     Properties
@@ -189,6 +195,14 @@ class FDMPlanner:
 
         # extract goal command generator
         goal_command: GoalCommand = self.env.command_manager._terms["command"]
+        demo_recorder = None
+        if getattr(self.args_cli, "record_demo", False):
+            demo_recorder = _ViewportDemoRecorder(
+                out_dir=Path(getattr(self.args_cli, "record_demo_dir")),
+                env_ids=getattr(self.args_cli, "record_demo_env_ids", [0, 1]),
+                every=max(1, int(getattr(self.args_cli, "record_demo_every", 2))),
+                max_frames=max(1, int(getattr(self.args_cli, "record_demo_max_frames", 900))),
+            )
 
         # path length and episode time are getting overwritten when reset, save the last one to catch the correct value
         # for the terminated environments
@@ -305,7 +319,7 @@ class FDMPlanner:
                 obs["planner_obs"]["proprio_obs"] = self._proprio_obs_history.clone()
                 obs["planner_obs"]["extero_obs"] = obs["fdm_obs_exteroceptive"].clone()
                 # ablation studies
-                if self.args_cli.ablation_mode == "no_height_scan":
+                if self.args_cli.ablation_mode in ["no_height_scan", "no_height"]:
                     obs["planner_obs"]["extero_obs"] *= 0.0
                 elif self.args_cli.ablation_mode == "no_state_obs":
                     obs["planner_obs"]["states"] *= 0.0
@@ -321,6 +335,16 @@ class FDMPlanner:
                 # replace actions if obs buffer has not been filled yet
                 se2_velocity_b[replan_not_filled] = torch.roll(initial_rand_actions[replan_not_filled], 1, dims=1)
                 se2_positions_w[replan_not_filled] *= 0
+
+            if demo_recorder is not None:
+                demo_recorder.capture(
+                    self,
+                    goal_command=goal_command,
+                    se2_positions_w=se2_positions_w,
+                    actions=se2_velocity_b,
+                    dones=dones,
+                    goal_reached=goal_reached,
+                )
 
             # update decimation counter
             self.decimation_counter[replan_envs] = 0
@@ -463,7 +487,17 @@ class FDMPlanner:
                     table.add_row([key, value["Success"], value["Fail"], value["All"]])
                 print("[INFO] Planner Evaluation\n", table)
 
+            if demo_recorder is not None and demo_recorder.should_stop():
+                demo_recorder.write()
+                metrics = self._planner_eval_metrics(
+                    finished_path_counter, path_rrt_length, traversed_path_length, goal_success, trajectory_time
+                )
+                print("[record-demo] stopping early after captured demo segment.", flush=True)
+                return metrics
+
         # get final eval metrics
+        if demo_recorder is not None:
+            demo_recorder.write()
         self.planner._flush_cvae_dataset()
         metrics = self._planner_eval_metrics(
             finished_path_counter, path_rrt_length, traversed_path_length, goal_success, trajectory_time
@@ -632,7 +666,7 @@ class FDMPlanner:
                     flush=True,
                 )
                 # ablation studies
-                if self.args_cli.ablation_mode == "no_height_scan":
+                if self.args_cli.ablation_mode in ["no_height_scan", "no_height"]:
                     obs["planner_obs"]["extero_obs"] *= 0.0
                 elif self.args_cli.ablation_mode == "no_state_obs":
                     obs["planner_obs"]["states"] *= 0.0
@@ -890,6 +924,465 @@ class FDMPlanner:
             table.add_row([key, value["Success"], value["Fail"], value["All"]])
         print("[INFO] Final Planner Evaluation\n", table)
 
+
+class _TopDownDemoRecorder:
+    def __init__(self, *, out_dir: Path, env_ids: list[int], every: int, max_frames: int) -> None:
+        self.out_dir = out_dir
+        self.env_ids = [int(env_id) for env_id in env_ids]
+        self.every = int(every)
+        self.max_frames = int(max_frames)
+        self.step = 0
+        self.frames: list[dict] = []
+        self.success_envs: set[int] = set()
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+
+    def capture(
+        self,
+        planner: FDMPlanner,
+        *,
+        goal_command: GoalCommand,
+        se2_positions_w: torch.Tensor,
+        actions: torch.Tensor,
+        dones: torch.Tensor,
+        goal_reached: torch.Tensor,
+    ) -> None:
+        self.step += 1
+        success_now = False
+        for env_id in self.env_ids:
+            if env_id < goal_reached.shape[0] and bool(goal_reached[env_id].item()):
+                self.success_envs.add(env_id)
+                success_now = True
+        if len(self.frames) >= self.max_frames or (self.step % self.every != 0 and not success_now):
+            return
+        robot = planner.env.scene.articulations["robot"]
+        origin = planner.env.scene.env_origins.detach()
+        root = robot.data.root_pos_w.detach()
+        quat = robot.data.root_quat_w.detach()
+        yaw = _yaw_from_quat_wxyz(quat)
+        goal = goal_command.pos_command_w.detach() if hasattr(goal_command, "pos_command_w") else None
+        path = se2_positions_w.detach()
+        command = actions[:, 0, :].detach()
+        frame = {"step": self.step, "envs": []}
+        for env_id in self.env_ids:
+            if env_id >= root.shape[0]:
+                continue
+            local_xy = (root[env_id, :2] - origin[env_id, :2]).cpu().tolist()
+            local_goal = None
+            if goal is not None and env_id < goal.shape[0]:
+                local_goal = (goal[env_id, :2] - origin[env_id, :2]).cpu().tolist()
+            local_path = None
+            if env_id < path.shape[0] and torch.isfinite(path[env_id]).all():
+                local_path = path[env_id, :, :2].cpu().tolist()
+            frame["envs"].append(
+                {
+                    "env_id": env_id,
+                    "xy": local_xy,
+                    "yaw": float(yaw[env_id].item()),
+                    "goal": local_goal,
+                    "path": local_path,
+                    "cmd": command[env_id].cpu().tolist() if env_id < command.shape[0] else [0.0, 0.0, 0.0],
+                    "done": bool(dones[env_id].item()) if env_id < dones.shape[0] else False,
+                    "success": bool(goal_reached[env_id].item()) if env_id < goal_reached.shape[0] else False,
+                }
+            )
+        self.frames.append(frame)
+
+    def should_stop(self) -> bool:
+        return len(self.frames) >= self.max_frames or bool(self.success_envs)
+
+    def write(self) -> None:
+        if not self.frames:
+            print("[record-demo] no frames captured", flush=True)
+            return
+        import csv
+        import imageio.v2 as imageio
+        import matplotlib
+        import numpy as np
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        csv_path = self.out_dir / "lab_plan_test_demo_trace.csv"
+        with csv_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["frame_step", "env_id", "x", "y", "yaw", "goal_x", "goal_y", "cmd_vx", "cmd_vy", "cmd_wz", "done", "success"])
+            for frame in self.frames:
+                for item in frame["envs"]:
+                    goal = item["goal"] or [math.nan, math.nan]
+                    cmd = item["cmd"]
+                    writer.writerow([frame["step"], item["env_id"], item["xy"][0], item["xy"][1], item["yaw"], goal[0], goal[1], cmd[0], cmd[1], cmd[2], item["done"], item["success"]])
+
+        video_path = self.out_dir / "lab_plan_test_demo_topdown.mp4"
+        colors = ["#e66101", "#5e3c99", "#1b9e77", "#d95f02"]
+        histories: dict[int, list[list[float]]] = {env_id: [] for env_id in self.env_ids}
+        with imageio.get_writer(video_path, fps=20, codec="libx264", quality=8, macro_block_size=16) as writer:
+            last = None
+            for frame in self.frames:
+                fig, ax = plt.subplots(figsize=(8, 7), dpi=120)
+                ax.set_title(f"IsaacLab plan_test --mode test, step {frame['step']}")
+                ax.set_aspect("equal", adjustable="box")
+                ax.grid(True, alpha=0.25)
+                ax.set_xlabel("x [m]")
+                ax.set_ylabel("y [m]")
+                ax.set_xlim(-1.2, 6.2)
+                ax.set_ylim(-3.0, 3.0)
+                ax.axvline(0, color="0.85", linewidth=1)
+                ax.axhline(0, color="0.85", linewidth=1)
+                for idx, item in enumerate(frame["envs"]):
+                    env_id = item["env_id"]
+                    color = colors[idx % len(colors)]
+                    histories.setdefault(env_id, []).append(item["xy"])
+                    hist = np.asarray(histories[env_id], dtype=float)
+                    if len(hist) > 1:
+                        ax.plot(hist[:, 0], hist[:, 1], color=color, linewidth=2.2, label=f"env {env_id}")
+                    if item["path"] is not None:
+                        path = np.asarray(item["path"], dtype=float)
+                        if path.ndim == 2 and len(path) > 1:
+                            ax.plot(path[:, 0], path[:, 1], color=color, alpha=0.35, linestyle="--", linewidth=1.4)
+                    x, y = item["xy"]
+                    yaw = item["yaw"]
+                    ax.scatter([x], [y], color=color, s=70, zorder=4)
+                    ax.arrow(x, y, 0.35 * math.cos(yaw), 0.35 * math.sin(yaw), head_width=0.09, color=color, length_includes_head=True)
+                    if item["goal"] is not None:
+                        gx, gy = item["goal"]
+                        ax.scatter([gx], [gy], marker="*", s=130, color=color, edgecolor="black", zorder=5)
+                    status = "success" if item["success"] else ("done" if item["done"] else "running")
+                    cmd = item["cmd"]
+                    ax.text(0.02, 0.97 - idx * 0.06, f"env {env_id}: {status}, cmd=({cmd[0]:+.2f},{cmd[1]:+.2f},{cmd[2]:+.2f})", transform=ax.transAxes, color=color, fontsize=9, va="top")
+                ax.legend(loc="lower right")
+                fig.canvas.draw()
+                width, height = fig.canvas.get_width_height()
+                if hasattr(fig.canvas, "tostring_rgb"):
+                    image = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8).reshape(height, width, 3)
+                else:
+                    image = np.asarray(fig.canvas.buffer_rgba())[:, :, :3]
+                writer.append_data(image)
+                last = image
+                plt.close(fig)
+            if last is not None:
+                for _ in range(30):
+                    writer.append_data(last)
+        print(f"[record-demo] wrote {video_path}", flush=True)
+        print(f"[record-demo] wrote {csv_path}", flush=True)
+
+
+class _RealCameraDemoRecorder:
+    def __init__(self, *, out_dir: Path, env_ids: list[int], every: int, max_frames: int) -> None:
+        import isaaclab.sim as sim_utils
+        from isaaclab.sensors.camera import Camera, CameraCfg
+
+        self.out_dir = out_dir
+        self.env_ids = [int(env_id) for env_id in env_ids]
+        self.every = int(every)
+        self.max_frames = int(max_frames)
+        self.step = 0
+        self.frame_index = 0
+        self.success_envs: set[int] = set()
+        self.top_dir = self.out_dir / "topdown_frames"
+        self.robot_dir = None
+        self.top_dir.mkdir(parents=True, exist_ok=True)
+        self.rows: list[list[object]] = []
+
+        def make_camera(prim_path: str):
+            spawn_cfg = None
+            if not sim_utils.find_matching_prims(prim_path):
+                spawn_cfg = sim_utils.PinholeCameraCfg(
+                    focal_length=24.0,
+                    focus_distance=400.0,
+                    horizontal_aperture=20.955,
+                    clipping_range=(0.1, 1000.0),
+                )
+            camera_cfg = CameraCfg(
+                prim_path=prim_path,
+                width=320,
+                height=240,
+                update_period=0.0,
+                data_types=["rgb"],
+                spawn=spawn_cfg,
+            )
+            camera = Camera(camera_cfg)
+            if not camera.is_initialized:
+                camera._initialize_impl()
+                camera._is_initialized = True
+            camera.reset()
+            return camera
+
+        self.top_camera = make_camera("/World/PlanTest/record_topdown_camera")
+        self.robot_camera = None
+
+    def capture(
+        self,
+        planner: FDMPlanner,
+        *,
+        goal_command: GoalCommand,
+        se2_positions_w: torch.Tensor,
+        actions: torch.Tensor,
+        dones: torch.Tensor,
+        goal_reached: torch.Tensor,
+    ) -> None:
+        self.step += 1
+        success_now = False
+        for env_id in self.env_ids:
+            if env_id < goal_reached.shape[0] and bool(goal_reached[env_id].item()):
+                self.success_envs.add(env_id)
+                success_now = True
+        if self.frame_index >= self.max_frames or (self.step % self.every != 0 and not success_now):
+            return
+
+        root = planner.env.scene.articulations["robot"].data.root_pos_w.detach()
+        quat = planner.env.scene.articulations["robot"].data.root_quat_w.detach()
+        yaw = _yaw_from_quat_wxyz(quat)
+        goal = goal_command.pos_command_w.detach() if hasattr(goal_command, "pos_command_w") else None
+        env_id = self.env_ids[0] if self.env_ids else 0
+        env_id = min(env_id, root.shape[0] - 1)
+
+        base = root[env_id]
+        top_eye = base + torch.tensor([0.0, -0.03, 9.0], device=planner.env.device)
+        top_target = base + torch.tensor([0.0, 0.0, 0.0], device=planner.env.device)
+        forward = torch.tensor([math.cos(float(yaw[env_id])), math.sin(float(yaw[env_id])), 0.0], device=planner.env.device)
+
+        top_rgb = self._render_camera(planner, self.top_camera, top_eye, top_target)
+
+        name = f"{self.frame_index:06d}_step_{self.step:05d}.jpg"
+        cv2.imwrite(str(self.top_dir / name), cv2.cvtColor(top_rgb, cv2.COLOR_RGB2BGR))
+
+        goal_xy = goal[env_id, :2].detach().cpu().tolist() if goal is not None else [math.nan, math.nan]
+        cmd = actions[env_id, 0, :].detach().cpu().tolist()
+        self.rows.append(
+            [
+                self.frame_index,
+                self.step,
+                env_id,
+                float(root[env_id, 0].item()),
+                float(root[env_id, 1].item()),
+                float(yaw[env_id].item()),
+                goal_xy[0],
+                goal_xy[1],
+                cmd[0],
+                cmd[1],
+                cmd[2],
+                bool(dones[env_id].item()),
+                bool(goal_reached[env_id].item()),
+            ]
+        )
+        self.frame_index += 1
+
+    def should_stop(self) -> bool:
+        return self.frame_index >= self.max_frames or bool(self.success_envs)
+
+    def write(self) -> None:
+        if self.frame_index == 0:
+            print("[record-demo] no real camera frames captured", flush=True)
+            return
+        import csv
+        import imageio.v2 as imageio
+        import numpy as np
+        from PIL import Image, ImageDraw
+
+        csv_path = self.out_dir / "lab_plan_test_real_camera_trace.csv"
+        with csv_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["frame", "step", "env_id", "x", "y", "yaw", "goal_x", "goal_y", "cmd_vx", "cmd_vy", "cmd_wz", "done", "success"])
+            writer.writerows(self.rows)
+
+        video_path = self.out_dir / "lab_plan_test_real_topdown.mp4"
+        frames = sorted(self.top_dir.glob("*.jpg"))
+        with imageio.get_writer(video_path, fps=10, codec="libx264", quality=8, macro_block_size=16) as writer:
+            last = None
+            for path in frames:
+                img = Image.open(path).convert("RGB")
+                draw = ImageDraw.Draw(img, "RGBA")
+                draw.rectangle((0, 0, 500, 36), fill=(0, 0, 0, 120))
+                draw.text((12, 9), f"plan_test real top-down  {path.stem}", fill=(255, 255, 255))
+                arr = np.asarray(img)
+                writer.append_data(arr)
+                last = arr
+            if last is not None:
+                for _ in range(16):
+                    writer.append_data(last)
+        print(f"[record-demo] wrote {video_path}", flush=True)
+        print(f"[record-demo] wrote {csv_path}", flush=True)
+
+    def _render_camera(self, planner: FDMPlanner, camera, eye: torch.Tensor, target: torch.Tensor):
+        camera.set_world_poses_from_view(eye.unsqueeze(0), target.unsqueeze(0))
+        rgb = None
+        for attempt in range(3):
+            for _ in range(4 + attempt * 4):
+                planner.env.sim.render()
+                camera.update(planner.env.step_dt)
+            rgb = camera.data.output["rgb"][0].detach().cpu().numpy().astype("uint8")
+            if float(rgb.max()) > 5.0:
+                return rgb
+        if rgb is None:
+            raise RuntimeError("PlanTest recorder camera did not produce an RGB frame")
+        return rgb
+
+
+class _ViewportDemoRecorder:
+    def __init__(self, *, out_dir: Path, env_ids: list[int], every: int, max_frames: int) -> None:
+        self.out_dir = out_dir
+        self.env_ids = [int(env_id) for env_id in env_ids]
+        self.every = int(every)
+        self.max_frames = int(max_frames)
+        self.step = 0
+        self.frame_index = 0
+        self.success_envs: set[int] = set()
+        self.frame_dir = self.out_dir / "topdown_frames"
+        self.frame_dir.mkdir(parents=True, exist_ok=True)
+        self.rows: list[list[object]] = []
+        self.viewport = None
+        self.camera_path = None
+        print(f"[record-demo] viewport recorder initialized at {self.out_dir}", flush=True)
+
+    def _ensure_viewport(self, planner: FDMPlanner) -> None:
+        if self.viewport is not None:
+            return
+        import omni.kit.app
+        import omni.kit.commands
+        import omni.usd
+        from omni.kit.viewport.utility import get_active_viewport
+        from pxr import Gf, Sdf, UsdGeom
+
+        app = omni.kit.app.get_app()
+        for _ in range(3):
+            app.update()
+        viewport = get_active_viewport()
+        if viewport is None:
+            raise RuntimeError("No active viewport is available for plan_test screenshot recording.")
+        viewport.resolution = (640, 480)
+        stage = omni.usd.get_context().get_stage()
+        camera_path = Sdf.Path("/World/PlanTestTopDownViewportCamera")
+        camera = UsdGeom.Camera.Define(stage, camera_path)
+        camera.GetProjectionAttr().Set(UsdGeom.Tokens.orthographic)
+        camera.GetHorizontalApertureAttr().Set(20.0)
+        camera.GetVerticalApertureAttr().Set(15.0)
+        camera.GetClippingRangeAttr().Set(Gf.Vec2f(0.1, 1000.0))
+        viewport.camera_path = camera_path
+        self.viewport = viewport
+        self.camera_path = camera_path
+
+    def capture(
+        self,
+        planner: FDMPlanner,
+        *,
+        goal_command: GoalCommand,
+        se2_positions_w: torch.Tensor,
+        actions: torch.Tensor,
+        dones: torch.Tensor,
+        goal_reached: torch.Tensor,
+    ) -> None:
+        self.step += 1
+        success_now = False
+        for env_id in self.env_ids:
+            if env_id < goal_reached.shape[0] and bool(goal_reached[env_id].item()):
+                self.success_envs.add(env_id)
+                success_now = True
+        if self.frame_index >= self.max_frames or (self.step % self.every != 0 and not success_now):
+            return
+
+        self._ensure_viewport(planner)
+        if self.frame_index == 0:
+            print(f"[record-demo] capturing first viewport frame at step {self.step}", flush=True)
+        import omni.kit.app
+        import omni.kit.commands
+        import omni.renderer_capture
+        from omni.kit.viewport.utility import capture_viewport_to_file
+        from pxr import Gf, UsdGeom
+
+        root = planner.env.scene.articulations["robot"].data.root_pos_w.detach()
+        quat = planner.env.scene.articulations["robot"].data.root_quat_w.detach()
+        yaw = _yaw_from_quat_wxyz(quat)
+        goal = goal_command.pos_command_w.detach() if hasattr(goal_command, "pos_command_w") else None
+        env_id = self.env_ids[0] if self.env_ids else 0
+        env_id = min(env_id, root.shape[0] - 1)
+        base = root[env_id]
+
+        stage = omni.usd.get_context().get_stage()
+        camera = UsdGeom.Camera(stage.GetPrimAtPath(self.camera_path))
+        camera.GetOrthographicApertureAttr().Set(7.0)
+        eye = Gf.Vec3d(float(base[0].item()), float(base[1].item()), float(base[2].item() + 9.0))
+        target = Gf.Vec3d(float(base[0].item()), float(base[1].item()), float(base[2].item()))
+        omni.kit.commands.execute(
+            "SetCameraLookAt",
+            camera_path=str(self.camera_path),
+            eye=eye,
+            target=target,
+        )
+
+        for _ in range(2):
+            planner.env.sim.render()
+            omni.kit.app.get_app().update()
+
+        frame_path = self.frame_dir / f"{self.frame_index:06d}_step_{self.step:05d}.png"
+        capture_viewport_to_file(self.viewport, file_path=str(frame_path))
+        omni.renderer_capture.acquire_renderer_capture_interface().wait_async_capture()
+
+        goal_xy = goal[env_id, :2].detach().cpu().tolist() if goal is not None else [math.nan, math.nan]
+        cmd = actions[env_id, 0, :].detach().cpu().tolist()
+        self.rows.append(
+            [
+                self.frame_index,
+                self.step,
+                env_id,
+                float(root[env_id, 0].item()),
+                float(root[env_id, 1].item()),
+                float(yaw[env_id].item()),
+                goal_xy[0],
+                goal_xy[1],
+                cmd[0],
+                cmd[1],
+                cmd[2],
+                bool(dones[env_id].item()),
+                bool(goal_reached[env_id].item()),
+            ]
+        )
+        self.frame_index += 1
+
+    def should_stop(self) -> bool:
+        return self.frame_index >= self.max_frames or bool(self.success_envs)
+
+    def write(self) -> None:
+        if self.frame_index == 0:
+            print("[record-demo] no viewport frames captured", flush=True)
+            return
+        import csv
+        import imageio.v2 as imageio
+        import numpy as np
+        from PIL import Image, ImageDraw
+
+        csv_path = self.out_dir / "lab_plan_test_viewport_trace.csv"
+        with csv_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["frame", "step", "env_id", "x", "y", "yaw", "goal_x", "goal_y", "cmd_vx", "cmd_vy", "cmd_wz", "done", "success"])
+            writer.writerows(self.rows)
+
+        video_path = self.out_dir / "lab_plan_test_default_obstacles_viewport_topdown.mp4"
+        frames = sorted(self.frame_dir.glob("*.png"))
+        with imageio.get_writer(video_path, fps=10, codec="libx264", quality=8, macro_block_size=16) as writer:
+            last = None
+            for path in frames:
+                img = Image.open(path).convert("RGB")
+                draw = ImageDraw.Draw(img, "RGBA")
+                draw.rectangle((0, 0, 560, 36), fill=(0, 0, 0, 120))
+                draw.text((12, 9), f"plan_test default obstacles viewport top-down  {path.stem}", fill=(255, 255, 255))
+                arr = np.asarray(img)
+                writer.append_data(arr)
+                last = arr
+            if last is not None:
+                for _ in range(16):
+                    writer.append_data(last)
+        print(f"[record-demo] wrote {video_path}", flush=True)
+        print(f"[record-demo] wrote {csv_path}", flush=True)
+
+
+def _yaw_from_quat_wxyz(quat: torch.Tensor) -> torch.Tensor:
+    w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    return torch.atan2(siny_cosp, cosy_cosp)
+
+
+class FDMPlanner(FDMPlanner):
     """
     Visualization
     """

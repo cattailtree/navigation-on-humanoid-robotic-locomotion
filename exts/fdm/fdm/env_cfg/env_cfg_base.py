@@ -141,12 +141,15 @@ class ActionsCfg:
             asset_name="robot",
             # ✅ 使用 G1 的 29DOF 关节列表（和 robot_cfg_g1 完全一致）
             joint_names=G1_29DOF_JOINT_NAMES,
+            preserve_order=True,
             scale=0.25,              # 与你 G1ActionsCfg 保持一致
             use_default_offset=True,
         ),
         low_level_decimation=4,
         # G1 29DOF low-level walking policy.
         low_level_policy_file="D:/fdm_data/mujoco_sim2sim/policies/g1_policy.pt",
+        low_level_policy_mode="single",
+        low_level_obs_dim=None,
         # NavigationSE2Action 在 apply_actions 里会用这个 group 名去取低层 obs
         low_level_obs_group="policy",
     )
@@ -160,27 +163,33 @@ class ObservationsCfg:
     class PolicyCfg(ObsGroup):
         """低层 G1 policy 的 obs（结构对齐 unitree_rl_lab 的 RobotEnvCfg.PolicyCfg）"""
 
-        # 1) 角速度（base frame）
+        # 1) 线速度（base frame）
+        base_lin_vel = ObsTerm(
+            func=mdp.base_lin_vel,
+            noise=Unoise(n_min=-0.1, n_max=0.1),
+        )
+
+        # 2) 角速度（base frame）
         base_ang_vel = ObsTerm(
             func=mdp.base_ang_vel,
             scale=0.2,
             noise=Unoise(n_min=-0.2, n_max=0.2),
         )
 
-        # 2) 重力方向
+        # 3) 重力方向
         projected_gravity = ObsTerm(
             func=mdp.projected_gravity,
             noise=Unoise(n_min=-0.05, n_max=0.05),
         )
 
-        # 3) 速度指令：这里我们不用 generated_commands，
+        # 4) 速度指令：这里我们不用 generated_commands，
         #    而是从顶层 action term "velocity_cmd" 里读 SE2 命令（vx, vy, yaw）
         velocity_commands = ObsTerm(
             func=mdp.vel_commands,
             params={"action_term": "velocity_cmd"},
         )
 
-        # 4) 关节位置（相对）——严格使用 G1_29DOF_JOINT_NAMES 顺序
+        # 5) 关节位置（相对）——严格使用 G1_29DOF_JOINT_NAMES 顺序
         joint_pos_rel = ObsTerm(
             func=mdp.joint_pos_rel,
             params={
@@ -193,7 +202,7 @@ class ObservationsCfg:
             noise=Unoise(n_min=-0.01, n_max=0.01),
         )
 
-        # 5) 关节速度（相对）
+        # 6) 关节速度（相对）
         joint_vel_rel = ObsTerm(
             func=mdp.joint_vel_rel,
             params={
@@ -207,7 +216,7 @@ class ObservationsCfg:
             noise=Unoise(n_min=-1.5, n_max=1.5),
         )
 
-        # 6) 上一时刻的低层动作（和 unitree 里 last_action 对应）
+        # 7) 上一时刻的低层动作（和 unitree 里 last_action 对应）
         last_action = ObsTerm(
             func=mdp.last_low_level_action,
             params={
@@ -219,7 +228,6 @@ class ObservationsCfg:
                 ),
             },
         )
-
         def __post_init__(self):
             # ⚠️ 关键：和训练时保持一致
             self.history_length = 5

@@ -19,6 +19,10 @@ from __future__ import annotations
 
 
 import argparse
+import csv
+import math
+import sys
+from pathlib import Path
 
 from isaaclab.app import AppLauncher
 # local imports
@@ -105,6 +109,51 @@ parser.add_argument(
     action="store_true",
     help="Disable MPPI neighbor-spread collision cost propagation for lower memory use.",
 )
+parser.add_argument(
+    "--record-demo",
+    action="store_true",
+    help="Record a lightweight top-down MP4 during --mode test without using plot_video.",
+)
+parser.add_argument(
+    "--record-demo-dir",
+    type=str,
+    default=r"D:\fdm_data\planner_eval\record_demo",
+    help="Directory for lightweight test-mode recording outputs.",
+)
+parser.add_argument(
+    "--record-demo-env-ids",
+    type=int,
+    nargs="+",
+    default=[0, 1],
+    help="Environment ids to draw in the lightweight recording.",
+)
+parser.add_argument(
+    "--record-demo-every",
+    type=int,
+    default=2,
+    help="Record one animation frame every N Lab planner steps.",
+)
+parser.add_argument(
+    "--record-demo-max-frames",
+    type=int,
+    default=900,
+    help="Maximum lightweight recording frames before stopping recording.",
+)
+parser.add_argument(
+    "--record-demo-use-planner-eval-terrain",
+    action="store_true",
+    help="Use plan_test's normal PLANNER_EVAL_CFG terrain while recording the lightweight demo.",
+)
+parser.add_argument(
+    "--apr07-legacy-model",
+    action="store_true",
+    help="Use compatibility settings for the Apr07 height FDM checkpoint.",
+)
+parser.add_argument(
+    "--pure-mppi-no-dynamics",
+    action="store_true",
+    help="Run a command-only MPPI baseline without FDM or ideal SE(2) rollout dynamics.",
+)
 # append common FDM cli arguments
 cli_args.add_fdm_args(parser, default_num_envs=24)
 # append AppLauncher cli args
@@ -112,10 +161,38 @@ AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
 args_cli = parser.parse_args()
 
+# This repo's Lab planner/elevator setup is G1-based. Do not let the shared
+# FDM CLI default ("anymal") silently put plan_test into ANYmal ablation logic.
+args_cli.robot = "g1"
+if args_cli.ablation_mode in ["no_state_obs", "no_proprio_obs"]:
+    raise ValueError(
+        "plan_test G1 ablations only support no_height/no_height_scan and no_risk. "
+        "no_state_obs/no_proprio_obs are legacy ANYmal-style ablations."
+    )
+
+# Keep the plain test-mode command as the MPPI-only baseline, but preserve
+# the default height observation/environment config instead of switching to
+# the heuristic cost-map planner.
+default_test_mppi_only = (
+    args_cli.mode == "test"
+    and "--env" not in sys.argv
+    and "--run" not in sys.argv
+    and not args_cli.pure_mppi_no_dynamics
+)
+if args_cli.run == "Apr07_17-01-32_fdm_train":
+    args_cli.apr07_legacy_model = True
+
 # script modes
 if args_cli.mode == "test":
-    args_cli.num_envs = 12*2
-    args_cli.headless = True
+    if args_cli.record_demo:
+        args_cli.num_envs = max(max(args_cli.record_demo_env_ids) + 1, len(args_cli.record_demo_env_ids), 1)
+        args_cli.enable_cameras = False
+        args_cli.headless = False
+        if getattr(args_cli, "rendering_mode", None) is None:
+            args_cli.rendering_mode = "performance"
+    else:
+        args_cli.num_envs = 12*2
+        args_cli.headless = True
 elif args_cli.mode == "metric":
     args_cli.num_envs = 12 * 8
     args_cli.headless = True
@@ -180,17 +257,31 @@ def main():
 
     # setup runner
     cfg = planner_cfg_init(args_cli)
+    if args_cli.apr07_legacy_model:
+        args_cli.reduced_obs = False
+        args_cli.remove_torque = False
+        cfg.load_checkpoint = "model.pth"
+        if hasattr(cfg.model_cfg, "use_geometric_collision_head"):
+            cfg.model_cfg.use_geometric_collision_head = False
+            cfg.model_cfg.geometric_collision_loss_weight = 0.0
     # robot changes
     cfg = robot_changes(cfg, args_cli)
     # modify cfg
     cfg = cfg_modifier_pre_init(cfg, args_cli)
     # ablation studies
     cfg = ablation_studies_modifications(cfg, args_cli)
+    if args_cli.record_demo and getattr(cfg.model_cfg, "use_geometric_collision_head", False):
+        print("[INFO] record_demo: disabling geometric collision head to match legacy Apr checkpoints.")
+        cfg.model_cfg.use_geometric_collision_head = False
+        cfg.model_cfg.geometric_collision_loss_weight = 0.0
 
     # swap environment
-    cfg.env_cfg.scene.terrain.terrain_type = "generator"
+    use_planner_eval_terrain = (not args_cli.record_demo) or args_cli.record_demo_use_planner_eval_terrain
+    if use_planner_eval_terrain:
+        cfg.env_cfg.scene.terrain.terrain_type = "generator"
     if args_cli.mode == "test":
-        cfg.env_cfg.scene.terrain.terrain_generator = fdm_terrain_cfg.PLANNER_EVAL_CFG
+        if use_planner_eval_terrain:
+            cfg.env_cfg.scene.terrain.terrain_generator = fdm_terrain_cfg.PLANNER_EVAL_CFG
     elif args_cli.mode == "metric":
         cfg.env_cfg.scene.terrain.terrain_generator = fdm_terrain_cfg.PLANNER_EVAL_CFG
         if args_cli.env == "baseline":
@@ -213,6 +304,11 @@ def main():
 
     # make origin selection deterministic
     cfg.env_cfg.scene.terrain.random_seed = 0
+    if getattr(cfg.env_cfg.scene.terrain, "terrain_generator", None) is not None:
+        terrain_vertical_scale = float(cfg.env_cfg.scene.terrain.terrain_generator.vertical_scale)
+        for sub_cfg in cfg.env_cfg.scene.terrain.terrain_generator.sub_terrains.values():
+            if hasattr(sub_cfg, "noise_step"):
+                sub_cfg.noise_step = max(float(sub_cfg.noise_step), terrain_vertical_scale)
 
     # set name of the run
     if args_cli.run is not None:
@@ -302,8 +398,24 @@ def main():
         pos_offset[2] = 2.0
         cfg.env_cfg.scene.env_sensor.offset.pos = tuple(pos_offset)
         sampling_planner_cfg_dict["to_cfg"]["num_neighbors"] = 2
+        if default_test_mppi_only:
+            sampling_planner_cfg_dict["to_cfg"]["control"] = "velocity_control"
+            sampling_planner_cfg_dict["to_cfg"]["num_neighbors"] = 0
+            sampling_planner_cfg_dict["to_cfg"]["collision_cost_neighbor_spread_weight"] = 0.0
+        if args_cli.pure_mppi_no_dynamics:
+            sampling_planner_cfg_dict["to_cfg"]["control"] = "direct_command"
+            sampling_planner_cfg_dict["to_cfg"]["states_cost_w_cost_map"] = False
+            sampling_planner_cfg_dict["to_cfg"]["num_neighbors"] = 0
+            sampling_planner_cfg_dict["to_cfg"]["collision_cost_traj_factor"] = 0.0
+            sampling_planner_cfg_dict["to_cfg"]["collision_cost_high_risk_factor"] = 0.0
+            sampling_planner_cfg_dict["to_cfg"]["collision_cost_neighbor_spread_weight"] = 0.0
 
     if args_cli.disable_neighbor_spread:
+        sampling_planner_cfg_dict["to_cfg"]["num_neighbors"] = 0
+        sampling_planner_cfg_dict["to_cfg"]["collision_cost_neighbor_spread_weight"] = 0.0
+    if args_cli.ablation_mode == "no_risk":
+        sampling_planner_cfg_dict["to_cfg"]["collision_cost_traj_factor"] = 0.0
+        sampling_planner_cfg_dict["to_cfg"]["collision_cost_high_risk_factor"] = 0.0
         sampling_planner_cfg_dict["to_cfg"]["num_neighbors"] = 0
         sampling_planner_cfg_dict["to_cfg"]["collision_cost_neighbor_spread_weight"] = 0.0
 

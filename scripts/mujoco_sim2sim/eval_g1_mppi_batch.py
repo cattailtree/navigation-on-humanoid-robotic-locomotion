@@ -72,12 +72,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-failures", type=int, default=0, help="Stop early after this many non-success episodes. 0 disables.")
     parser.add_argument("--control-decimation", type=int, default=Sim2SimConfig.control_decimation)
     parser.add_argument("--physics-dt", type=float, default=Sim2SimConfig.physics_dt)
-    parser.add_argument("--planner", choices=("fdm", "goal", "zero"), default="fdm")
+    parser.add_argument("--planner", choices=("fdm", "mppi_only", "goal", "zero"), default="fdm")
     parser.add_argument(
         "--eval-preset",
-        choices=("full", "fast"),
+        choices=("full", "fast", "light_ablation"),
         default="full",
-        help="fast lowers MPPI samples/iterations for coarse success-rate sweeps.",
+        help=(
+            "fast lowers MPPI samples/iterations for coarse success-rate sweeps. "
+            "light_ablation uses 300 episodes, population 128, and excludes timeouts from metrics."
+        ),
     )
     parser.add_argument(
         "--fdm-terrain-cfg",
@@ -130,7 +133,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--keep-scenes", action="store_true")
     parser.add_argument("--zero-controller", action="store_true")
     parser.add_argument("--policy-device", type=str, default="cpu")
-    parser.add_argument("--policy-obs-dim", type=int, default=480)
+    parser.add_argument("--policy-obs-dim", type=int, default=495)
     parser.add_argument("--policy-action-dim", type=int, default=29)
     parser.add_argument("--policy-history", type=int, default=5)
     parser.add_argument("--policy-inference-decimation", type=int, default=4)
@@ -139,7 +142,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--g1-obs-layout",
         choices=("auto", "g1_nav_96", "g1_policy_99"),
-        default="g1_nav_96",
+        default="g1_policy_99",
     )
     parser.add_argument(
         "--obs-axis-transform",
@@ -155,6 +158,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fdm-mppi-gamma", type=float, default=1.0)
     parser.add_argument("--fdm-mppi-sigma", type=float, default=0.8)
     parser.add_argument("--fdm-mppi-beta", type=float, default=0.6)
+    parser.add_argument("--mppi-only-dt", type=float, default=0.5)
+    parser.add_argument("--mppi-only-collision-prob", type=float, default=0.0)
     parser.add_argument("--fdm-action-min-vx", type=float, default=-0.10)
     parser.add_argument("--fdm-action-max-vx", type=float, default=1.50)
     parser.add_argument("--fdm-action-max-vy", type=float, default=0.10)
@@ -255,11 +260,19 @@ def main() -> None:
 
 
 def _apply_eval_preset(args: argparse.Namespace) -> None:
-    if args.eval_preset != "fast":
+    if args.eval_preset == "full":
         return
-    args.fdm_population_size = min(args.fdm_population_size, 128)
-    args.fdm_mppi_iterations = min(args.fdm_mppi_iterations, 3)
-    args.fdm_replan_interval = max(args.fdm_replan_interval, 10)
+    if args.eval_preset == "fast":
+        args.fdm_population_size = min(args.fdm_population_size, 128)
+        args.fdm_mppi_iterations = min(args.fdm_mppi_iterations, 3)
+        args.fdm_replan_interval = max(args.fdm_replan_interval, 10)
+        return
+    if args.eval_preset == "light_ablation":
+        args.episodes = 300
+        args.fdm_population_size = 128
+        args.fdm_mppi_iterations = min(args.fdm_mppi_iterations, 3)
+        args.fdm_replan_interval = max(args.fdm_replan_interval, 10)
+        args.exclude_timeout_from_metrics = True
 
 
 def run_episode(
@@ -544,6 +557,9 @@ def _make_planner(args: argparse.Namespace):
         yaw_command_limit=args.fdm_yaw_command_limit,
         lateral_command_limit=args.fdm_lateral_command_limit,
         yaw_drift_limit=args.fdm_yaw_drift_limit,
+        use_fdm_model=args.planner == "fdm",
+        kinematic_dt=args.mppi_only_dt,
+        kinematic_collision_prob=args.mppi_only_collision_prob,
     )
 
 

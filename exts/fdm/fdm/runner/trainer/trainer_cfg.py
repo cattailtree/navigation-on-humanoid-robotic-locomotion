@@ -14,7 +14,7 @@ class TrainerBaseCfg:
     """Configuration for the trainer."""
 
     # general training
-    epochs: int = 8
+    epochs: int = 5
     """Number of epochs for training with the collected samples of a single collection round."""
     early_stopping: bool = False
     """Whether to use early stopping."""
@@ -72,7 +72,7 @@ class TrainerBaseCfg:
     # weight decay and learning rate
     weight_decay: float = 1e-4  # Dec03 Model: 5e-5;  Nov19 Model: 1e-4
     """Weight decay for the optimizer."""
-    learning_rate: float = 5e-3
+    learning_rate: float = 1e-4
     """Learning rate for the optimizer."""
 
     # saving and logging

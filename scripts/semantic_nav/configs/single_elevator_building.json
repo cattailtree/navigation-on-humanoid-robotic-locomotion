@@ -1,0 +1,19 @@
+{
+  "nodes": [
+    {"id": "start_f1", "floor": "F1", "kind": "start", "pose": [0.0, 0.0, 0.0], "label": "start"},
+    {"id": "corridor_f1", "floor": "F1", "kind": "corridor", "pose": [4.0, 0.0, 0.0], "label": "main corridor"},
+    {"id": "room_f1", "floor": "F1", "kind": "room", "pose": [4.0, 3.0, 0.0], "label": "room on current floor"},
+    {"id": "elevator_f1", "floor": "F1", "kind": "elevator_lobby", "pose": [8.0, 1.2, 0.0], "label": "elevator lobby"},
+    {"id": "elevator_b1", "floor": "B1", "kind": "elevator_lobby", "pose": [8.0, 1.2, 0.0], "label": "elevator lobby"},
+    {"id": "corridor_b1", "floor": "B1", "kind": "corridor", "pose": [6.0, 0.0, 0.0], "label": "basement corridor"},
+    {"id": "target_room_b1", "floor": "B1", "kind": "room", "pose": [2.0, -3.0, 0.0], "label": "target room"}
+  ],
+  "edges": [
+    {"src": "start_f1", "dst": "corridor_f1", "cost": 4.0, "kind": "walk", "bidirectional": true},
+    {"src": "corridor_f1", "dst": "room_f1", "cost": 3.0, "kind": "walk", "bidirectional": true},
+    {"src": "corridor_f1", "dst": "elevator_f1", "cost": 4.2, "kind": "walk", "bidirectional": true},
+    {"src": "elevator_f1", "dst": "elevator_b1", "cost": 1.0, "kind": "elevator_transition", "bidirectional": true},
+    {"src": "elevator_b1", "dst": "corridor_b1", "cost": 2.4, "kind": "walk", "bidirectional": true},
+    {"src": "corridor_b1", "dst": "target_room_b1", "cost": 5.0, "kind": "walk", "bidirectional": true}
+  ]
+}

@@ -267,6 +267,9 @@ class FDMPlannerAdapter(PlannerAdapter):
     progress_guard_ratio: float = 0.4
     progress_guard_max_risk: float = 0.25
     progress_guard_max_scan_cost: float = 3.0
+    use_fdm_model: bool = True
+    kinematic_dt: float = 0.5
+    kinematic_collision_prob: float = 0.0
 
     def __post_init__(self) -> None:
         self._model = None
@@ -305,6 +308,36 @@ class FDMPlannerAdapter(PlannerAdapter):
 
     def _ensure_loaded(self):
         if self._model is None:
+            if not self.use_fdm_model:
+                self._model = False
+                self._dims = {
+                    "history": 1,
+                    "state_dim": 0,
+                    "proprio_dim": 0,
+                    "horizon": 10,
+                    "height_shape": Sim2SimConfig.height_scan_shape,
+                }
+                print(
+                    "[MPPI-only] using ideal SE(2) rollout "
+                    f"horizon={self._dims['horizon']} dt={self.kinematic_dt}"
+                )
+                horizon = int(self._dims["horizon"])
+                lower_bound = [[self.action_min_vx, -self.action_max_vy, -self.action_max_wz] for _ in range(horizon)]
+                upper_bound = [[self.action_max_vx, self.action_max_vy, self.action_max_wz] for _ in range(horizon)]
+                self._mppi = LocalBatchedMPPIOptimizer(
+                    horizon=horizon,
+                    action_dim=3,
+                    population_size=self.population_size,
+                    num_iterations=self.mppi_iterations,
+                    gamma=self.mppi_gamma,
+                    sigma=self.mppi_sigma,
+                    beta=self.mppi_beta,
+                    lower_bound=lower_bound,
+                    upper_bound=upper_bound,
+                    device=self.device,
+                    seed=self.seed,
+                )
+                return self._model, self._dims
             self._model, self._dims = load_fdm_model(
                 checkpoint=self.checkpoint,
                 run_dir=self.run_dir,
@@ -346,7 +379,8 @@ class FDMPlannerAdapter(PlannerAdapter):
         model, dims = self._ensure_loaded()
         assert self._mppi is not None
 
-        self._update_history(obs, int(dims["history"]), int(dims["state_dim"]), int(dims["proprio_dim"]))
+        if self.use_fdm_model:
+            self._update_history(obs, int(dims["history"]), int(dims["state_dim"]), int(dims["proprio_dim"]))
         base_command = np.asarray(self._goal_tracker.command(obs).as_array(), dtype=np.float32)
         if not np.any(self._last_command):
             self._mppi.seed_mean(base_command)
@@ -385,6 +419,17 @@ class FDMPlannerAdapter(PlannerAdapter):
         dims: dict,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
         batch = actions.shape[0]
+        if not self.use_fdm_model:
+            state_traj = self._kinematic_rollout(actions)
+            collision_prob = torch.full(
+                (batch, actions.shape[1]),
+                float(self.kinematic_collision_prob),
+                dtype=actions.dtype,
+                device=self.device,
+            )
+            energy = torch.zeros(batch, actions.shape[1], 1, dtype=actions.dtype, device=self.device)
+            costs, terms = self._score_actions(obs, actions, state_traj, collision_prob, energy)
+            return costs, terms, state_traj, collision_prob, energy
         state = self._state_history_tensor(batch, int(dims["history"]), int(dims["state_dim"]))
         proprio = self._proprio_tensor(batch, int(dims["history"]), int(dims["proprio_dim"]))
         extero = self._height_tensor(obs.height_scan, tuple(dims["height_shape"]), batch)
@@ -395,6 +440,25 @@ class FDMPlannerAdapter(PlannerAdapter):
             collision_prob = torch.maximum(collision_prob, model_out[3])
         costs, terms = self._score_actions(obs, actions, state_traj, collision_prob, energy)
         return costs, terms, state_traj, collision_prob, energy
+
+    def _kinematic_rollout(self, actions: torch.Tensor) -> torch.Tensor:
+        batch, horizon, _action_dim = actions.shape
+        x = torch.zeros(batch, dtype=actions.dtype, device=self.device)
+        y = torch.zeros(batch, dtype=actions.dtype, device=self.device)
+        yaw = torch.zeros(batch, dtype=actions.dtype, device=self.device)
+        states = []
+        dt = float(self.kinematic_dt)
+        for step_idx in range(horizon):
+            vx = actions[:, step_idx, 0]
+            vy = actions[:, step_idx, 1]
+            wz = actions[:, step_idx, 2]
+            cos_yaw = torch.cos(yaw)
+            sin_yaw = torch.sin(yaw)
+            x = x + (vx * cos_yaw - vy * sin_yaw) * dt
+            y = y + (vx * sin_yaw + vy * cos_yaw) * dt
+            yaw = self._wrap_to_pi_tensor(yaw + wz * dt)
+            states.append(torch.stack((x, y, torch.sin(yaw), torch.cos(yaw)), dim=1))
+        return torch.stack(states, dim=1)
 
     def _update_history(self, obs: PlannerObservation, history: int, state_dim: int, proprio_dim: int) -> None:
         if obs.fdm_state is not None:
@@ -558,6 +622,8 @@ class FDMPlannerAdapter(PlannerAdapter):
         return base - self.collision_safety_factor
 
     def _uses_unified_failure_prediction(self) -> bool:
+        if not self.use_fdm_model:
+            return True
         model_cfg = getattr(getattr(self, "_model", None), "cfg", None)
         return bool(getattr(model_cfg, "unified_failure_prediction", False))
 
