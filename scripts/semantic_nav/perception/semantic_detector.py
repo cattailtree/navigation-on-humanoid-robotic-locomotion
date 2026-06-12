@@ -9,7 +9,7 @@ from perception.detection_types import BoundingBox2D
 
 @dataclass(frozen=True)
 class SemanticDetection:
-    node_id: str
+    node_id: str | None
     label: str
     score: float
     bbox: BoundingBox2D | None = None

@@ -13,20 +13,41 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 TASK_SCRIPT = Path(__file__).with_name("run_lab_elevator_task.py")
 SEMANTIC_NAV_ROOT = TASK_SCRIPT.parents[1]
 SCRIPTS_ROOT = SEMANTIC_NAV_ROOT.parent
-DEFAULT_RUN_DIR = REPO_ROOT / "logs" / "fdm" / "fdm_se2_prediction_depth" / "May12_14-21-45_fdm_train"
-DEFAULT_CHECKPOINT = DEFAULT_RUN_DIR / "model_collection_round_14.pth"
 DEFAULT_OUTPUT_DIR = Path(r"D:\semantic_nav_run")
 
 
+def _default_run_dir() -> Path:
+    latest = REPO_ROOT / "logs" / "fdm" / "fdm_se2_prediction_depth" / "Jun05_16-56-19_fdm_train"
+    if latest.exists():
+        return latest
+    return REPO_ROOT / "logs" / "fdm" / "fdm_se2_prediction_depth" / "May12_14-21-45_fdm_train"
+
+
+def _latest_collection_checkpoint(run_dir: Path) -> Path:
+    checkpoints = sorted(run_dir.glob("model_collection_round_*.pth"), key=lambda path: _checkpoint_round(path))
+    if checkpoints:
+        return checkpoints[-1]
+    return run_dir / "model.pth"
+
+
+def _checkpoint_round(path: Path) -> int:
+    try:
+        return int(path.stem.rsplit("_", 1)[-1])
+    except ValueError:
+        return -1
+
+
 def main() -> int:
+    default_run_dir = _default_run_dir()
     parser = argparse.ArgumentParser(
         description=(
             "Run the IsaacLab elevator-search preset. Unknown arguments are forwarded "
             "to run_lab_elevator_task.py, so later flags override this preset."
         )
     )
-    parser.add_argument("--run-dir", type=Path, default=DEFAULT_RUN_DIR, help="FDM training run directory.")
-    parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT, help="FDM checkpoint path.")
+    parser.add_argument("--run-dir", type=Path, default=default_run_dir, help="FDM training run directory.")
+    parser.add_argument("--checkpoint", type=Path, default=None, help="FDM checkpoint path.")
+    parser.add_argument("--latest-checkpoint", action="store_true", help="Force the highest-numbered model_collection_round checkpoint from --run-dir.")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Directory for camera frames and traj.csv.")
     parser.add_argument("--goal", default="take the elevator to the basement target room", help="Natural-language task for the LLM parser.")
     parser.add_argument("--target", default="auto", help="Target semantic node id, or auto to let the LLM/parser choose.")
@@ -40,18 +61,34 @@ def main() -> int:
     parser.add_argument("--record-resolution", type=int, nargs=2, default=(640, 480), help="Recording frame width height.")
     parser.add_argument("--record-top-center", type=float, nargs=2, default=(4.8, 1.1), help="Top-down camera center in local XY.")
     parser.add_argument("--record-top-height", type=float, default=13.0, help="Top-down camera height.")
+    parser.add_argument("--low-level-policy-file", type=Path, default=None, help="Override the G1 low-level gait policy path.")
+    parser.add_argument("--low-level-policy-mode", choices=("single", "dwaq"), default="single")
+    parser.add_argument("--low-level-obs-dim", type=int, default=None)
+    parser.add_argument("--low-level-obs-history", type=int, default=5)
+    parser.add_argument("--dwaq-clip-deploy-command", action="store_true")
+    parser.add_argument("--dwaq-gait-phase-layout", choices=("deploy", "train"), default="deploy")
+    parser.add_argument("--local-executor", choices=("fdm_mppi", "mppi"), default="mppi")
+    parser.add_argument("--search-label", default=None, help="Generic blind-search object label, for example fridge or refrigerator.")
+    parser.add_argument("--search-node-id", default=None, help="Semantic node id for generic blind-search.")
+    parser.add_argument("--search-kind", default=None, help="Semantic node kind for generic blind-search.")
+    parser.add_argument("--search-prompts", default=None, help="Dot/comma separated detector prompts for generic blind-search.")
     parser.add_argument("--record", action="store_true", help="Enable robot-view and top-down recording. Disabled by default to keep memory low.")
     parser.add_argument("--no-record", action="store_true", help="Deprecated alias; recording is disabled unless --record is passed.")
     parser.add_argument("--no-video", action="store_true", help="Skip MP4 generation after the run.")
     parser.add_argument("--show-command", action="store_true", help="Print the expanded command before launching.")
     parser.add_argument("--dry-run", action="store_true", help="Print the expanded command and exit without launching IsaacLab.")
     args, passthrough = parser.parse_known_args()
+    checkpoint = args.checkpoint
+    if checkpoint is None or args.latest_checkpoint:
+        checkpoint = _latest_collection_checkpoint(args.run_dir)
 
     trajectory_csv = args.output_dir / "traj.csv"
     result_json = args.output_dir / "result.json"
     fdm_snapshot_out = args.output_dir / "fdm_snapshots.npz"
     run_log = args.output_dir / "run.log"
-    launch_goal, launch_target, launch_task_parser = _preparse_task_before_isaac(args)
+    launch_goal, launch_target, launch_task_parser, parsed_search_label, parsed_search_prompts = _preparse_task_before_isaac(args)
+    effective_search_label = args.search_label or parsed_search_label
+    effective_search_prompts = args.search_prompts or parsed_search_prompts
     do_record = args.record and not args.no_record
 
     cmd = [
@@ -79,7 +116,7 @@ def main() -> int:
         args.llm_model,
         "--llm-timeout-s",
         str(args.llm_timeout_s),
-        "--blind-find-elevator",
+        "--blind-find-object" if effective_search_label or args.search_node_id or args.search_kind else "--blind-find-elevator",
         "--blind-floor",
         "F1",
         "--adaptive-exploration",
@@ -96,6 +133,9 @@ def main() -> int:
         "9.2",
         "--spawn-corridor-lobby",
         "--spawn-center-pillar",
+        "--spawn-planner-eval-obstacles",
+        "--planner-eval-obstacle-profile",
+        "slalom",
         "--corridor-lobby-elevator-pose",
         "8.4",
         "3.0",
@@ -111,12 +151,16 @@ def main() -> int:
         "--se2-output-yaw-threshold",
         "0.55",
         "--perception-min-score",
-        "0.5",
+        "0.7",
         "--perception-every",
         "50",
+        "--blind-detection-confirmations",
+        "2",
         "--localize-detection-with-depth",
         "--depth-localization-approach-distance",
         str(args.success_radius),
+        "--depth-localization-max-node-distance",
+        "2.0",
         "--motion-detection-image-dir",
         str(args.output_dir),
         "--trajectory-csv",
@@ -126,17 +170,17 @@ def main() -> int:
         "--result-json",
         str(result_json),
         "--local-executor",
-        "fdm_mppi",
+        args.local_executor,
         "--fdm-run-dir",
         str(args.run_dir),
         "--fdm-checkpoint",
-        str(args.checkpoint),
+        str(checkpoint),
         "--fdm-mppi-population",
         "512",
         "--fdm-mppi-replan-every",
         "25",
         "--fdm-mppi-lookahead",
-        "1.6",
+        "0.8",
         "--fdm-mppi-pass-tolerance",
         "0.5",
         "--fdm-mppi-progress-margin",
@@ -144,7 +188,7 @@ def main() -> int:
         "--fdm-mppi-final-tolerance",
         str(args.success_radius),
         "--fdm-mppi-min-forward-carrot",
-        "1.2",
+        "0.55",
         "--fdm-mppi-final-waypoint-handoff-distance",
         "1.0",
         "--fdm-mppi-disable-collision-cost-goal-radius",
@@ -156,7 +200,39 @@ def main() -> int:
         "2.0",
         "--fdm-mppi-final-approach-tolerance",
         str(args.success_radius),
+        "--fdm-mppi-min-vx",
+        "0.0",
+        "--fdm-mppi-max-vx",
+        "0.45",
+        "--fdm-mppi-max-vy",
+        "0.08",
+        "--fdm-mppi-max-wz",
+        "0.45",
     ]
+    if args.low_level_policy_file is not None:
+        cmd.extend(["--low-level-policy-file", str(args.low_level_policy_file)])
+    cmd.extend(
+        [
+            "--low-level-policy-mode",
+            args.low_level_policy_mode,
+            "--low-level-obs-history",
+            str(args.low_level_obs_history),
+            "--dwaq-gait-phase-layout",
+            args.dwaq_gait_phase_layout,
+        ]
+    )
+    if effective_search_label is not None:
+        cmd.extend(["--search-label", effective_search_label])
+    if args.search_node_id is not None:
+        cmd.extend(["--search-node-id", args.search_node_id])
+    if args.search_kind is not None:
+        cmd.extend(["--search-kind", args.search_kind])
+    if effective_search_prompts is not None:
+        cmd.extend(["--search-prompts", effective_search_prompts])
+    if args.low_level_obs_dim is not None:
+        cmd.extend(["--low-level-obs-dim", str(args.low_level_obs_dim)])
+    if args.dwaq_clip_deploy_command:
+        cmd.append("--dwaq-clip-deploy-command")
     cmd[2:2] = ["--headless"]
     if do_record:
         cmd.extend(
@@ -335,11 +411,14 @@ def _frame_files(frame_dir: Path) -> list[Path]:
     return sorted([*frame_dir.glob("*.jpg"), *frame_dir.glob("*.png")])
 
 
-def _preparse_task_before_isaac(args: argparse.Namespace) -> tuple[str, str, str]:
+def _preparse_task_before_isaac(args: argparse.Namespace) -> tuple[str, str, str, str | None, str | None]:
+    if args.search_label:
+        return args.goal, args.target, args.task_parser, None, None
     if args.task_parser != "openai_compatible":
-        return args.goal, args.target, args.task_parser
+        search_label, search_prompts = _rule_preparse_search(args.goal)
+        return args.goal, args.target, args.task_parser, search_label, search_prompts
     if args.target.strip().lower() not in {"", "auto", "llm", "none", "null"}:
-        return args.goal, args.target, "rule"
+        return args.goal, args.target, "rule", None, None
 
     if str(SCRIPTS_ROOT) not in sys.path:
         sys.path.insert(0, str(SCRIPTS_ROOT))
@@ -367,14 +446,61 @@ def _preparse_task_before_isaac(args: argparse.Namespace) -> tuple[str, str, str
             flush=True,
         )
         release_task_parser_resources_from_args(args)
-        return args.goal, args.target, "rule"
+        search_label, search_prompts = _rule_preparse_search(args.goal)
+        return args.goal, args.target, "rule", search_label, search_prompts
     target = parsed.target_node_id or args.target
+    search_label = parsed.search_label if parsed.goal.intent == "open_set_object_search" else None
+    search_prompts = ".".join(parsed.search_prompts) if parsed.search_prompts else None
     print(
-        f"[semantic_nav:preset] llm intent={parsed.goal.intent} target_floor={parsed.goal.target_floor} target_node={target}",
+        f"[semantic_nav:preset] llm intent={parsed.goal.intent} target_floor={parsed.goal.target_floor} "
+        f"target_node={target} search_label={search_label or '-'}",
         flush=True,
     )
     release_task_parser_resources_from_args(args)
-    return args.goal, target, "rule"
+    return args.goal, target, "rule", search_label, search_prompts
+
+
+def _rule_preparse_search(goal: str) -> tuple[str | None, str | None]:
+    text = goal.strip().lower()
+    elevator_terms = ("elevator", "lift", "电梯")
+    floor_terms = ("basement", "downstairs", "b1", "地下", "楼下")
+    if any(term in text for term in elevator_terms) or any(term in text for term in floor_terms):
+        return None, None
+    prefixes = (
+        "find the ",
+        "find a ",
+        "find an ",
+        "find ",
+        "locate the ",
+        "locate a ",
+        "locate an ",
+        "locate ",
+        "search for the ",
+        "search for a ",
+        "search for an ",
+        "search for ",
+        "look for the ",
+        "look for a ",
+        "look for an ",
+        "look for ",
+        "找",
+        "寻找",
+    )
+    label = None
+    for prefix in prefixes:
+        if text.startswith(prefix):
+            label = text[len(prefix) :].strip(" .,!?:;，。！？：；")
+            break
+    if not label:
+        return None, None
+    prompts = {
+        "fridge": "fridge.refrigerator.kitchen appliance",
+        "refrigerator": "refrigerator.fridge.kitchen appliance",
+        "fire extinguisher": "fire extinguisher.extinguisher.red cylinder",
+        "extinguisher": "fire extinguisher.extinguisher.red cylinder",
+        "water dispenser": "water dispenser.drinking fountain.water cooler",
+    }.get(label, label)
+    return label, prompts
 
 
 if __name__ == "__main__":

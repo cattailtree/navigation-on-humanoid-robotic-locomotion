@@ -17,6 +17,7 @@ def make_semantic_detector(
     image_jpeg_b64: str | None = None,
     log_detections: bool = False,
     min_score: float = 0.1,
+    prompts: tuple[str, ...] | None = None,
 ) -> SemanticDetector:
     if kind == "apexnav":
         return ApexNavSemanticSelector()
@@ -25,7 +26,7 @@ def make_semantic_detector(
     if kind == "dummy_client":
         if graph is None:
             raise ValueError("dummy_client detector requires graph")
-        return ClientBackedSemanticDetector(DummyGraphPerceptionClient(graph))
+        return ClientBackedSemanticDetector(DummyGraphPerceptionClient(graph), prompts=prompts or ("elevator", "lift", "elevator door", "elevator sign"))
     if kind == "http_client":
         if perception_endpoint is None:
             raise ValueError("http_client detector requires perception_endpoint")
@@ -34,6 +35,7 @@ def make_semantic_detector(
             image_jpeg_b64=image_jpeg_b64,
             log_detections=log_detections,
             min_score=min_score,
+            prompts=prompts or ("elevator", "lift", "elevator door", "elevator sign"),
         )
     if kind == "apexnav_gdino":
         endpoint = perception_endpoint or "http://127.0.0.1:12181/gdino"
@@ -42,6 +44,7 @@ def make_semantic_detector(
             image_jpeg_b64=image_jpeg_b64,
             log_detections=log_detections,
             min_score=min_score,
+            prompts=prompts or ("elevator", "lift", "elevator door", "elevator sign"),
         )
     if kind == "apexnav_yolov7":
         endpoint = perception_endpoint or "http://127.0.0.1:12184/yolov7"
@@ -50,5 +53,6 @@ def make_semantic_detector(
             image_jpeg_b64=image_jpeg_b64,
             log_detections=log_detections,
             min_score=min_score,
+            prompts=prompts or ("elevator", "lift", "elevator door", "elevator sign"),
         )
     raise ValueError(f"Unknown semantic detector kind: {kind}")

@@ -13,6 +13,7 @@ import json
 from math import atan2, cos, hypot, sin
 from pathlib import Path
 import sys
+import traceback
 from typing import Any
 
 import numpy as np
@@ -29,6 +30,31 @@ if str(SEMANTIC_NAV_ROOT) not in sys.path:
 import utils.cli_args as cli_args  # isort: skip
 from envs.abstract_building_env import DEFAULT_BUILDING_CONFIG  # isort: skip
 from llm.factory import add_task_parser_args, make_task_parser_from_args, normalize_target_node_id, release_task_parser_resources_from_args  # isort: skip
+
+
+LAB_TERRAIN_CHOICES = (
+    "plane",
+    "generator",
+    "fdm_train",
+    "fdm_train_no_terrain",
+    "fdm_eval",
+    "fdm_eval_no_terrain",
+    "fdm_rough",
+    "fdm_rough_no_terrain",
+    "planner_eval",
+    "planner_eval_no_terrain",
+    "planner_eval_2d",
+    "planner_eval_2d_no_terrain",
+    "paper_figure",
+    "paper_figure_no_terrain",
+)
+FDM_FLOOR_TERRAIN_NAMES = (
+    "flat_reference",
+    "grass_reference",
+    "snow_reference",
+    "mud_reference",
+    "rough_floor_reference",
+)
 
 
 parser = argparse.ArgumentParser(description="Run the semantic single-elevator task in Isaac Lab.")
@@ -70,11 +96,25 @@ parser.add_argument("--fdm-mppi-min-vx", type=float, default=-0.1)
 parser.add_argument("--fdm-mppi-max-vx", type=float, default=1.0)
 parser.add_argument("--fdm-mppi-max-vy", type=float, default=0.3)
 parser.add_argument("--fdm-mppi-max-wz", type=float, default=0.2)
+parser.add_argument("--low-level-policy-file", type=Path, default=None, help="Override the G1 low-level gait policy path.")
+parser.add_argument("--low-level-policy-mode", choices=("single", "dwaq"), default="single")
+parser.add_argument("--low-level-obs-dim", type=int, default=None, help="Single-frame obs dim for multi-input low-level policies.")
+parser.add_argument("--low-level-obs-history", type=int, default=5)
+parser.add_argument("--dwaq-clip-deploy-command", action="store_true", help="Clip high-level commands to the original DWAQ deploy range.")
+parser.add_argument("--dwaq-gait-phase-layout", choices=("deploy", "train"), default="deploy")
 parser.add_argument("--humanoid-final-approach-distance", type=float, default=1.2)
 parser.add_argument("--humanoid-final-approach-lateral-offset", type=float, default=0.0)
 parser.add_argument("--trajectory-csv", type=Path, default=None, help="Optional CSV path for per-step semantic navigation trajectory logs.")
 parser.add_argument("--fdm-snapshot-out", type=Path, default=None, help="Optional NPZ path for per-step FDM input snapshots.")
-parser.add_argument("--lab-terrain", choices=("plane", "generator"), default="plane")
+parser.add_argument(
+    "--lab-terrain",
+    choices=LAB_TERRAIN_CHOICES,
+    default="plane",
+    help=(
+        "Terrain source for the Lab navigation scene. fdm_train includes the terrain_cfg "
+        "flat/grass/snow/mud/rough floor mix used for FDM-style training."
+    ),
+)
 parser.add_argument(
     "--detector",
     choices=("apexnav", "graph", "dummy_client", "http_client", "apexnav_gdino", "apexnav_yolov7"),
@@ -100,6 +140,12 @@ parser.add_argument(
     default=1.0,
     help="Distance to stop in front of the depth-localized detection point.",
 )
+parser.add_argument(
+    "--depth-localization-max-node-distance",
+    type=float,
+    default=2.0,
+    help="Reject a depth-localized hit if it is this far from the matched semantic node in XY; <=0 disables the check.",
+)
 parser.add_argument("--motion-detection-floor", default="B1", help="Floor on which the Lab visual target becomes visible.")
 parser.add_argument("--motion-detection-node", default="elevator_b1", help="Semantic node used for motion-time Lab camera detection.")
 parser.add_argument("--motion-detection-image-dir", type=Path, default=None, help="Optional directory for motion-time camera images.")
@@ -116,9 +162,24 @@ parser.add_argument("--record-top-center", type=float, nargs=2, default=(4.8, 0.
 parser.add_argument("--record-top-height", type=float, default=12.0, help="Top-down camera height.")
 parser.add_argument("--result-json", type=Path, default=None, help="Optional path for run success/failure summary.")
 parser.add_argument("--blind-find-elevator", action="store_true", help="Blindly explore until perception detects an elevator, then A* to it.")
+parser.add_argument("--blind-find-object", action="store_true", help="Blindly explore until perception detects the requested semantic object, then A* to it.")
+parser.add_argument("--search-node-id", default=None, help="Semantic graph node id to search for during blind object search.")
+parser.add_argument("--search-kind", default=None, help="Semantic node kind accepted during blind object search; defaults to elevator_lobby for elevator mode.")
+parser.add_argument("--search-label", default=None, help="Target object label used for detector prompts, for example fridge or refrigerator.")
+parser.add_argument(
+    "--search-prompts",
+    default=None,
+    help="Dot/comma separated detector prompts for blind object search. Defaults are inferred from search label or elevator mode.",
+)
 parser.add_argument("--blind-floor", default="F1", help="Floor used for blind elevator search.")
 parser.add_argument("--blind-vx", type=float, default=0.35, help="Forward velocity during blind search.")
 parser.add_argument("--blind-wz", type=float, default=0.08, help="Yaw velocity during blind search.")
+parser.add_argument(
+    "--blind-detection-confirmations",
+    type=int,
+    default=1,
+    help="Number of object detections required before blind search switches to target navigation.",
+)
 parser.add_argument("--adaptive-exploration", action="store_true", help="Use frontier-like arena coverage before target detection.")
 parser.add_argument("--exploration-spacing", type=float, default=1.6, help="Spacing between adaptive exploration sweeps.")
 parser.add_argument("--spawn-blind-search-arena", action="store_true", help="Spawn a bounded arena for blind-search experiments.")
@@ -147,6 +208,8 @@ parser.add_argument("--spawn-center-pillar", action="store_true", help="Spawn a 
 parser.add_argument("--center-pillar-center", type=float, nargs=2, default=None, help="Pillar center in local XY. Defaults to the blind arena center.")
 parser.add_argument("--center-pillar-size", type=float, nargs=2, default=(0.65, 0.65), help="Pillar footprint size in local XY.")
 parser.add_argument("--center-pillar-height", type=float, default=2.4, help="Pillar height in meters.")
+parser.add_argument("--spawn-planner-eval-obstacles", action="store_true", help="Add terrain_cfg planner-eval style boxes/pillars/gates to the elevator-search scene.")
+parser.add_argument("--planner-eval-obstacle-profile", choices=("light", "slalom", "dense"), default="slalom")
 parser.add_argument("--exploration-wall-margin", type=float, default=1.6, help="Distance kept from arena walls by adaptive exploration viewpoints.")
 cli_args.add_fdm_args(parser, default_num_envs=1)
 AppLauncher.add_app_launcher_args(parser)
@@ -154,7 +217,7 @@ args_cli = parser.parse_args()
 
 args_cli.num_envs = 1
 args_cli.robot = "g1"
-if args_cli.use_lab_camera or args_cli.detect_during_motion or args_cli.blind_find_elevator or args_cli.localize_detection_with_depth or (
+if args_cli.use_lab_camera or args_cli.detect_during_motion or args_cli.blind_find_elevator or args_cli.blind_find_object or args_cli.localize_detection_with_depth or (
     args_cli.record_run_dir is not None and not args_cli.record_viewport
 ):
     args_cli.enable_cameras = True
@@ -165,6 +228,7 @@ simulation_app = app_launcher.app
 
 import torch  # noqa: E402
 from isaaclab.envs import ManagerBasedRLEnv  # noqa: E402
+from isaaclab.managers import ObservationTermCfg as ObsTerm  # noqa: E402
 
 import fdm.env_cfg.terrain_cfg as fdm_terrain_cfg  # noqa: E402
 import fdm.mdp as mdp  # noqa: E402
@@ -188,6 +252,7 @@ from lab_scene.elevator_scene import (  # noqa: E402
     spawn_corridor_lobby_walls,
     spawn_elevator_nodes,
     spawn_minimal_elevator_scene,
+    spawn_planner_eval_obstacles,
     spawn_rect_wall,
 )
 from perception.factory import make_semantic_detector  # noqa: E402
@@ -499,6 +564,88 @@ def _humanoidize_grid_path(
     return result
 
 
+def _split_search_prompts(value: str | None) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    parts = value.replace(".", ",").split(",")
+    return tuple(part.strip() for part in parts if part.strip())
+
+
+def _search_terms_from_label(label: str | None) -> tuple[str, ...]:
+    if label is None:
+        return ()
+    terms = _split_search_prompts(label)
+    if not terms:
+        terms = (label.strip(),) if label.strip() else ()
+    extras: list[str] = []
+    for term in terms:
+        normalized = term.lower()
+        if normalized == "fridge":
+            extras.append("refrigerator")
+        elif normalized == "refrigerator":
+            extras.append("fridge")
+    return tuple(dict.fromkeys([*terms, *extras]))
+
+
+def _blind_search_prompts(graph, target_node_id: str | None) -> tuple[str, ...]:
+    explicit = _split_search_prompts(args_cli.search_prompts)
+    if explicit:
+        return explicit
+    label_terms = _search_terms_from_label(args_cli.search_label)
+    if label_terms:
+        return label_terms
+    if args_cli.blind_find_object and target_node_id is not None and target_node_id in graph.nodes:
+        node = graph.nodes[target_node_id]
+        node_terms = _split_search_prompts(str(node.attrs.get("detection_label", "")))
+        if node_terms:
+            return node_terms
+        if node.label:
+            return _search_terms_from_label(node.label)
+    return ("elevator", "lift", "elevator door", "elevator sign")
+
+
+def _node_search_terms(node: SemanticNode) -> set[str]:
+    values = [
+        node.node_id,
+        node.label,
+        node.kind,
+        str(node.attrs.get("detection_label", "")),
+        str(node.attrs.get("semantic_hint", "")),
+    ]
+    terms: set[str] = set()
+    for value in values:
+        stripped = value.strip().lower()
+        if stripped:
+            terms.add(stripped)
+        for token in stripped.replace("_", " ").replace("-", " ").split():
+            if len(token) > 2:
+                terms.add(token)
+    return terms
+
+
+def _matches_blind_search_target(node: SemanticNode, *, floor: str) -> bool:
+    if node.floor != floor:
+        return False
+    if args_cli.search_node_id:
+        return node.node_id == args_cli.search_node_id
+    search_kind = args_cli.search_kind
+    if search_kind is None and not args_cli.blind_find_object:
+        search_kind = "elevator_lobby"
+    if search_kind is not None and node.kind != search_kind:
+        return False
+    label_terms = _search_terms_from_label(args_cli.search_label)
+    if label_terms:
+        node_terms = _node_search_terms(node)
+        for term in label_terms:
+            normalized = term.lower()
+            if normalized in node_terms:
+                return True
+            if any(normalized in node_term or node_term in normalized for node_term in node_terms):
+                return True
+        return False
+    return search_kind is not None
+
+
 def _make_executor(
     *,
     env,
@@ -569,12 +716,15 @@ def run_blind_find_then_astar(
     se2_planner: HumanoidSE2AStar | None = None,
     exploration_strategy: AdaptiveExplorationStrategy | None = None,
     recorder: LabRunRecorder | None = None,
+    target_node_id: str | None = None,
 ) -> ExecutionLoopResult:
     astar = SemanticAStarPlanner(graph)
+    search_prompts = _blind_search_prompts(graph, target_node_id)
     executor: WaypointExecutor | FdmMppiWaypointExecutor | None = None
     executor_mode = "blind"
     perception_events: list[str] = []
     confirmed_nodes: set[str] = set()
+    detection_confirm_counts: dict[str, int] = {}
     csv_file = None
     csv_writer = None
     fdm_snapshot_recorder = FdmSnapshotRecorder(args_cli.fdm_snapshot_out)
@@ -642,6 +792,7 @@ def run_blind_find_then_astar(
                     image_jpeg_b64=image_b64,
                     log_detections=True,
                     min_score=args_cli.perception_min_score,
+                    prompts=search_prompts,
                 )
                 current_node_id = _nearest_node_on_floor(graph, pose, floor)
                 try:
@@ -650,16 +801,22 @@ def run_blind_find_then_astar(
                     event = f"blind_perception_failed_floor={floor} camera=robot_view error={type(exc).__name__}: {exc}"
                     perception_events.append(f"step={step_idx} {event}")
                     detections = []
-                elevator_detections = [
+                target_detections = [
                     detection
                     for detection in detections
-                    if graph.nodes[detection.node_id].floor == floor and graph.nodes[detection.node_id].kind == "elevator_lobby"
+                    if (
+                        (args_cli.blind_find_object and detection.node_id is None)
+                        or (
+                            detection.node_id is not None
+                            and _matches_blind_search_target(graph.nodes[detection.node_id], floor=floor)
+                        )
+                    )
                 ]
-                selected_nodes = tuple(detection.node_id for detection in elevator_detections)
+                selected_nodes = tuple(detection.node_id or f"open:{detection.label}" for detection in target_detections)
                 selected = ",".join(selected_nodes) or "none"
-                event = f"blind_perception_floor={floor} camera=robot_view selected={selected}"
+                event = f"blind_perception_floor={floor} camera=robot_view prompts={','.join(search_prompts)} selected={selected}"
                 perception_events.append(f"step={step_idx} {event}")
-                if elevator_detections and current_node_id is not None:
+                if target_detections and current_node_id is not None:
                     def _detection_priority(detection) -> tuple[int, float]:
                         label = detection.label.lower()
                         if "door" in label:
@@ -668,73 +825,116 @@ def run_blind_find_then_astar(
                             return (1, -detection.score)
                         return (2, -detection.score)
 
-                    selected_detection = sorted(elevator_detections, key=_detection_priority)[0]
-                    target_node_id = selected_detection.node_id
-                    confirmed_nodes.add(target_node_id)
-                    target_pose = graph.nodes[target_node_id].pose
-                    localized_target = _depth_localize_detection_target(
-                        observation=camera_observation,
-                        detection=selected_detection,
-                        robot_pose=pose,
-                        approach_distance=args_cli.depth_localization_approach_distance,
-                    )
-                    if localized_target is not None:
-                        target_pose = localized_target.approach_pose
-                        hit_x, hit_y, hit_z = localized_target.hit_xyz
-                        print(
-                            "[semantic_nav:perception] depth_localized "
-                            f"node={target_node_id} depth={localized_target.depth_m:.2f}m "
-                            f"pixel=({localized_target.pixel_uv[0]:.1f},{localized_target.pixel_uv[1]:.1f}) "
-                            f"hit=({hit_x:.2f},{hit_y:.2f},{hit_z:.2f}) "
-                            f"approach=({target_pose.x:.2f},{target_pose.y:.2f},{target_pose.yaw:.2f})",
-                            flush=True,
-                        )
+                    selected_detection = sorted(target_detections, key=_detection_priority)[0]
+                    target_node_id = selected_detection.node_id or f"detected_{selected_detection.label.lower().replace(' ', '_').replace('-', '_')}"
+                    required_confirmations = max(1, args_cli.blind_detection_confirmations)
+                    detection_confirm_counts[target_node_id] = detection_confirm_counts.get(target_node_id, 0) + 1
+                    confirmation_count = detection_confirm_counts[target_node_id]
+                    if confirmation_count < required_confirmations:
                         event = (
-                            f"{event}; depth_target={target_node_id} "
-                            f"hit=({hit_x:.2f},{hit_y:.2f},{hit_z:.2f}) "
-                            f"approach=({target_pose.x:.2f},{target_pose.y:.2f},{target_pose.yaw:.2f})"
+                            f"{event}; pending_detection={target_node_id} "
+                            f"score={selected_detection.score:.3f} confirm={confirmation_count}/{required_confirmations}"
                         )
-                    elif args_cli.localize_detection_with_depth:
-                        event = f"{event}; depth_target_failed={target_node_id}"
-                    if grid_planner is not None:
-                        planner = se2_planner if se2_planner is not None else grid_planner
-                        grid_path = planner.plan(pose, target_pose)
-                        if grid_path:
-                            executor = _make_executor(
-                                env=robot.env,
-                                steps=_build_walk_steps_from_poses(
-                                    grid_path,
-                                    floor=floor,
-                                    target_node_id=target_node_id,
-                                    preserve_yaw=se2_planner is not None,
-                                ),
-                                cfg=cfg,
-                                planner_cfg=planner_cfg,
-                            )
-                            executor_mode = "target_grid_astar"
-                            path_text = "->".join(f"({wp.x:.1f},{wp.y:.1f})" for wp in grid_path)
-                            print(f"[semantic_nav:astar] selected_path={path_text}", flush=True)
-                            event = f"{event}; grid_astar_target={target_node_id} path={path_text}"
-                        else:
-                            event = f"{event}; grid_astar_failed target={target_node_id}"
-                    if executor is None:
-                        path = astar.plan_to_any(
-                            start=current_node_id,
-                            goal_node_ids=[target_node_id],
-                            edge_filter=lambda edge: edge.kind == "walk",
+                        perception_events[-1] = f"step={step_idx} {event}"
+                    else:
+                        confirmed_nodes.add(target_node_id)
+                        graph_target_pose = graph.nodes[target_node_id].pose if selected_detection.node_id is not None else None
+                        target_pose = graph_target_pose or pose
+                        localized_target = _depth_localize_detection_target(
+                            observation=camera_observation,
+                            detection=selected_detection,
+                            robot_pose=pose,
+                            approach_distance=args_cli.depth_localization_approach_distance,
                         )
-                        if not path.is_empty:
-                            executor = _make_executor(
-                                env=robot.env,
-                                steps=_build_walk_steps_from_path(graph, path.node_ids),
-                                cfg=cfg,
-                                planner_cfg=planner_cfg,
+                        depth_target_rejected = False
+                        if (
+                            localized_target is not None
+                            and graph_target_pose is not None
+                            and args_cli.depth_localization_max_node_distance > 0.0
+                            and hypot(
+                                localized_target.hit_xyz[0] - graph_target_pose.x,
+                                localized_target.hit_xyz[1] - graph_target_pose.y,
                             )
-                            executor_mode = "target_semantic_astar"
-                            event = f"{event}; astar_start={current_node_id} astar_target={target_node_id} path={'->'.join(path.node_ids)}"
-                        else:
-                            event = f"{event}; astar_failed start={current_node_id} target={target_node_id}"
-                    perception_events[-1] = f"step={step_idx} {event}"
+                            > args_cli.depth_localization_max_node_distance
+                        ):
+                            hit_x, hit_y, hit_z = localized_target.hit_xyz
+                            hit_distance = hypot(hit_x - graph_target_pose.x, hit_y - graph_target_pose.y)
+                            print(
+                                "[semantic_nav:perception] depth_rejected "
+                                f"node={target_node_id} hit_distance={hit_distance:.2f}m "
+                                f"limit={args_cli.depth_localization_max_node_distance:.2f}m "
+                                f"hit=({hit_x:.2f},{hit_y:.2f},{hit_z:.2f})",
+                                flush=True,
+                            )
+                            event = (
+                                f"{event}; depth_target_rejected={target_node_id} "
+                                f"hit_distance={hit_distance:.2f}"
+                            )
+                            localized_target = None
+                            depth_target_rejected = True
+                        if localized_target is not None:
+                            target_pose = localized_target.approach_pose
+                            hit_x, hit_y, hit_z = localized_target.hit_xyz
+                            print(
+                                "[semantic_nav:perception] depth_localized "
+                                f"node={target_node_id} depth={localized_target.depth_m:.2f}m "
+                                f"pixel=({localized_target.pixel_uv[0]:.1f},{localized_target.pixel_uv[1]:.1f}) "
+                                f"hit=({hit_x:.2f},{hit_y:.2f},{hit_z:.2f}) "
+                                f"approach=({target_pose.x:.2f},{target_pose.y:.2f},{target_pose.yaw:.2f})",
+                                flush=True,
+                            )
+                            event = (
+                                f"{event}; depth_target={target_node_id} "
+                                f"hit=({hit_x:.2f},{hit_y:.2f},{hit_z:.2f}) "
+                                f"approach=({target_pose.x:.2f},{target_pose.y:.2f},{target_pose.yaw:.2f})"
+                            )
+                        elif args_cli.localize_detection_with_depth and not depth_target_rejected:
+                            event = f"{event}; depth_target_failed={target_node_id}"
+                        if selected_detection.node_id is None and localized_target is None:
+                            event = f"{event}; open_target_no_depth={target_node_id}"
+                            perception_events[-1] = f"step={step_idx} {event}"
+                        elif grid_planner is not None:
+                            planner = se2_planner if se2_planner is not None else grid_planner
+                            grid_path = planner.plan(pose, target_pose)
+                            if grid_path:
+                                executor = _make_executor(
+                                    env=robot.env,
+                                    steps=_build_walk_steps_from_poses(
+                                        grid_path,
+                                        floor=floor,
+                                        target_node_id=target_node_id,
+                                        preserve_yaw=se2_planner is not None,
+                                    ),
+                                    cfg=cfg,
+                                    planner_cfg=planner_cfg,
+                                )
+                                executor_mode = "target_grid_astar"
+                                path_text = "->".join(f"({wp.x:.1f},{wp.y:.1f})" for wp in grid_path)
+                                print(f"[semantic_nav:astar] selected_path={path_text}", flush=True)
+                                event = f"{event}; grid_astar_target={target_node_id} path={path_text}"
+                            else:
+                                event = f"{event}; grid_astar_failed target={target_node_id}"
+                        if executor is None:
+                            if selected_detection.node_id is not None:
+                                path = astar.plan_to_any(
+                                    start=current_node_id,
+                                    goal_node_ids=[target_node_id],
+                                    edge_filter=lambda edge: edge.kind == "walk",
+                                )
+                                if not path.is_empty:
+                                    executor = _make_executor(
+                                        env=robot.env,
+                                        steps=_build_walk_steps_from_path(graph, path.node_ids),
+                                        cfg=cfg,
+                                        planner_cfg=planner_cfg,
+                                    )
+                                    executor_mode = "target_semantic_astar"
+                                    event = f"{event}; astar_start={current_node_id} astar_target={target_node_id} path={'->'.join(path.node_ids)}"
+                                else:
+                                    event = f"{event}; astar_failed start={current_node_id} target={target_node_id}"
+                            else:
+                                event = f"{event}; open_target_requires_grid_planner={target_node_id}"
+                        perception_events[-1] = f"step={step_idx} {event}"
 
             if executor is None:
                 if exploration_strategy is not None and grid_planner is not None:
@@ -869,6 +1069,94 @@ def run_blind_find_then_astar(
         fdm_snapshot_recorder.close()
 
 
+def _apply_low_level_gait_overrides(cfg) -> None:
+    action_cfg = getattr(getattr(cfg.env_cfg, "actions", None), "velocity_cmd", None)
+    if action_cfg is None:
+        return
+    dwaq_term_dims = [3, 3, 3, 29, 29, 29, 4]
+    if args_cli.low_level_policy_file is not None:
+        action_cfg.low_level_policy_file = str(args_cli.low_level_policy_file)
+    action_cfg.low_level_policy_mode = args_cli.low_level_policy_mode
+    action_cfg.low_level_obs_dim = args_cli.low_level_obs_dim
+    action_cfg.low_level_obs_history = args_cli.low_level_obs_history
+    if args_cli.low_level_policy_mode != "dwaq":
+        return
+
+    policy_obs = getattr(cfg.env_cfg.observations, "policy", None)
+    if policy_obs is not None:
+        if hasattr(policy_obs, "joint_vel"):
+            policy_obs.joint_vel.scale = 1.0
+        if hasattr(policy_obs, "joint_vel_rel"):
+            policy_obs.joint_vel_rel.scale = 1.0
+        policy_obs.gait_phase = ObsTerm(
+            func=mdp.dwaq_gait_phase,
+            params={"period": 0.8, "offset": 0.5, "layout": args_cli.dwaq_gait_phase_layout},
+        )
+    action_cfg.low_level_obs_term_dims = dwaq_term_dims
+    if action_cfg.low_level_obs_dim is None:
+        action_cfg.low_level_obs_dim = sum(dwaq_term_dims)
+    if args_cli.dwaq_clip_deploy_command:
+        action_cfg.clip_mode = "minmax"
+        action_cfg.clip = [(-0.4, 0.7), (-0.4, 0.4), (-1.57, 1.57)]
+
+
+def _apply_lab_terrain(cfg) -> None:
+    terrain = cfg.env_cfg.scene.terrain
+    selected = args_cli.lab_terrain
+    print(f"[semantic_nav:lab] applying terrain={selected}", flush=True)
+    if selected == "plane":
+        terrain.terrain_type = "plane"
+        terrain.terrain_generator = None
+        terrain.random_seed = 0
+        print("[semantic_nav:lab] terrain=plane", flush=True)
+        return
+
+    terrain_generators = {
+        "generator": fdm_terrain_cfg.PAPER_FIGURE_TERRAIN_CFG,
+        "paper_figure": fdm_terrain_cfg.PAPER_FIGURE_TERRAIN_CFG,
+        "fdm_train": _fdm_train_floor_only_terrain_generator(),
+        "fdm_train_no_terrain": fdm_terrain_cfg.FDM_TERRAINS_NO_TERRAIN_CFG,
+        "fdm_eval": fdm_terrain_cfg.FDM_EVAL_EXTEROCEPTIVE_TERRAINS_CFG,
+        "fdm_eval_no_terrain": fdm_terrain_cfg.FDM_EVAL_EXTEROCEPTIVE_TERRAINS_NO_TERRAIN_CFG,
+        "fdm_rough": fdm_terrain_cfg.FDM_ROUGH_TERRAINS_CFG,
+        "fdm_rough_no_terrain": fdm_terrain_cfg.FDM_ROUGH_TERRAINS_NO_TERRAIN_CFG,
+        "planner_eval": fdm_terrain_cfg.PLANNER_EVAL_CFG,
+        "planner_eval_no_terrain": fdm_terrain_cfg.PLANNER_EVAL_NO_TERRAIN_CFG,
+        "planner_eval_2d": fdm_terrain_cfg.PLANNER_EVAL_2D_CFG,
+        "planner_eval_2d_no_terrain": fdm_terrain_cfg.PLANNER_EVAL_2D_NO_TERRAIN_CFG,
+        "paper_figure_no_terrain": fdm_terrain_cfg.PAPER_FIGURE_NO_TERRAIN_CFG,
+    }
+    terrain.terrain_type = "generator"
+    terrain.terrain_generator = terrain_generators[selected]
+    terrain.random_seed = 0
+    if hasattr(terrain, "groundplane"):
+        terrain.groundplane = False
+    sub_terrains = getattr(terrain.terrain_generator, "sub_terrains", {})
+    print(
+        f"[semantic_nav:lab] terrain={selected} generator_sub_terrains={','.join(sub_terrains.keys())}",
+        flush=True,
+    )
+
+
+def _fdm_train_floor_only_terrain_generator():
+    generator = fdm_terrain_cfg._terrain_generator(
+        "train",
+        border_width=1.0,
+        num_rows=8,
+        num_cols=8,
+    )
+    generator.sub_terrains = {
+        name: generator.sub_terrains[name]
+        for name in FDM_FLOOR_TERRAIN_NAMES
+        if name in generator.sub_terrains
+    }
+    total_proportion = sum(float(getattr(sub_cfg, "proportion", 0.0)) for sub_cfg in generator.sub_terrains.values())
+    if total_proportion > 0.0:
+        for sub_cfg in generator.sub_terrains.values():
+            sub_cfg.proportion = float(sub_cfg.proportion) / total_proportion
+    return generator
+
+
 def main() -> None:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -878,18 +1166,13 @@ def main() -> None:
         release_task_parser_resources_from_args(args_cli)
         cfg = planner_cfg_init(args_cli)
         cfg = cfg_modifier_pre_init(cfg, args_cli)
+        _apply_low_level_gait_overrides(cfg)
         cfg.env_cfg.scene.num_envs = 1
         cfg.env_cfg.episode_length_s = args_cli.episode_length_s
         command_cfg = getattr(getattr(cfg.env_cfg, "commands", None), "command", None)
         if hasattr(command_cfg, "debug_vis"):
             command_cfg.debug_vis = False
-        if args_cli.lab_terrain == "plane":
-            cfg.env_cfg.scene.terrain.terrain_type = "plane"
-            cfg.env_cfg.scene.terrain.terrain_generator = None
-        else:
-            cfg.env_cfg.scene.terrain.terrain_type = "generator"
-            cfg.env_cfg.scene.terrain.terrain_generator = fdm_terrain_cfg.PAPER_PLANNER_FIGURE_TERRAIN_CFG
-        cfg.env_cfg.scene.terrain.random_seed = 0
+        _apply_lab_terrain(cfg)
         cfg.env_cfg.events.reset_base.func = mdp.reset_root_state_center
         cfg.env_cfg.events.reset_base.params = {}
 
@@ -1009,6 +1292,18 @@ def main() -> None:
             print(
                 f"[semantic_nav:lab] spawned center pillar center={center_pillar_center} "
                 f"size={tuple(args_cli.center_pillar_size)} height={args_cli.center_pillar_height}",
+                flush=True,
+            )
+        if args_cli.spawn_planner_eval_obstacles:
+            planner_eval_obstacles = spawn_planner_eval_obstacles(
+                origin=env.scene.env_origins[0],
+                profile=args_cli.planner_eval_obstacle_profile,
+            )
+            corridor_lobby_obstacles.extend(planner_eval_obstacles)
+            env.sim.render()
+            print(
+                "[semantic_nav:lab] spawned planner-eval style obstacles "
+                f"profile={args_cli.planner_eval_obstacle_profile} obstacles={len(planner_eval_obstacles)}",
                 flush=True,
             )
         spawn_preplan_elevator = (args_cli.spawn_lab_elevator or args_cli.use_lab_camera) and not args_cli.detect_during_motion
@@ -1132,11 +1427,11 @@ def main() -> None:
                     wall_margin=args_cli.exploration_wall_margin,
                     prefix_viewpoints=prefix_viewpoints,
                 )
-        if args_cli.blind_find_elevator:
+        if args_cli.blind_find_elevator or args_cli.blind_find_object:
             print("[semantic_nav:debug] blind branch: creating task parser", flush=True)
             task_parser = make_task_parser_from_args(args_cli)
             print("[semantic_nav:debug] blind branch: parsing task", flush=True)
-            target_node_id = normalize_target_node_id(args_cli.target)
+            target_node_id = args_cli.search_node_id or normalize_target_node_id(args_cli.target)
             parsed_task = task_parser.parse(
                 args_cli.goal,
                 current_floor=start_node.floor,
@@ -1146,6 +1441,11 @@ def main() -> None:
             print("[semantic_nav:debug] blind branch: task parsed", flush=True)
             if target_node_id is None:
                 target_node_id = parsed_task.target_node_id
+            if args_cli.blind_find_object:
+                if args_cli.search_label is None and parsed_task.search_label is not None:
+                    args_cli.search_label = parsed_task.search_label
+                if args_cli.search_prompts is None and parsed_task.search_prompts:
+                    args_cli.search_prompts = ".".join(parsed_task.search_prompts)
             print("[semantic_nav:lab] task:", parsed_task.goal.raw_text, flush=True)
             print("[semantic_nav:lab] task parser:", args_cli.task_parser, flush=True)
             print("[semantic_nav:lab] parsed intent:", parsed_task.goal.intent, flush=True)
@@ -1167,9 +1467,10 @@ def main() -> None:
                 se2_planner=se2_planner,
                 exploration_strategy=exploration_strategy,
                 recorder=recorder,
+                target_node_id=target_node_id,
             )
             print(f"[semantic_nav:lab] done success={result.success} steps={result.steps} reason={result.reason}")
-            _write_result_json(args_cli.result_json, result, mode="blind_find_elevator")
+            _write_result_json(args_cli.result_json, result, mode="blind_find_object" if args_cli.blind_find_object else "blind_find_elevator")
             if result.confirmed_nodes:
                 print(f"[semantic_nav:lab] confirmed nodes: {','.join(result.confirmed_nodes)}")
             if result.perception_events:
@@ -1268,5 +1569,8 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
+    except Exception:
+        traceback.print_exc()
+        raise
     finally:
         simulation_app.close()

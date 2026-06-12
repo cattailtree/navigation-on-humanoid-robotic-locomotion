@@ -11,7 +11,7 @@ except ImportError:
     from config import Sim2SimConfig
 
 
-DEFAULT_RUN_DIR = Path(r"C:\Users\Admin\fdm\logs\fdm\fdm_se2_prediction_depth\May12_14-21-45_fdm_train")
+DEFAULT_RUN_DIR = Path(r"C:\Users\Admin\fdm\logs\fdm\fdm_se2_prediction_depth\Jun11_14-20-48_fdm_train")
 
 torch = None
 yaml = None

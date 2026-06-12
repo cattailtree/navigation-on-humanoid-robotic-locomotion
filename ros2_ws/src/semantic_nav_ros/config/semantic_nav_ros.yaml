@@ -1,0 +1,146 @@
+semantic_nav_node:
+  ros__parameters:
+    building_config: scripts/semantic_nav/configs/single_elevator_building.json
+    frame_id: map
+    odom_topic: /odom
+    cmd_vel_raw_topic: /semantic_nav/cmd_vel_raw
+    goal_topic: /semantic_nav/goal
+    target_node_topic: /semantic_nav/target_node
+    pause_topic: /semantic_nav/pause
+    status_topic: /semantic_nav/status
+    path_topic: /semantic_nav/path
+    fdm_goal_topic: /semantic_nav/fdm_goal
+    publish_fdm_goal: true
+    search_prompts_topic: /semantic_nav/search_prompts
+    detections_json_topic: /semantic_nav/detections_json
+    control_rate_hz: 20.0
+    start_node_id: start_f1
+    default_goal: find the elevator
+    default_target_node_id: auto
+    autostart: false
+    planner_backend: waypoint
+    task_parser: rule
+    detector: graph
+    perception_endpoint: http://127.0.0.1:12181/gdino
+    perception_min_score: 0.65
+    open_set_min_score: 0.65
+    open_set_confirmations: 2
+    exploration_node_ids: [corridor_f1, room_f1, elevator_f1]
+    xy_tolerance: 0.35
+    yaw_tolerance: 0.35
+    require_yaw_alignment: false
+    max_vx: 0.35
+    max_vy: 0.05
+    max_wz: 0.55
+    k_vx: 0.8
+    k_vy: 0.5
+    k_wz: 1.2
+    slow_radius: 1.0
+
+semantic_nav_safety_gate:
+  ros__parameters:
+    cmd_vel_raw_topic: /semantic_nav/selected_cmd_vel_raw
+    cmd_vel_topic: /cmd_vel
+    scan_topic: /scan
+    estop_topic: /semantic_nav/estop
+    safety_status_topic: /semantic_nav/safety_status
+    rate_hz: 30.0
+    safety_enabled: true
+    stop_distance_m: 0.45
+    slow_distance_m: 0.9
+    forward_fov_deg: 70.0
+    command_timeout_s: 0.4
+    scan_timeout_s: 0.8
+    max_vx: 0.35
+    max_vy: 0.05
+    max_wz: 0.55
+
+semantic_nav_cmd_mux:
+  ros__parameters:
+    waypoint_cmd_topic: /semantic_nav/cmd_vel_raw
+    fdm_cmd_topic: /semantic_nav/fdm_cmd_vel_raw
+    selected_cmd_topic: /semantic_nav/selected_cmd_vel_raw
+    source_topic: /semantic_nav/cmd_source
+    status_topic: /semantic_nav/cmd_mux_status
+    default_source: waypoint
+    source_timeout_s: 0.5
+    rate_hz: 30.0
+
+fdm_mppi_ros2_node:
+  ros__parameters:
+    backend: fdm_mppi
+    frame_id: map
+    odom_topic: /odom
+    goal_topic: /semantic_nav/fdm_goal
+    height_scan_topic: /semantic_nav/fdm_height_scan
+    fdm_state_topic: /semantic_nav/fdm_state
+    fdm_proprioception_topic: /semantic_nav/fdm_proprioception
+    cmd_vel_raw_topic: /semantic_nav/fdm_cmd_vel_raw
+    path_topic: /semantic_nav/fdm_path
+    status_topic: /semantic_nav/fdm_status
+    debug_topic: /semantic_nav/fdm_debug
+    rate_hz: 10.0
+    model_run_dir: logs/fdm/fdm_se2_prediction_depth/Jun11_14-20-48_fdm_train
+    checkpoint: ""
+    device: cpu
+    height_scan_shape: [60, 46]
+    population_size: 256
+    mppi_iterations: 4
+    replan_interval: 1
+    max_vx: 0.35
+    max_vy: 0.05
+    max_wz: 0.55
+    action_min_vx: -0.05
+    action_max_vx: 0.45
+    action_max_vy: 0.08
+    action_max_wz: 0.55
+    kinematic_dt: 0.25
+    require_observation_dims: true
+    publish_zero_until_ready: true
+
+fdm_observation_bridge:
+  ros__parameters:
+    odom_topic: /odom
+    joint_state_topic: /joint_states
+    command_topic: /semantic_nav/selected_cmd_vel_raw
+    low_level_action_topic: /semantic_nav/low_level_action
+    second_last_low_level_action_topic: /semantic_nav/second_last_low_level_action
+    fdm_state_topic: /semantic_nav/fdm_state
+    fdm_proprioception_topic: /semantic_nav/fdm_proprioception
+    status_topic: /semantic_nav/fdm_observation_status
+    rate_hz: 20.0
+    fdm_state_dim: 8
+    fdm_proprioception_dim: 157
+    action_dim: 29
+    proprio_layout_csv: velocity_commands,projected_gravity,base_lin_vel,base_ang_vel,joint_torque,joint_pos,joint_vel,last_actions,second_last_action
+    state_position_frame: local
+    joint_names: [""]
+    joint_names_csv: ""
+    energy_scale: 0.0
+    pad_missing_joints: true
+
+laser_height_scan_bridge:
+  ros__parameters:
+    scan_topic: /scan
+    height_scan_topic: /semantic_nav/fdm_height_scan
+    status_topic: /semantic_nav/height_scan_status
+    height_scan_shape: [60, 46]
+    resolution: 0.1
+    obstacle_height: 0.20
+    fill_height: 0.0
+    max_range: 5.0
+    dilation_cells: 1
+    center_x_offset_m: 0.0
+    center_y_offset_m: 0.0
+
+semantic_nav_gdino_bridge:
+  ros__parameters:
+    image_topic: /camera/color/image_raw/compressed
+    goal_prompts_topic: /semantic_nav/search_prompts
+    detections_topic: /semantic_nav/detections_json
+    endpoint: http://127.0.0.1:12181/gdino
+    default_prompts: [elevator, lift, elevator door, elevator sign]
+    box_threshold: 0.35
+    text_threshold: 0.25
+    timeout_s: 10.0
+    min_publish_period_s: 0.25

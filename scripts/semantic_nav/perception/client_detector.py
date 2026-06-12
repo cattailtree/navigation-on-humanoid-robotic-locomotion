@@ -64,10 +64,22 @@ class ClientBackedSemanticDetector(SemanticDetector):
                 if resolved_score < self.min_label_match_score:
                     if self.log_detections:
                         self._log_detection(perception_detection, resolved_node_id, resolved_score, skipped="weak_match")
-                    continue
+                    node = None
+                    resolved_node_id = "-"
+                    resolved_score = 0.0
             if self.log_detections:
                 self._log_detection(perception_detection, resolved_node_id, resolved_score)
             if node is None:
+                candidate = SemanticDetection(
+                    node_id=None,
+                    label=perception_detection.label,
+                    score=perception_detection.score,
+                    bbox=perception_detection.bbox,
+                )
+                key = f"open:{candidate.label.lower()}"
+                previous = detections_by_node.get(key)
+                if previous is None or self._candidate_priority(candidate) > self._candidate_priority(previous):
+                    detections_by_node[key] = candidate
                 continue
             candidate = SemanticDetection(
                 node_id=node.node_id,

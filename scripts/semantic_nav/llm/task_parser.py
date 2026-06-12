@@ -15,6 +15,8 @@ from planners.goal_parser import GoalParser, NavigationGoal
 class NavigationTaskParse:
     goal: NavigationGoal
     target_node_id: str | None = None
+    search_label: str | None = None
+    search_prompts: tuple[str, ...] = ()
     rationale: str | None = None
     source: str = "rule"
 
@@ -46,13 +48,21 @@ class RuleBasedTaskParser:
         start_node_id: str,
     ) -> NavigationTaskParse:
         del graph, start_node_id
-        return NavigationTaskParse(goal=self._parser.parse(text, current_floor=current_floor), source="rule")
+        goal = self._parser.parse(text, current_floor=current_floor)
+        search_label = _infer_open_set_search_label(text, goal.intent)
+        search_prompts = _default_search_prompts(search_label)
+        return NavigationTaskParse(
+            goal=goal,
+            search_label=search_label,
+            search_prompts=search_prompts,
+            source="rule",
+        )
 
 
 class HttpNavigationTaskParser:
     """External LLM task parser, kept out-of-process like ApexNav's VLM services."""
 
-    VALID_INTENTS = {"floor_transition", "find_elevator", "local_goal"}
+    VALID_INTENTS = {"floor_transition", "find_elevator", "local_goal", "open_set_object_search"}
 
     def __init__(
         self,
@@ -133,6 +143,8 @@ class HttpNavigationTaskParser:
 
         target_floor = _normalize_floor_id(_optional_str(data.get("target_floor")), current_floor=current_floor, graph=graph)
         target_label = _optional_str(data.get("target_label"))
+        search_label = _optional_str(data.get("search_label")) or _infer_open_set_search_label(text, intent)
+        search_prompts = _normalize_search_prompts(data.get("search_prompts"), search_label=search_label)
         target_node_id = _resolve_target_node_id(
             graph,
             node_id=_optional_str(data.get("target_node_id")),
@@ -170,6 +182,8 @@ class HttpNavigationTaskParser:
                 target_label=target_label,
             ),
             target_node_id=target_node_id,
+            search_label=search_label,
+            search_prompts=search_prompts,
             rationale=_optional_str(data.get("rationale")),
             source=self.mode,
         )
@@ -177,10 +191,12 @@ class HttpNavigationTaskParser:
 
 def _response_schema() -> dict[str, Any]:
     return {
-        "intent": "floor_transition | find_elevator | local_goal",
+        "intent": "floor_transition | find_elevator | local_goal | open_set_object_search",
         "target_floor": "floor id such as F1 or B1, or null",
         "target_label": "human-readable target object/place, or null",
         "target_node_id": "one graph node id if the graph contains the requested target, or null",
+        "search_label": "open-vocabulary object label to search for when the target is not a graph node, or null",
+        "search_prompts": "short list of detector prompts/synonyms for search_label, or []",
         "rationale": "short reason, optional",
     }
 
@@ -231,6 +247,8 @@ def _chat_completion_payload(
         "Return only one JSON object matching the schema. Choose target_node_id only from the provided graph. "
         "Use intent=floor_transition whenever the request asks the robot to use/take an elevator to reach another floor or another-floor destination. "
         "Use intent=find_elevator only when the elevator itself is the final requested target and there is no destination beyond the elevator. "
+        "Use intent=open_set_object_search when the request asks to find an object that is not a provided graph node. "
+        "For open_set_object_search, fill search_label and search_prompts with concise detector prompts/synonyms. "
         "Use intent=local_goal for same-floor targets. Prefer room/place target nodes over elevator nodes when the user names a room/place destination."
     )
     return {
@@ -319,6 +337,79 @@ def _resolve_target_node_id(
     if label:
         return _match_node_by_text(graph, label, floor=floor)
     return None
+
+
+def _infer_open_set_search_label(text: str, intent: str | None = None) -> str | None:
+    text_norm = text.strip().lower()
+    if not text_norm:
+        return None
+    if intent in {"floor_transition", "find_elevator"}:
+        return None
+    prefixes = (
+        "find the ",
+        "find a ",
+        "find an ",
+        "find ",
+        "locate the ",
+        "locate a ",
+        "locate an ",
+        "locate ",
+        "search for the ",
+        "search for a ",
+        "search for an ",
+        "search for ",
+        "go find the ",
+        "go find ",
+        "look for the ",
+        "look for a ",
+        "look for an ",
+        "look for ",
+    )
+    for prefix in prefixes:
+        if text_norm.startswith(prefix):
+            return _clean_search_label(text_norm[len(prefix) :])
+    zh_prefixes = ("帮我找", "去找", "寻找", "找一下", "找")
+    for prefix in zh_prefixes:
+        if text_norm.startswith(prefix):
+            return _clean_search_label(text_norm[len(prefix) :])
+    if intent == "open_set_object_search":
+        return _clean_search_label(text_norm)
+    return None
+
+
+def _clean_search_label(value: str) -> str | None:
+    label = value.strip(" .,!?:;，。！？：；")
+    for suffix in (" for me", " please", " nearby", " in the scene", " in this scene"):
+        if label.endswith(suffix):
+            label = label[: -len(suffix)].strip()
+    return label or None
+
+
+def _normalize_search_prompts(value: Any, *, search_label: str | None) -> tuple[str, ...]:
+    prompts: list[str] = []
+    if isinstance(value, str):
+        prompts.extend(part.strip() for part in value.replace(".", ",").split(",") if part.strip())
+    elif isinstance(value, list):
+        prompts.extend(str(part).strip() for part in value if str(part).strip())
+    if not prompts:
+        prompts.extend(_default_search_prompts(search_label))
+    return tuple(dict.fromkeys(prompts))
+
+
+def _default_search_prompts(search_label: str | None) -> tuple[str, ...]:
+    if not search_label:
+        return ()
+    label = search_label.strip().lower()
+    synonyms = {
+        "fridge": ("fridge", "refrigerator", "kitchen appliance"),
+        "refrigerator": ("refrigerator", "fridge", "kitchen appliance"),
+        "fire extinguisher": ("fire extinguisher", "extinguisher", "red cylinder"),
+        "extinguisher": ("fire extinguisher", "extinguisher", "red cylinder"),
+        "water dispenser": ("water dispenser", "drinking fountain", "water cooler"),
+    }
+    if label in synonyms:
+        return synonyms[label]
+    return (search_label,)
 
 
 def _repair_intent(

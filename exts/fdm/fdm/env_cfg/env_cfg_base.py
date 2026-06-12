@@ -24,6 +24,7 @@ from nav_suite.terrains import NavTerrainImporterCfg
 
 import fdm.mdp as mdp
 from fdm import FDM_DATA_DIR
+from .terrain_cfg import FDM_TRAINING_TERRAINS_CFG
 
 # 从你自己的 G1 配置里引入
 from fdm.env_cfg.robot_cfg_g1 import G1_CFG, G1_29DOF_JOINT_NAMES
@@ -48,7 +49,7 @@ TERRAIN_ANALYSIS_CFG = mdp.TerrainAnalysisCfg(
 
 
 ##
-# Scene definition
+# Scene definition······································································
 ##
 
 
@@ -56,10 +57,11 @@ TERRAIN_ANALYSIS_CFG = mdp.TerrainAnalysisCfg(
 class TerrainSceneCfg(InteractiveSceneCfg):
     """Configuration for the terrain scene with a humanoid G1 robot."""
 
-    # USD TERRAIN
+    # Default FDM training terrain. This matches the generator-backed Apr/May training runs.
     terrain = NavTerrainImporterCfg(
         prim_path="/World/ground",
-        terrain_type="usd",
+        terrain_type="generator",
+        terrain_generator=FDM_TRAINING_TERRAINS_CFG,
         usd_path=os.path.join(
             FDM_DATA_DIR, "Terrains", "navigation_terrain_wall_usd_merge_large_single_object_maze.usd"
         ),

@@ -57,6 +57,31 @@ def corridor_lobby_wall_specs() -> list[tuple[str, Pose2D, tuple[float, float]]]
     ]
 
 
+def planner_eval_obstacle_specs(profile: str = "slalom") -> list[tuple[str, Pose2D, tuple[float, float], float]]:
+    """Lab-sized obstacles inspired by terrain_cfg planner-eval object families.
+
+    The specs are local-frame axis-aligned rectangles:
+    (name, center pose, footprint size, height).
+    """
+
+    base_specs = [
+        ("corridor_box_left", Pose2D(1.7, 1.95, 0.0), (0.20, 0.30), 1.6),
+        ("corridor_box_right", Pose2D(3.5, -2.05, 0.0), (0.20, 0.30), 1.6),
+        ("lobby_pillar_left", Pose2D(7.0, 2.45, 0.0), (0.28, 0.28), 2.0),
+        ("lobby_pillar_right", Pose2D(8.8, -2.55, 0.0), (0.28, 0.28), 2.0),
+        ("lobby_cross_a", Pose2D(9.8, 2.65, 0.0), (0.60, 0.16), 1.2),
+        ("lobby_cross_b", Pose2D(9.8, 2.65, 0.0), (0.16, 0.60), 1.2),
+    ]
+    if profile == "light":
+        return base_specs[:4]
+    if profile == "dense":
+        return base_specs + [
+            ("lobby_dense_left", Pose2D(7.8, -2.35, 0.0), (0.24, 0.42), 1.6),
+            ("lobby_dense_right", Pose2D(10.0, 0.10, 0.0), (0.24, 0.42), 1.6),
+        ]
+    return base_specs
+
+
 def spawn_minimal_elevator_scene(
     *,
     origin: torch.Tensor,
@@ -242,6 +267,15 @@ def spawn_rect_wall(
         scale=(sx, sy, height),
         color=(0.28, 0.34, 0.32),
     )
+
+
+def spawn_planner_eval_obstacles(*, origin: torch.Tensor, profile: str = "slalom") -> list[tuple[float, float, float, float]]:
+    """Spawn planner-eval style obstacles and return grid obstacle rectangles."""
+
+    specs = planner_eval_obstacle_specs(profile)
+    for name, center, size, height in specs:
+        spawn_rect_wall(origin=origin, name=f"planner_eval_{name}", center=center, size=size, height=height)
+    return [(center.x, center.y, size[0], size[1]) for _, center, size, _ in specs]
 
 
 def spawn_corridor_lobby_walls(*, origin: torch.Tensor) -> list[tuple[float, float, float, float]]:

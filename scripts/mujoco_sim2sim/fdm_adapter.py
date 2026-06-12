@@ -268,6 +268,7 @@ class FDMPlannerAdapter(PlannerAdapter):
     progress_guard_max_risk: float = 0.25
     progress_guard_max_scan_cost: float = 3.0
     use_fdm_model: bool = True
+    require_observation_dims: bool = True
     kinematic_dt: float = 0.5
     kinematic_collision_prob: float = 0.0
 
@@ -466,11 +467,19 @@ class FDMPlannerAdapter(PlannerAdapter):
             if state.shape[0] == state_dim:
                 self._state_history.append(state.copy())
                 del self._state_history[:-history]
+            elif self.require_observation_dims:
+                raise ValueError(f"FDM state dim mismatch: got {state.shape[0]}, expected {state_dim}.")
+        elif self.require_observation_dims:
+            raise ValueError(f"FDM state is required for backend=fdm_mppi; expected dim {state_dim}.")
         if obs.fdm_proprioception is not None:
             proprio = np.asarray(obs.fdm_proprioception, dtype=np.float32).reshape(-1)
             if proprio.shape[0] == proprio_dim:
                 self._proprio_history.append(proprio.copy())
                 del self._proprio_history[:-history]
+            elif self.require_observation_dims:
+                raise ValueError(f"FDM proprioception dim mismatch: got {proprio.shape[0]}, expected {proprio_dim}.")
+        elif self.require_observation_dims:
+            raise ValueError(f"FDM proprioception is required for backend=fdm_mppi; expected dim {proprio_dim}.")
 
     def _state_history_tensor(self, batch: int, history: int, state_dim: int):
         if self._state_history:
@@ -478,10 +487,8 @@ class FDMPlannerAdapter(PlannerAdapter):
             history_np = np.stack((pad + self._state_history)[-history:], axis=0).astype(np.float32)
         else:
             history_np = np.zeros((history, state_dim), dtype=np.float32)
-            if state_dim >= 4:
-                history_np[:, 3] = 1.0
-            if state_dim >= 8:
-                history_np[:, 6:8] = 1.0
+            if state_dim >= 7:
+                history_np[:, 6] = 1.0
         tensor = torch.as_tensor(history_np, dtype=torch.float32, device=self.device)
         return tensor.unsqueeze(0).repeat(batch, 1, 1)
 
