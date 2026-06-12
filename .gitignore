@@ -23,12 +23,17 @@ isaac_sim/
 *.usdc
 *_cache/
 omni.kit.*
+.thumbs/
+**/.thumbs/
 
 # Logs & WandB
 logs/
 wandb/
 tensorboard/
 tb/
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
 
 
 
@@ -44,8 +49,25 @@ outputs/
 tmp_g1dwaq_lab/
 tmp_policy_inspect/
 tmp_mppi_only_scenes/
+tmp_g1dwaq_lab/
+mppi_only*.csv
+
+# Generated demos / experiment artifacts
+docs/**/*.mp4
+docs/**/*.avi
+docs/**/*.mov
+docs/**/*.mkv
+docs/**/*.webm
+docs/**/*.gif
+docs/**/*_probe*/
+docs/**/semantic_nav_current_csv_frames/
+docs/**/velocity_tracking_probe*/
+docs/**/*diagnostic*.png
+docs/**/*replay*.mp4
+docs/**/*trace.csv
+docs/**/*summary*.csv
+nav-suite/**/docs/videos/
 
 # ===== generated datasets / caches (DO NOT COMMIT) =====
 exts/fdm/data/Terrains/test_datasets/
 **/test_datasets/
-
